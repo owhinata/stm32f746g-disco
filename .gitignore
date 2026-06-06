@@ -53,3 +53,14 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# project build artifacts and downloaded toolchain
+/build/
+/tools/
+
+# flash image backups
+backup_full.bin
+*.backup.bin
+
+# reference material
+_ref/

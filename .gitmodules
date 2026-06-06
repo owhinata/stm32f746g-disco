@@ -1,0 +1,10 @@
+[submodule "lib/cmsis_core"]
+	path = lib/cmsis_core
+	url = https://github.com/STMicroelectronics/cmsis-core
+	branch = cm7
+[submodule "lib/cmsis_device_f7"]
+	path = lib/cmsis_device_f7
+	url = https://github.com/STMicroelectronics/cmsis_device_f7
+[submodule "lib/stm32f7xx_hal_driver"]
+	path = lib/stm32f7xx_hal_driver
+	url = https://github.com/STMicroelectronics/stm32f7xx_hal_driver
