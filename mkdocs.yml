@@ -55,6 +55,7 @@ nav:
   - RTOS:
       - rtos/threadx.md
       - rtos/shell-registration.md
+      - rtos/shell-parser.md
 
 markdown_extensions:
   - admonition

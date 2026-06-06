@@ -55,8 +55,19 @@ struct cli_cmd {
 	const struct cli_cmd *subcmds;  /**< sentinel-terminated subcommand array, or NULL */
 	cli_cmd_handler_t     handler;  /**< handler, or NULL for a pure parent command */
 	uint8_t               mandatory;/**< required argc (command name included) */
-	uint8_t               optional; /**< number of optional arguments allowed */
+	uint8_t               optional; /**< number of optional args, or CLI_ARG_RAW */
 };
+
+/**
+ * Sentinel for the `optional` field / the CLI_CMD_REGISTER / CLI_CMD_ARG
+ * `optional` argument.  Marks a RAW command: after the `mandatory` tokens are
+ * tokenized normally, the rest of the input line is passed verbatim (no quote
+ * or escape processing, leading whitespace trimmed) as a single extra argument,
+ * and the argument-count upper bound is not enforced.  Leaf commands only
+ * (a command with no subcommands) -- on a command that has subcommands the raw
+ * tail is not captured and CLI_ARG_RAW just acts as a large optional count.
+ */
+#define CLI_ARG_RAW 0xFFu
 
 /*
  * Section attribute for a root command entry.  `used` + the linker's KEEP keep
@@ -83,8 +94,8 @@ struct cli_cmd {
  * Note: `name` must be a valid C identifier, so names with dashes (e.g.
  * "foo-bar") cannot be registered this way today.  Every standard-tier command
  * (version/uptime/reboot/thread/devmem/help/clear/history/backends) is a valid
- * identifier.  Detection of duplicate root names across translation units is
- * left to the parser (issue #3).
+ * identifier.  Duplicate root names are not detected: command lookup takes the
+ * first match in SORT_BY_NAME order, so avoid registering the same root twice.
  */
 /* Parameters are underscore-prefixed so a `name`/`help`/... parameter does not
  * collide with the identically named designated-initializer field below (the
