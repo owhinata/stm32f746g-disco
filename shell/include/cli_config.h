@@ -65,6 +65,22 @@
 #define CLI_MAX_SUBCMD_DEPTH 8
 #endif
 
+/* ThreadX priority of each shell instance thread (impl. #4).  Plain integer
+ * (no ThreadX symbols here, so cli_config.h stays ThreadX-independent and
+ * host-includable).  Default 16: a development shell runs *below* the demo
+ * application threads (priority 10 in src/app_threadx.c) so it never starves
+ * real work; the <5 ms echo target (req §15) is paced by IRQ -> event flag ->
+ * thread wake-up and is verified on target in issue #8. */
+#ifndef CLI_INSTANCE_PRIORITY
+#define CLI_INSTANCE_PRIORITY 16
+#endif
+
+/* Bytes drained from the transport per read() in the instance thread loop
+ * (impl. #4).  Purely a batching size; does not bound input length. */
+#ifndef CLI_RX_DRAIN_CHUNK
+#define CLI_RX_DRAIN_CHUNK 32
+#endif
+
 /*
  * The number of registered commands is bounded only by the linker section
  * capacity (effectively unlimited; the scan is linear).  Tab-completion does
@@ -81,5 +97,7 @@ _Static_assert(CLI_PROMPT_BUFFER_SIZE > 0,  "CLI_PROMPT_BUFFER_SIZE must be > 0"
 _Static_assert(CLI_INSTANCE_STACK_SIZE >= 512, "CLI_INSTANCE_STACK_SIZE too small");
 _Static_assert(CLI_MAX_INSTANCES >= 1,      "CLI_MAX_INSTANCES must be >= 1");
 _Static_assert(CLI_MAX_SUBCMD_DEPTH >= 1,   "CLI_MAX_SUBCMD_DEPTH must be >= 1");
+_Static_assert(CLI_INSTANCE_PRIORITY <= 31, "CLI_INSTANCE_PRIORITY must be 0..31 (ThreadX)");
+_Static_assert(CLI_RX_DRAIN_CHUNK >= 1,     "CLI_RX_DRAIN_CHUNK must be >= 1");
 
 #endif /* CLI_CONFIG_H */

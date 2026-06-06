@@ -70,6 +70,29 @@ int cli_tokenize(char *line, char **argv, int max_argc);
 enum cli_parse_status cli_parse(char *line, char **argv, int argv_cap,
                                 struct cli_parse_result *out);
 
+/*
+ * Core line pipeline (issue #4), implemented in cli_session.c.  These functions
+ * operate on a `struct cli_instance` but never call a ThreadX (tx_*) API, so the
+ * translation unit compiles and unit-tests on the host (the ThreadX glue --
+ * thread loop, object creation, ISR notify -- lives in cli_core.c instead).
+ */
+
+/** last_result value stored for any non-OK dispatch outcome (req §9: non-zero). */
+#define CLI_DISPATCH_ERR (-1)
+
+/** Feed one received byte through the ASCII filter + RX state machine. */
+void cli_input_byte(struct cli_instance *sh, uint8_t b);
+
+/** Parse and run the accumulated line, print the outcome, return to the prompt. */
+void cli_dispatch_line(struct cli_instance *sh);
+
+/** Blocking raw write straight to the transport (no lock; single-thread output
+ *  in #4).  The locked/buffered output API is layered on top by #5. */
+int  cli_raw_write_unlocked(struct cli_instance *sh, const void *data, size_t len);
+
+/** Emit the instance prompt. */
+void cli_prompt(struct cli_instance *sh);
+
 #ifdef __cplusplus
 }
 #endif

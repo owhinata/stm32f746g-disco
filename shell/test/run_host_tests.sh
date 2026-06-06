@@ -40,4 +40,16 @@ gcc $CFLAGS -DCLI_MAX_ARGC=8 -DCLI_MAX_SUBCMD_DEPTH=2 \
     $LDFLAGS -o "$out/test_parse"
 "$out/test_parse"
 
+# #4 -- shell core: ASCII filter, RX state machine, dispatch, fail-safe.
+# cli_session.c is ThreadX-free (the tx_* glue lives in cli_core.c, firmware
+# only), so it builds on the host against the tx_api.h shim in test/shim, placed
+# first on the include path.  Compiled with cli_parse.c and small CLI_* limits
+# so the buffer-full (CLI_CMD_BUFFER_SIZE) and too-many-tokens (CLI_MAX_ARGC)
+# paths fit a compact input line.
+gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
+    -I "$here/shim" -I "$inc" -I "$core" \
+    "$here/test_core.c" "$core/cli_session.c" "$core/cli_parse.c" \
+    $LDFLAGS -o "$out/test_core"
+"$out/test_core"
+
 echo "host tests passed"
