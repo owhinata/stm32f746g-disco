@@ -43,3 +43,28 @@ cmake --build build --target flash-thread_metric
 - ThreadX tick を **100 Hz** に（`TX_GLUE_TICK_DIV=10` + `TX_TIMER_TICKS_PER_SECOND=100`）。移植層の `TM_THREADX_TICKS_PER_SECOND` に合わせ、`tm_thread_sleep(30)` が実 30 秒になる。
 - 割込みテストは `SVC #0`（`TM_CAUSE_INTERRUPT`）。`port/threadx/tm_svc.c` が `SVC_Handler`→`tm_interrupt_handler` を配線（該当テストのみリンク）。
 - ベンチのカウンタは非 volatile グローバルを無限ループで更新するため、テストソースのみ `-O0` でビルド（-O2 だとレジスタ保持でメモリに書き戻らず report が 0 を読み "died" になる）。ThreadX 本体は `-O2` のまま。
+
+## Execution Profile Kit（オプション）
+
+`exec_profile` アプリで、スレッド/ISR/アイドルの CPU 時間を Cortex-M7 の **DWT サイクルカウンタ**で計測する（kit の既定 `TX_EXECUTION_TIME_SOURCE` = `DWT->CYCCNT` @0xE0001004）。
+
+```bash
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DBUILD_EXEC_PROFILE=ON
+cmake --build build --target flash-exec_profile
+```
+
+3 秒ごとに配分を出力（worker_a は worker_b の 2.5 倍の仕事量）:
+
+```
+  worker_a :  273166163  (42%)
+  worker_b :  109277261  (16%)
+  ISR      :          0  ( 0%)
+  idle     :  265319044  (40%)
+```
+
+要点:
+
+- `-DBUILD_EXEC_PROFILE=ON` が `TX_EXECUTION_PROFILE_ENABLE` を定義し、ポート asm がプロファイルフックを呼ぶ。ThreadX コア+ポートを再ビルドし `tx_execution_profile.c` を追加。
+- **Cortex-M7 の DWT ロック**：DWT Lock Access Register の解除（`*(uint32_t*)0xE0001FB0 = 0xC5ACCE55`）をしないと `CYCCNT` が 0 のまま＝全測定 0 になる。
+- **ISR 時間は 0**：kit は ThreadX の context save/restore 経由で ISR 時間を数えるが、本ポートの `SysTick_Handler` は素の C ハンドラなので計上されない。ISR を計測するには本体を `_tx_execution_isr_enter()`/`_exit()` で囲む。

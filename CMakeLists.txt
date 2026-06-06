@@ -205,3 +205,27 @@ if(BUILD_THREAD_METRIC)
     set_source_files_properties("${TM_TEST_SRC}" PROPERTIES COMPILE_OPTIONS "-O0")
     firmware_finalize(thread_metric)
 endif()
+
+# --- App: exec_profile (optional Execution Profile Kit demo) ----------------
+# Per-thread / ISR / idle CPU-time profiling via the Cortex-M7 DWT cycle
+# counter. TX_EXECUTION_PROFILE_ENABLE makes the ThreadX port asm call the
+# profile hooks, so ThreadX core + port must be rebuilt with it (per-target
+# here). Reuses TX_DIR/TX_PORT/TX_CORE/TX_ASM from the threadx block.
+option(BUILD_EXEC_PROFILE "Build the ThreadX Execution Profile Kit demo" OFF)
+if(BUILD_EXEC_PROFILE)
+    add_executable(exec_profile
+        "${CMAKE_SOURCE_DIR}/src/app_exec_profile.c"
+        "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
+        "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c"
+        ${TX_CORE} ${TX_ASM})
+    target_link_libraries(exec_profile PRIVATE common)
+    target_include_directories(exec_profile PRIVATE
+        "${TX_DIR}/common/inc" "${TX_PORT}/inc"
+        "${CMAKE_SOURCE_DIR}/port/threadx"
+        "${TX_DIR}/utility/execution_profile_kit")
+    target_compile_definitions(exec_profile PRIVATE
+        TX_INCLUDE_USER_DEFINE_FILE
+        TX_EXECUTION_PROFILE_ENABLE)
+    target_compile_options(exec_profile PRIVATE -O2)
+    firmware_finalize(exec_profile)
+endif()

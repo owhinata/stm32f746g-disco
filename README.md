@@ -10,6 +10,7 @@ fetched automatically — nothing to install by hand except `cmake`, `ninja`,
 | `threadx`       | Eclipse ThreadX RTOS: two threads (LED blink + UART print)        |
 | `coremark`      | EEMBC CoreMark benchmark — **optional**, `-DBUILD_COREMARK=ON`     |
 | `thread_metric` | Thread-Metric RTOS benchmark — **optional**, `-DBUILD_THREAD_METRIC=ON` |
+| `exec_profile`  | ThreadX Execution Profile Kit demo — **optional**, `-DBUILD_EXEC_PROFILE=ON` |
 
 Board bring-up (216 MHz clock, caches, VCP UART, printf) is shared in
 `src/bsp.c`.
@@ -158,6 +159,42 @@ Integration notes:
   selected test source is built at `-O0` (otherwise GCC keeps the counter in a
   register and the reporting thread sees a stale 0 → "thread died"). ThreadX
   itself stays at `-O2`, so the measured RTOS operations are representative.
+
+## Execution Profile Kit (optional app)
+
+`exec_profile` uses the ThreadX Execution Profile Kit to measure per-thread /
+ISR / idle CPU time via the Cortex-M7 **DWT cycle counter** (the kit's default
+`TX_EXECUTION_TIME_SOURCE` is `DWT->CYCCNT` at `0xE0001004`). Two worker threads
+do different amounts of work; a reporter thread prints the distribution every 3 s.
+
+```bash
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DBUILD_EXEC_PROFILE=ON
+cmake --build build --target flash-exec_profile
+```
+
+Measured (worker_a does 2.5× the work of worker_b):
+
+```
+exec_profile (cycles / 3 s @216 MHz):
+  worker_a :  273166163  (42%)
+  worker_b :  109277261  (16%)
+  ISR      :          0  ( 0%)
+  idle     :  265319044  (40%)
+```
+
+Integration notes:
+
+- `-DBUILD_EXEC_PROFILE=ON` defines `TX_EXECUTION_PROFILE_ENABLE`, which makes
+  the ThreadX port asm call the profile hooks; ThreadX core + port are rebuilt
+  with it, and `tx_execution_profile.c` is added.
+- **Cortex-M7 DWT lock:** the cycle counter only runs after unlocking the DWT
+  Lock Access Register (`*(uint32_t*)0xE0001FB0 = 0xC5ACCE55`) — without it
+  `CYCCNT` stays 0 and every measurement reads 0.
+- **ISR time reads 0 here:** the kit counts ISR time via the ThreadX context
+  save/restore path, but this port's `SysTick_Handler` is a plain C handler, so
+  SysTick time is not attributed to ISR. To profile an ISR, call
+  `_tx_execution_isr_enter()` / `_tx_execution_isr_exit()` around its body.
 
 ## Notes
 

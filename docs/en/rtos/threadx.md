@@ -66,3 +66,37 @@ Integration notes:
   selected test source is built at `-O0` (at -O2 GCC keeps the counter in a
   register and the reporting thread reads a stale 0 → "thread died"). ThreadX
   stays at `-O2`.
+
+## Execution Profile Kit (optional)
+
+The `exec_profile` app measures per-thread / ISR / idle CPU time via the
+Cortex-M7 **DWT cycle counter** (the kit's default `TX_EXECUTION_TIME_SOURCE` is
+`DWT->CYCCNT` at `0xE0001004`).
+
+```bash
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DBUILD_EXEC_PROFILE=ON
+cmake --build build --target flash-exec_profile
+```
+
+Prints the distribution every 3 s (worker_a does 2.5× the work of worker_b):
+
+```
+  worker_a :  273166163  (42%)
+  worker_b :  109277261  (16%)
+  ISR      :          0  ( 0%)
+  idle     :  265319044  (40%)
+```
+
+Notes:
+
+- `-DBUILD_EXEC_PROFILE=ON` defines `TX_EXECUTION_PROFILE_ENABLE` so the port asm
+  calls the profile hooks; ThreadX core + port are rebuilt with it and
+  `tx_execution_profile.c` is added.
+- **Cortex-M7 DWT lock:** unlock the DWT Lock Access Register
+  (`*(uint32_t*)0xE0001FB0 = 0xC5ACCE55`) or `CYCCNT` stays 0 and every
+  measurement reads 0.
+- **ISR time reads 0:** the kit attributes ISR time via the ThreadX context
+  save/restore path, but this port's `SysTick_Handler` is a plain C handler. To
+  profile an ISR, wrap its body in `_tx_execution_isr_enter()` /
+  `_tx_execution_isr_exit()`.
