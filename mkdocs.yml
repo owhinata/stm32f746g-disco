@@ -54,6 +54,7 @@ nav:
       - build/cmake.md
   - RTOS:
       - rtos/threadx.md
+      - rtos/shell-registration.md
 
 markdown_extensions:
   - admonition

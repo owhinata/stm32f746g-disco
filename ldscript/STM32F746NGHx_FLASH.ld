@@ -56,6 +56,21 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
+  /* Shell (CLI) root command table: const cli_cmd entries registered from any
+   * TU via CLI_CMD_REGISTER().  KEEP survives --gc-sections; SORT_BY_NAME gives
+   * a deterministic (alphabetical) order; entries carry aligned(__alignof__) so
+   * the array is gap-free and walkable by pointer arithmetic between the two
+   * boundary symbols.  Empty (start==end) when no command is registered. */
+  .shell_root_cmds (READONLY) :
+  {
+    . = ALIGN(4);
+    PROVIDE_HIDDEN (__cli_root_cmds_start = .);
+    KEEP (*(SORT_BY_NAME(.shell_root_cmds.*)))
+    KEEP (*(.shell_root_cmds))
+    PROVIDE_HIDDEN (__cli_root_cmds_end = .);
+    . = ALIGN(4);
+  } >FLASH
+
   .ARM.extab : { *(.ARM.extab* .gnu.linkonce.armextab.*) } >FLASH
   .ARM :
   {
