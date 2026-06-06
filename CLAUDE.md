@@ -39,10 +39,98 @@ STM32F746G-DISCO（STM32F746NGH6 / Cortex-M7）向けの **ベアメタル + Ecl
 
 ## Git ワークフロー
 
-- **ブランチ**: `feat/`, `fix/`, `docs/`, `build/`, `refactor/`, `chore/`, `style/` prefix。ベースは常に `main`
-- **コミット**: conventional commits 形式 `type: short description`
+**PR は作らない。** Issue 駆動で feature/fix ブランチを切り、ローカル `main` に `--ff-only` merge → push → Issue へ対応コメント → Issue クローズ、の流れ。
+
+- **ブランチ**: `feat/`, `fix/`, `docs/`, `build/`, `refactor/`, `chore/`, `style/` prefix。`<prefix>/<N>-short-description`（`<N>` は Issue 番号）。ベースは常に `main`
+- **コミット**: conventional commits 形式 `type: short description`。Issue 対応時は `type: #N short description` で **subject に Issue 番号**を含める（GitHub のリンク生成＋オートクローズ判定のため）
 - コミットメッセージ末尾に `Co-Authored-By: Claude ...` を付与
-- 動作確認していない変更を commit しない
+- 動作確認していない変更を commit / push しない
+
+### 1. Issue 作成
+
+着手前にまず Issue を立てる（バグ報告 / 機能追加 / リファクタ いずれも同様）。
+
+```bash
+gh issue create --repo owhinata/stm32f746g-disco --title "short description" --body "$(cat <<'EOF'
+## Summary
+- 症状・問題・やりたいことの説明
+
+## Reproduction (バグの場合)
+- 再現手順
+
+## Environment
+- Board: STM32F746G-DISCO (STM32F746NGH6 / Cortex-M7)
+- Reproduced at: <commit-hash>
+- 関連する CONFIG / ビルド設定
+
+## Notes
+- 調査メモ・仮説・設計案
+EOF
+)"
+```
+
+### 2. ブランチを切って実装 → 動作確認 → コミット
+
+```bash
+git checkout -b feat/<N>-short-description    # <N> は Issue 番号
+# ... 実装 → ビルド → フラッシュ → 実機で動作確認 ...
+git commit -m "type: #<N> short description"
+```
+
+### 3. ローカル main に ff-merge
+
+```bash
+git checkout main
+git merge --ff-only feat/<N>-short-description
+```
+
+`--ff-only` で必ず early return する。merge コミットは作らない。
+
+### 4. push
+
+```bash
+git push origin main
+```
+
+push 時、コミットメッセージに `fix: #<N> ...` / `closes #<N>` 等の GitHub オートクローズキーワードが含まれていれば、対応する Issue は自動的に CLOSED になる。
+
+### 5. Issue へ対応コメント
+
+push 後、`gh issue comment` で対応サマリを残す。コミットレンジ（`<base>..<head>`）を必ず含める。
+
+```bash
+gh issue comment <N> --repo owhinata/stm32f746g-disco --body "$(cat <<'EOF'
+## 対応完了
+
+`feat/<N>-...` を `main` に ff-merge して push (`<base>..<head>`)。
+
+### 修正内容
+- 変更点を箇条書き
+
+### 動作確認
+- 実機で確認した挙動
+
+### 補足 (任意)
+- 関連 Issue / 後続フォローアップ
+EOF
+)"
+```
+
+### 6. Issue クローズ + ブランチ削除
+
+オートクローズで CLOSED になっていなければ手動で閉じる。マージ済みブランチは削除する。
+
+```bash
+gh issue close <N> --repo owhinata/stm32f746g-disco          # 必要なら
+git branch -d feat/<N>-short-description
+```
+
+### 注意
+
+- **PR は作らない**。`gh pr create` / `gh pr merge` は使わない
+- `main` への直 push なので `--ff-only` を厳守、**force push は禁止**
+- 動作確認していないコミットを `main` に push しない
+- Issue を立てずにコミットしない（`#<N>` 参照が無いコミットは追跡できない）。ただし Epic / 親 Issue は、クローズキーワードを使わず `#<epic>` 参照のリンクのみとする（誤クローズ防止）
 
 ### Upstream submodule は read-only
 
