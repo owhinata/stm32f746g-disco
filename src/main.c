@@ -8,12 +8,17 @@
  *   - D-Cache: enabled
  *   - SYSCLK : 216 MHz from 25 MHz HSE (PLL: M=25, N=432, P=2)
  *
- * Blinks user LED LD1 (PI1) at 1 Hz.
+ * Blinks user LED LD1 (PI1) at 1 Hz and prints over the ST-Link VCP
+ * (USART1, TX=PA9 / RX=PB7, 115200 8N1) using printf.
  */
 #include "main.h"
+#include <stdio.h>
+
+UART_HandleTypeDef huart1;   /* ST-Link Virtual COM Port */
 
 static void SystemClock_Config(void);
 static void LD1_GPIO_Init(void);
+static void VCP_UART_Init(void);
 
 int main(void)
 {
@@ -30,10 +35,18 @@ int main(void)
     SystemClock_Config();
 
     LD1_GPIO_Init();
+    VCP_UART_Init();
 
+    /* Unbuffered stdout so each printf reaches the VCP immediately. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("hello world\r\n");
+
+    uint32_t tick = 0;
     while (1)
     {
         HAL_GPIO_TogglePin(LD1_GPIO_PORT, LD1_PIN);
+        printf("tick %lu\r\n", (unsigned long)tick++);
         HAL_Delay(500);   /* 500 ms on / 500 ms off -> 1 Hz blink */
     }
 }
@@ -104,6 +117,54 @@ static void LD1_GPIO_Init(void)
     GPIO_InitStruct.Pull  = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(LD1_GPIO_PORT, &GPIO_InitStruct);
+}
+
+/**
+ * @brief  USART1 on the ST-Link Virtual COM Port (PA9=TX, PB7=RX), 115200 8N1.
+ */
+static void VCP_UART_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_USART1_CLK_ENABLE();
+
+    /* PA9 -> USART1_TX */
+    GPIO_InitStruct.Pin       = GPIO_PIN_9;
+    GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull      = GPIO_NOPULL;
+    GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* PB7 -> USART1_RX */
+    GPIO_InitStruct.Pin       = GPIO_PIN_7;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    huart1.Instance          = USART1;
+    huart1.Init.BaudRate     = 115200;
+    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits     = UART_STOPBITS_1;
+    huart1.Init.Parity       = UART_PARITY_NONE;
+    huart1.Init.Mode         = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/**
+ * @brief  Retarget newlib stdout/stderr to the VCP UART so printf works.
+ */
+int _write(int file, char *ptr, int len)
+{
+    (void)file;
+    HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len, HAL_MAX_DELAY);
+    return len;
 }
 
 /**
