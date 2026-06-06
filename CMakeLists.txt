@@ -131,6 +131,51 @@ target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE)
 target_compile_options(threadx PRIVATE -O2)
 firmware_finalize(threadx)
 
+# --- App: shell ------------------------------------------------------------
+# Interactive ThreadX CLI shell over the USART1 VCP (issue #8).  Reuses the
+# ThreadX core/port from the threadx block (TX_DIR/TX_PORT/TX_CORE/TX_ASM) and,
+# like that app, omits src/stm32f7xx_it.c because ThreadX supplies PendSV_Handler
+# (USART1_IRQHandler comes from the UART backend).
+#
+# The shell core + backends are collected into an OBJECT library named shell_obj
+# (NOT shell -- the executable below takes the target name `shell`).  Because
+# cli_instance.h pulls in tx_api.h, the objlib MUST be compiled with the same
+# TX_INCLUDE_USER_DEFINE_FILE + port/threadx as the ThreadX core linked into the
+# exe, or the TX_THREAD / event-flags / mutex layouts disagree (ABI mismatch).
+add_library(shell_obj OBJECT
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_core.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_parse.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_printf.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_session.c"
+    "${CMAKE_SOURCE_DIR}/shell/backend/cli_backend_uart.c"
+    "${CMAKE_SOURCE_DIR}/shell/backend/cli_backend_dummy.c")
+target_link_libraries(shell_obj PUBLIC bsp_iface)
+target_include_directories(shell_obj
+    PUBLIC  "${CMAKE_SOURCE_DIR}/shell/include"
+    PRIVATE "${CMAKE_SOURCE_DIR}/shell/core"
+            "${CMAKE_SOURCE_DIR}/shell/backend"
+            "${TX_DIR}/common/inc" "${TX_PORT}/inc"
+            "${CMAKE_SOURCE_DIR}/port/threadx")
+target_compile_definitions(shell_obj PRIVATE TX_INCLUDE_USER_DEFINE_FILE)
+target_compile_options(shell_obj PRIVATE -O2)
+
+add_executable(shell
+    "${CMAKE_SOURCE_DIR}/src/app_shell.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
+    "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
+    ${TX_CORE}
+    ${TX_ASM})
+target_link_libraries(shell PRIVATE common shell_obj)
+target_include_directories(shell PRIVATE
+    "${TX_DIR}/common/inc" "${TX_PORT}/inc"
+    "${CMAKE_SOURCE_DIR}/port/threadx"
+    "${CMAKE_SOURCE_DIR}/shell/include"
+    "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
+    "${CMAKE_SOURCE_DIR}/shell/backend")  # CLI_BACKEND_*_DEFINE macros
+target_compile_definitions(shell PRIVATE TX_INCLUDE_USER_DEFINE_FILE)
+target_compile_options(shell PRIVATE -O2)
+firmware_finalize(shell)
+
 # --- App: thread_metric (optional Thread-Metric RTOS benchmark) -------------
 # Runs the EEMBC-style ThreadX benchmark suite. Pick the test with
 # -DTHREAD_METRIC_TEST=<name>. Reuses TX_DIR/TX_PORT/TX_CORE/TX_ASM from above.

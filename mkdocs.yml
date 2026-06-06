@@ -60,6 +60,7 @@ nav:
       - rtos/shell-output.md
       - rtos/shell-testing.md
       - rtos/shell-backend-uart.md
+      - rtos/shell-app.md
 
 markdown_extensions:
   - admonition
