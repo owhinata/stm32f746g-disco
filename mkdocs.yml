@@ -1,0 +1,72 @@
+site_name: STM32F746G-DISCO Guide
+site_url: https://owhinata.github.io/stm32f746g-disco/
+site_description: STM32F746G-DISCO bare-metal + Eclipse ThreadX firmware (official ST HAL, CMake)
+repo_url: https://github.com/owhinata/stm32f746g-disco
+repo_name: owhinata/stm32f746g-disco
+
+theme:
+  name: material
+  language: ja
+  palette:
+    - scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: ダークモードに切り替え
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: ライトモードに切り替え
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - toc.integrate
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: folder
+      languages:
+        - locale: ja
+          name: 日本語
+          default: true
+          build: true
+        - locale: en
+          name: English
+          build: true
+          nav_translations:
+            ハードウェア: Hardware
+            ビルド: Build
+            RTOS: RTOS
+
+nav:
+  - Home: index.md
+  - ハードウェア:
+      - hardware/board.md
+  - ビルド:
+      - build/cmake.md
+  - RTOS:
+      - rtos/threadx.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - def_list
+  - attr_list
+  - md_in_html

@@ -69,3 +69,7 @@ _ref/
 *.swp
 *.swo
 *~
+
+# mkdocs build output / python venv
+/site/
+.venv/
