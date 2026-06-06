@@ -84,35 +84,11 @@ Watch the VCP (`/dev/ttyACM0`) with any serial terminal at 115200 8N1, e.g.:
 picocom -b 115200 --imap lfcrlf /dev/ttyACM0
 ```
 
-## CoreMark result
-
-Measured on this board (216 MHz, GCC 13.3, `-O3`, code in flash with I/D-cache,
-performance run, auto-calibrated to ~11.8 s / 11000 iterations):
-
-```
-2K performance run parameters for coremark.
-CoreMark Size    : 666
-Total time (secs): 11.843000
-Iterations/Sec   : 928.818711
-Iterations       : 11000
-Compiler version : GCC13.3.1 20240614
-Compiler flags   : -O3 -mcpu=cortex-m7 -mfpu=fpv5-sp-d16 -mfloat-abi=hard
-Memory location  : STACK
-Correct operation validated. See README.md for run and reporting rules.
-CoreMark 1.0 : 928.818711 / GCC13.3.1 20240614 -O3 ... / STACK
-```
-
-**CoreMark ≈ 928.8**, i.e. **≈ 4.30 CoreMark/MHz**. The port times the run with
-the 1 ms SysTick (`HAL_GetTick`) and prints through the VCP `printf`; CoreMark
-self-calibrates the iteration count (`ITERATIONS=0`) to run 10–100 s. Running
-code from flash (7 wait states) caps the per-MHz figure; placing the hot code in
-ITCM/RAM would push it higher.
-
 ## ThreadX (Eclipse ThreadX)
 
-`APP=threadx` runs the upstream **Eclipse ThreadX** RTOS (MIT, `lib/threadx`
-submodule) with the Cortex-M7/GNU port. `tx_application_define()` creates two
-threads:
+The `threadx` app runs the upstream **Eclipse ThreadX** RTOS (MIT,
+`lib/threadx` submodule) with the Cortex-M7/GNU port. `tx_application_define()`
+creates two threads:
 
 - `led`   — toggles LD1 every 250 ms
 - `print` — prints a counter over the VCP every 1 s (run them concurrently)
@@ -131,6 +107,23 @@ PendSV handler waiting for the timer to make a thread ready; if SysTick shared
 PendSV's priority it could not preempt that spin, the tick would stall, and
 sleeping threads would never wake. Critical sections use PRIMASK, so the higher
 SysTick priority is still masked safely inside ThreadX.
+
+## CoreMark result (optional app)
+
+Built with `-DBUILD_COREMARK=ON` and measured on this board (216 MHz, GCC 13.3,
+`-O3`, performance run, auto-calibrated to ~11.8 s / 11000 iterations):
+
+```
+CoreMark 1.0 : 928.818711 / GCC13.3.1 -O3 -mcpu=cortex-m7 -mfpu=fpv5-sp-d16 -mfloat-abi=hard / STACK
+Correct operation validated.
+```
+
+**CoreMark ≈ 928.8 ≈ 4.30 CoreMark/MHz.** The port times the run with the 1 ms
+SysTick (`HAL_GetTick`) and prints via the VCP `printf`; CoreMark self-calibrates
+the iteration count (`ITERATIONS=0`) to run 10–100 s. With the I/D-cache enabled
+the hot loops are cache-resident, so the flash 7-wait-state penalty is already
+hidden — moving the kernels into ITCM was measured to add only ~0.6 %, and the
+remaining gap to ST's published ~1082 (5.0/MHz) is compiler-bound (IAR vs GCC).
 
 ## Notes
 
