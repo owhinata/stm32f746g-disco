@@ -114,9 +114,11 @@ and end-to-end auto tests (#6), the USART1 VCP backend (#7), the shell app +
 `shell/test/test_core.c` is compiled together with `cli_session.c` and
 `cli_parse.c` (with `shim/tx_api.h` first on the include path and small
 `CLI_CMD_BUFFER_SIZE`/`CLI_MAX_ARGC` overrides to exercise the full-buffer and
-too-many-tokens paths). A capture transport records output, and the test asserts
-the ASCII filter, the state machine, CR/LF/CR-LF coalescing, the dispatch
-mapping, fail-safe, and **non-mixing output of two instances**.
+too-many-tokens paths). Output and the `tx_*` glue go through the shared
+[dummy backend + host glue](shell-testing.md) (bytes are injected at the session
+level via `cli_input_byte`). The test asserts the ASCII filter, the state
+machine, CR/LF/CR-LF coalescing, the dispatch mapping, fail-safe, and
+**non-mixing output of two instances**.
 
 ```bash
 sh shell/test/run_host_tests.sh   # => host tests passed

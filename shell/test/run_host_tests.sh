@@ -12,6 +12,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 inc="$here/../include"
 core="$here/../core"
+backend="$here/../backend"
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 
@@ -40,28 +41,51 @@ gcc $CFLAGS -DCLI_MAX_ARGC=8 -DCLI_MAX_SUBCMD_DEPTH=2 \
     $LDFLAGS -o "$out/test_parse"
 "$out/test_parse"
 
+# Shared host pieces for the core / output / integration tests (#4-#6): the
+# dummy (loopback) backend and the ThreadX-free glue (no-op lock/notify, a
+# faithful cli_tx_send_blocking over tr->api->write, and the RX pump).  Found via
+# the test dir (-I "$here", host_glue.h) and the backend dir (cli_backend_dummy.h).
+glue="$backend/cli_backend_dummy.c $here/host_glue.c"
+glue_inc="-I $here -I $backend"
+
 # #4 -- shell core: ASCII filter, RX state machine, dispatch, fail-safe.
 # cli_session.c is ThreadX-free (the tx_* glue lives in cli_core.c, firmware
 # only), so it builds on the host against the tx_api.h shim in test/shim, placed
-# first on the include path.  Compiled with cli_parse.c and small CLI_* limits
-# so the buffer-full (CLI_CMD_BUFFER_SIZE) and too-many-tokens (CLI_MAX_ARGC)
-# paths fit a compact input line.
+# first on the include path.  Output + tx_* glue now route through the shared
+# dummy backend.  Compiled with cli_parse.c and small CLI_* limits so the
+# buffer-full (CLI_CMD_BUFFER_SIZE) and too-many-tokens (CLI_MAX_ARGC) paths fit
+# a compact input line.
 gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
     -DCLI_USE_COLOR=0 \
-    -I "$here/shim" -I "$inc" -I "$core" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
     "$here/test_core.c" "$core/cli_session.c" "$core/cli_printf.c" "$core/cli_parse.c" \
+    $glue \
     $LDFLAGS -o "$out/test_core"
 "$out/test_core"
 
 # #5 -- output API: minimal formatter, 32 B staging + autoflush, VT100 colour,
 # hexdump, TX-failure drop/return.  cli_printf.c is ThreadX-free (the tx_* flow
-# control lives in cli_core.c), so it builds against the shim with no-op lock
-# stubs and a capturing cli_tx_send_blocking.  Colour ON (default) and the real
-# 32 B CLI_PRINTF_BUFFER_SIZE so the SGR escapes and autoflush are exercised.
+# control lives in cli_core.c), so it builds against the shim and routes staged
+# output through the shared dummy backend + glue.  Colour ON (default) and the
+# real 32 B CLI_PRINTF_BUFFER_SIZE so the SGR escapes and autoflush are exercised.
 gcc $CFLAGS \
-    -I "$here/shim" -I "$inc" -I "$core" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
     "$here/test_output.c" "$core/cli_printf.c" \
+    $glue \
     $LDFLAGS -o "$out/test_output"
 "$out/test_output"
+
+# #6 -- dummy backend end-to-end: input -> execute -> output driven THROUGH the
+# transport (cli_dummy_inject -> read() -> state machine -> write() -> capture),
+# §11 flow control (backpressure completes / timeout drops / immediate fail),
+# §9/§18 abnormal cases and §10 multi-instance isolation.  Small CLI_* limits +
+# colour OFF as for #4 so overflow / too-many-tokens fit and output compares plain.
+gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
+    -DCLI_USE_COLOR=0 \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    "$here/test_integration.c" "$core/cli_session.c" "$core/cli_printf.c" "$core/cli_parse.c" \
+    $glue \
+    $LDFLAGS -o "$out/test_integration"
+"$out/test_integration"
 
 echo "host tests passed"

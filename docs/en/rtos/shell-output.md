@@ -83,13 +83,14 @@ command's output is dropped.
 
 ## Verification (host unit test)
 
-`shell/test/test_output.c` is compiled with `cli_printf.c` (the `shim/tx_api.h`,
-no-op lock stubs and a capturing `cli_tx_send_blocking`). It asserts the formatter
-(boundaries: `INT_MIN`/`LLONG_MIN`/`%p`/`NULL %s`/unknown spec/width+flags), the
-autoflush across >32 B, colour (SGR), hexdump, and TX-failure
-drop/`<0`/`tx_failed`/`tx_dropped`. The ThreadX flow control inside
-`cli_tx_send_blocking` (KILL, staged send, clamp) is covered by the ARM
-compile-smoke and review.
+`shell/test/test_output.c` is compiled with `cli_printf.c` (`shim/tx_api.h`;
+output goes through the shared [dummy backend + host glue](shell-testing.md),
+actually calling `tr->api->write()`). It asserts the formatter (boundaries:
+`INT_MIN`/`LLONG_MIN`/`%p`/`NULL %s`/unknown spec/width+flags), the autoflush
+across >32 B, colour (SGR), hexdump, and immediate TX-failure `<0`/`tx_failed`/no
+output. Flow control (backpressure completes, timeout drop, `tx_dropped`, clamp)
+is path-verified via the host glue by the [#6 integration test](shell-testing.md);
+`cli_core.c`'s ThreadX wait/KILL stays covered by the ARM smoke and review.
 
 ```bash
 sh shell/test/run_host_tests.sh   # => host tests passed

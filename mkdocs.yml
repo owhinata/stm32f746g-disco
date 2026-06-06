@@ -58,6 +58,7 @@ nav:
       - rtos/shell-parser.md
       - rtos/shell-core.md
       - rtos/shell-output.md
+      - rtos/shell-testing.md
 
 markdown_extensions:
   - admonition

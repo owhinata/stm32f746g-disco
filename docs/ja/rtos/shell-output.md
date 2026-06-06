@@ -70,10 +70,12 @@ newlib / Zephyr の printf コードは流用しない。
 
 ## 検証（ホスト単体テスト）
 
-`shell/test/test_output.c` を `cli_printf.c` と同時コンパイル（`shim/tx_api.h` + lock no-op stub +
-capture する `cli_tx_send_blocking`）。フォーマッタ（境界: `INT_MIN`/`LLONG_MIN`/`%p`/`NULL %s`/未知 spec/
-幅・フラグ）・32B 超の autoflush・色（SGR）・hexdump・TX 失敗時の drop/`<0`/`tx_failed`/`tx_dropped` を assert。
-`cli_tx_send_blocking` の ThreadX フロー制御（KILL・段階送信・clamp）は ARM コンパイルスモークとレビューで担保。
+`shell/test/test_output.c` を `cli_printf.c` と同時コンパイル（`shim/tx_api.h`、出力は共有
+[dummy backend + host glue](shell-testing.md) 経由で実際に `tr->api->write()` を叩く）。フォーマッタ
+（境界: `INT_MIN`/`LLONG_MIN`/`%p`/`NULL %s`/未知 spec/幅・フラグ）・32B 超の autoflush・色（SGR）・
+hexdump・TX 即失敗時の `<0`/`tx_failed`/無出力を assert。フロー制御（バックプレッシャ完走・timeout drop・
+`tx_dropped`・clamp）は [#6 統合テスト](shell-testing.md)が host glue で経路検証する
+（`cli_core.c` の ThreadX 待ち/KILL は ARM スモークとレビューで担保）。
 
 ```bash
 sh shell/test/run_host_tests.sh   # => host tests passed

@@ -7,11 +7,13 @@
  * CR / LF / CR-LF coalescing) and dispatch (cli_parse status -> message, handler
  * invocation with handler-relative argv, fail-safe, instance isolation).
  *
- * Drives the ThreadX-free cli_session.c directly (no thread, no backend): a
- * capture transport records everything written, and bytes are injected with
- * cli_input_byte().  The tx_* glue in cli_core.c is out of scope here and is
- * exercised on target.  Compiled with small CLI_* limits (see run_host_tests.sh)
- * so the buffer-full and too-many-tokens paths fit a compact input.
+ * Drives the ThreadX-free cli_session.c directly (no thread): bytes are injected
+ * at the session level with cli_input_byte(), while output and the tx_* glue go
+ * through the shared dummy backend (cli_backend_dummy) + host_glue, so this test
+ * and test_integration.c share one transport/flow-control model.  The full RX
+ * read() path is exercised end-to-end in test_integration.c.  Compiled with small
+ * CLI_* limits (see run_host_tests.sh) so the buffer-full and too-many-tokens
+ * paths fit a compact input.
  */
 #include <assert.h>
 #include <stddef.h>
@@ -21,52 +23,8 @@
 
 #include "cli_instance.h"
 #include "cli_internal.h"
-
-/* ---- capture transport ------------------------------------------------- */
-
-struct cap {
-	char   buf[2048];
-	size_t n;
-};
-
-static int cap_init(struct cli_transport *tr)   { (void)tr; return 0; }
-static int cap_enable(struct cli_transport *tr) { (void)tr; return 0; }
-static int cap_read(struct cli_transport *tr, uint8_t *d, size_t cap)
-{
-	(void)tr; (void)d; (void)cap; return 0;   /* test injects via cli_input_byte */
-}
-static int cap_write(struct cli_transport *tr, const uint8_t *d, size_t len)
-{
-	struct cap *c = (struct cap *)tr->ctx;
-	for (size_t i = 0; i < len && c->n < sizeof c->buf - 1; i++)
-		c->buf[c->n++] = (char)d[i];
-	c->buf[c->n] = '\0';
-	return (int)len;
-}
-static const struct cli_transport_api cap_api = {
-	cap_init, cap_enable, cap_write, cap_read, NULL, NULL,
-};
-
-/* #5 output-path hooks (ThreadX glue is firmware-only): lock is a no-op on the
- * host, and the "send" stub captures bytes -- or, when tx_fail is armed, drops
- * them and fails so the dispatch can exercise the §11 non-zero promotion. */
-static int tx_fail;
-
-int cli_lock(struct cli_instance *sh)   { (void)sh; return 0; }
-void cli_unlock(struct cli_instance *sh) { (void)sh; }
-
-int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t len)
-{
-	struct cap *c = (struct cap *)sh->tr->ctx;
-	if (tx_fail) {
-		sh->tx_dropped += (uint32_t)len;
-		return -1;
-	}
-	for (size_t i = 0; i < len && c->n < sizeof c->buf - 1; i++)
-		c->buf[c->n++] = (char)data[i];
-	c->buf[c->n] = '\0';
-	return 0;
-}
+#include "cli_backend_dummy.h"
+#include "host_glue.h"
 
 /* ---- test commands ----------------------------------------------------- */
 
@@ -99,22 +57,23 @@ CLI_CMD_REGISTER(need2,   NULL,    "needs 2 args", h_echo, 2, 0);
 
 /* ---- harness ----------------------------------------------------------- */
 
-static struct cap          cap_ctx;
-static struct cli_transport tr = { &cap_api, NULL, &cap_ctx };
-static struct cli_instance  sh;
+CLI_BACKEND_DUMMY_DEFINE(tr);
+static struct cli_instance sh;
 
 static void reset_sh(void)
 {
 	memset(&sh, 0, sizeof sh);
 	sh.tr = &tr;
 	tr.sh = &sh;
-	tr.ctx = &cap_ctx;
 	strcpy(sh.prompt, "> ");
-	cap_ctx.n = 0;
-	cap_ctx.buf[0] = '\0';
+	cli_dummy_clear_output(&tr);
+	cli_dummy_clear_rx(&tr);
+	cli_dummy_reset_stats(&tr);
+	cli_dummy_set_tx_fail(&tr, 0);
+	cli_dummy_set_tx_cap(&tr, 0);          /* unlimited */
+	cli_test_set_tx_wait_hook(NULL, NULL);
 	ran_argc = -1;
 	ran_a0[0] = ran_a1[0] = '\0';
-	tx_fail = 0;
 }
 
 static void feed(const char *s)
@@ -125,15 +84,17 @@ static void feed(const char *s)
 
 static void feed_byte(uint8_t b) { cli_input_byte(&sh, b); }
 
-static int count_occurrences(const char *hay, const char *needle)
+static const char *cap_str(void) { return cli_dummy_output_str(&tr); }
+static int cap_has(const char *needle) { return strstr(cap_str(), needle) != NULL; }
+
+static int count_occurrences(const char *needle)
 {
 	int n = 0;
 	size_t nl = strlen(needle);
-	for (const char *p = hay; (p = strstr(p, needle)) != NULL; p += nl)
+	for (const char *p = cap_str(); (p = strstr(p, needle)) != NULL; p += nl)
 		n++;
 	return n;
 }
-static int cap_has(const char *needle) { return strstr(cap_ctx.buf, needle) != NULL; }
 
 /* ---- tests ------------------------------------------------------------- */
 
@@ -183,7 +144,7 @@ static void test_ctrl_c(void)
 	feed_byte(0x03);                              /* Ctrl+C */
 	assert(sh.len == 0);
 	assert(cap_has("^C"));
-	assert(strstr(cap_ctx.buf, "> ") != NULL);    /* fresh prompt */
+	assert(cap_has("> "));                        /* fresh prompt */
 
 	/* Ctrl+C recovers even from a half-read escape sequence. */
 	reset_sh();
@@ -204,7 +165,9 @@ static void test_dispatch_ok(void)
 	assert(sh.len == 0);                          /* line reset after dispatch */
 	assert(sh.last_result == 0);
 	/* prompt reappears at the very end */
-	assert(strcmp(cap_ctx.buf + cap_ctx.n - 2, "> ") == 0);
+	size_t n;
+	const char *o = cli_dummy_output(&tr, &n);
+	assert(n >= 2 && strcmp(o + n - 2, "> ") == 0);
 
 	/* Subcommand: handler gets the leaf-relative argv (argv[0] == "list"). */
 	reset_sh();
@@ -217,15 +180,15 @@ static void test_newline_coalescing(void)
 {
 	reset_sh();
 	feed("version\r\n");                          /* CR-LF: one dispatch */
-	assert(count_occurrences(cap_ctx.buf, "echo-ran") == 1);
+	assert(count_occurrences("echo-ran") == 1);
 
 	reset_sh();
 	feed("version\n");                            /* lone LF: one dispatch */
-	assert(count_occurrences(cap_ctx.buf, "echo-ran") == 1);
+	assert(count_occurrences("echo-ran") == 1);
 
 	reset_sh();
 	feed("version\r");                            /* lone CR: one dispatch */
-	assert(count_occurrences(cap_ctx.buf, "echo-ran") == 1);
+	assert(count_occurrences("echo-ran") == 1);
 }
 
 static void test_dispatch_errors(void)
@@ -268,35 +231,39 @@ static void test_fail_safe(void)
 }
 
 /* §11: a TX failure during a command forces a non-zero result even though the
- * handler itself returned 0 (it did not check cli_print's return). */
+ * handler itself returned 0 (it did not check cli_print's return).  Here the
+ * dummy backend's immediate-failure mode stands in for a dead transport; the
+ * tx_dropped *count* (timeout path) is asserted in test_integration.c. */
 static void test_tx_failure_promotes_result(void)
 {
 	reset_sh();
-	tx_fail = 1;
+	cli_dummy_set_tx_fail(&tr, 1);
 	feed("version\r");
-	tx_fail = 0;
 	assert(sh.last_result == CLI_DISPATCH_ERR);
-	assert(sh.tx_dropped > 0);
+	assert(sh.tx_failed == 1);
 }
 
 /* Two independent instances must not share state or cross output streams. */
 static void test_instance_isolation(void)
 {
-	struct cap c1 = {0}, c2 = {0};
-	struct cli_transport t1 = { &cap_api, NULL, &c1 };
-	struct cli_transport t2 = { &cap_api, NULL, &c2 };
+	struct cli_dummy     d1 = {0}, d2 = {0};
+	struct cli_transport t1 = { &cli_dummy_api, NULL, &d1 };
+	struct cli_transport t2 = { &cli_dummy_api, NULL, &d2 };
 	struct cli_instance  s1, s2;
 
 	memset(&s1, 0, sizeof s1); s1.tr = &t1; t1.sh = &s1; strcpy(s1.prompt, "1> ");
 	memset(&s2, 0, sizeof s2); s2.tr = &t2; t2.sh = &s2; strcpy(s2.prompt, "2> ");
+	cli_dummy_set_tx_cap(&t1, 0); cli_dummy_set_tx_cap(&t2, 0);   /* unlimited */
 
 	for (const char *p = "version\r"; *p; p++) cli_input_byte(&s1, (uint8_t)*p);
 	for (const char *p = "no\r";      *p; p++) cli_input_byte(&s2, (uint8_t)*p);
 
-	assert(strstr(c1.buf, "echo-ran") != NULL);            /* s1 ran the command */
-	assert(strstr(c1.buf, "command not found") == NULL);
-	assert(strstr(c2.buf, "no: command not found") != NULL); /* s2 saw only its own */
-	assert(strstr(c2.buf, "echo-ran") == NULL);            /* no cross-talk */
+	const char *o1 = cli_dummy_output_str(&t1);
+	const char *o2 = cli_dummy_output_str(&t2);
+	assert(strstr(o1, "echo-ran") != NULL);                  /* s1 ran the command */
+	assert(strstr(o1, "command not found") == NULL);
+	assert(strstr(o2, "no: command not found") != NULL);     /* s2 saw only its own */
+	assert(strstr(o2, "echo-ran") == NULL);                  /* no cross-talk */
 	assert(s1.last_result == 0 && s2.last_result == CLI_DISPATCH_ERR);
 }
 

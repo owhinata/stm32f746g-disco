@@ -105,8 +105,9 @@ USART1 VCP backend（#7）、shell アプリ + `flash-shell`（#8）、行編集
 
 `shell/test/test_core.c` を `cli_session.c` + `cli_parse.c` と同時コンパイル（`shim/tx_api.h`
 を include パス先頭に、`CLI_CMD_BUFFER_SIZE`/`CLI_MAX_ARGC` を小さく上書きして満杯/トークン超過を検査）。
-capture transport で出力を記録し、ASCII フィルタ・状態機械・CR/LF/CR-LF・dispatch 写像・
-fail-safe・**2 インスタンスの出力非混在**を assert する。
+出力と `tx_*` グルーは共有 [dummy backend + host glue](shell-testing.md) 経由
+（`cli_session.c` への注入は `cli_input_byte` 直接）。ASCII フィルタ・状態機械・CR/LF/CR-LF・
+dispatch 写像・fail-safe・**2 インスタンスの出力非混在**を assert する。
 
 ```bash
 sh shell/test/run_host_tests.sh   # => host tests passed
