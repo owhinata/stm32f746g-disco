@@ -5,10 +5,11 @@ STMicroelectronics HAL**. The HAL/CMSIS sources and the ARM GNU toolchain are
 fetched automatically — nothing to install by hand except `cmake`, `ninja`,
 `git`, `curl`, and (for flashing) `st-flash`.
 
-| App        | What it does                                                       |
-|------------|-------------------------------------------------------------------|
-| `threadx`  | Eclipse ThreadX RTOS: two threads (LED blink + UART print)        |
-| `coremark` | EEMBC CoreMark benchmark — **optional**, off by default (see below)|
+| App             | What it does                                                       |
+|-----------------|-------------------------------------------------------------------|
+| `threadx`       | Eclipse ThreadX RTOS: two threads (LED blink + UART print)        |
+| `coremark`      | EEMBC CoreMark benchmark — **optional**, `-DBUILD_COREMARK=ON`     |
+| `thread_metric` | Thread-Metric RTOS benchmark — **optional**, `-DBUILD_THREAD_METRIC=ON` |
 
 Board bring-up (216 MHz clock, caches, VCP UART, printf) is shared in
 `src/bsp.c`.
@@ -124,6 +125,39 @@ the iteration count (`ITERATIONS=0`) to run 10–100 s. With the I/D-cache enabl
 the hot loops are cache-resident, so the flash 7-wait-state penalty is already
 hidden — moving the kernels into ITCM was measured to add only ~0.6 %, and the
 remaining gap to ST's published ~1082 (5.0/MHz) is compiler-bound (IAR vs GCC).
+
+## Thread-Metric (optional app)
+
+The Thread-Metric RTOS benchmark suite (8 tests measuring RTOS event throughput)
+runs on ThreadX. The `lib/threadx/utility/benchmarks/thread_metric` sources are
+used as-is; the runner lives in `src/app_thread_metric.c` + `port/threadx/`.
+
+```bash
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DBUILD_THREAD_METRIC=ON -DTHREAD_METRIC_TEST=basic
+cmake --build build --target flash-thread_metric
+```
+
+`THREAD_METRIC_TEST` selects the test: `basic` (default), `cooperative`,
+`preemptive`, `memory`, `message`, `sync`, `interrupt`, `interrupt_preempt`.
+Results print over the VCP every 30 s, e.g. the basic test:
+
+```
+**** Thread-Metric Basic Single Thread Processing Test **** Relative Time: 30
+Time Period Total:  252879
+```
+
+Integration notes:
+
+- ThreadX runs at **100 Hz** here (`TX_GLUE_TICK_DIV=10`,
+  `TX_TIMER_TICKS_PER_SECOND=100`) to match the porting layer's
+  `TM_THREADX_TICKS_PER_SECOND`, so `tm_thread_sleep(30)` is a real 30 s.
+- The interrupt tests raise `SVC #0` (`TM_CAUSE_INTERRUPT`); `port/threadx/tm_svc.c`
+  routes `SVC_Handler` to `tm_interrupt_handler` (linked only for those tests).
+- The benchmark counters are non-volatile globals updated in tight loops, so the
+  selected test source is built at `-O0` (otherwise GCC keeps the counter in a
+  register and the reporting thread sees a stale 0 → "thread died"). ThreadX
+  itself stays at `-O2`, so the measured RTOS operations are representative.
 
 ## Notes
 

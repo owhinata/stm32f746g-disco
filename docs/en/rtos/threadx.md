@@ -39,3 +39,30 @@ still masked safely inside ThreadX.
   definitions).
 - The port `.S` files `#include "tx_user.h"`, so the ASM include path must be
   set and `TX_INCLUDE_USER_DEFINE_FILE` defined.
+
+## Thread-Metric benchmark (optional)
+
+The Thread-Metric suite bundled with ThreadX (RTOS benchmark, 8 tests) runs as
+the `thread_metric` app.
+
+```bash
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DBUILD_THREAD_METRIC=ON -DTHREAD_METRIC_TEST=basic
+cmake --build build --target flash-thread_metric
+```
+
+`THREAD_METRIC_TEST`: `basic` (default) / `cooperative` / `preemptive` /
+`memory` / `message` / `sync` / `interrupt` / `interrupt_preempt`. Results print
+over the VCP every 30 s (e.g. basic: `Time Period Total: 252879`).
+
+Integration notes:
+
+- ThreadX runs at **100 Hz** (`TX_GLUE_TICK_DIV=10` +
+  `TX_TIMER_TICKS_PER_SECOND=100`) to match the porting layer's
+  `TM_THREADX_TICKS_PER_SECOND`, so `tm_thread_sleep(30)` is a real 30 s.
+- The interrupt tests raise `SVC #0` (`TM_CAUSE_INTERRUPT`); `port/threadx/tm_svc.c`
+  routes `SVC_Handler` to `tm_interrupt_handler` (linked only for those tests).
+- The benchmark counters are non-volatile globals updated in tight loops, so the
+  selected test source is built at `-O0` (at -O2 GCC keeps the counter in a
+  register and the reporting thread reads a stale 0 → "thread died"). ThreadX
+  stays at `-O2`.

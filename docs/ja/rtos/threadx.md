@@ -25,3 +25,21 @@
 
 - `common/src/*.c`（コア）+ `ports/cortex_m7/gnu/src/*.S`（コンテキストスイッチ等）をビルド。`tx_misra`（`.c`/`.S` とも）は重複定義のため**除外**。
 - ポート `.S` は `tx_user.h` を `#include` するため、ASM にも include パスを通し `TX_INCLUDE_USER_DEFINE_FILE` を定義。
+
+## Thread-Metric ベンチマーク（オプション）
+
+ThreadX 同梱の Thread-Metric（RTOS 性能ベンチ、8 テスト）を `thread_metric` アプリとして実行できる。
+
+```bash
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DBUILD_THREAD_METRIC=ON -DTHREAD_METRIC_TEST=basic
+cmake --build build --target flash-thread_metric
+```
+
+`THREAD_METRIC_TEST`：`basic`（既定）/ `cooperative` / `preemptive` / `memory` / `message` / `sync` / `interrupt` / `interrupt_preempt`。結果は 30 秒ごとに VCP 出力（例：basic は `Time Period Total: 252879`）。
+
+統合上の要点：
+
+- ThreadX tick を **100 Hz** に（`TX_GLUE_TICK_DIV=10` + `TX_TIMER_TICKS_PER_SECOND=100`）。移植層の `TM_THREADX_TICKS_PER_SECOND` に合わせ、`tm_thread_sleep(30)` が実 30 秒になる。
+- 割込みテストは `SVC #0`（`TM_CAUSE_INTERRUPT`）。`port/threadx/tm_svc.c` が `SVC_Handler`→`tm_interrupt_handler` を配線（該当テストのみリンク）。
+- ベンチのカウンタは非 volatile グローバルを無限ループで更新するため、テストソースのみ `-O0` でビルド（-O2 だとレジスタ保持でメモリに書き戻らず report が 0 を読み "died" になる）。ThreadX 本体は `-O2` のまま。

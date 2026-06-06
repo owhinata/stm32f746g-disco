@@ -45,11 +45,24 @@ void tx_glue_timer_enable(void)
     tx_timer_active = 1u;
 }
 
+/* Number of 1 ms SysTicks per ThreadX tick. Default 1 (1 kHz ThreadX tick).
+   Override with -DTX_GLUE_TICK_DIV (e.g. 10 -> 100 Hz). Keep in sync with
+   TX_TIMER_TICKS_PER_SECOND in tx_user.h. */
+#ifndef TX_GLUE_TICK_DIV
+#define TX_GLUE_TICK_DIV 1u
+#endif
+
 void SysTick_Handler(void)
 {
-    HAL_IncTick();
+    HAL_IncTick();   /* HAL timebase stays at 1 ms */
+
     if (tx_timer_active != 0u)
     {
-        _tx_timer_interrupt();
+        static UINT div = 0u;
+        if (++div >= (UINT)TX_GLUE_TICK_DIV)
+        {
+            div = 0u;
+            _tx_timer_interrupt();
+        }
     }
 }

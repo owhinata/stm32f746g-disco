@@ -7,8 +7,12 @@
 #ifndef TX_USER_H
 #define TX_USER_H
 
-/* SysTick is driven at 1 kHz by the HAL timebase, and the SysTick handler
-   calls _tx_timer_interrupt() once per ms, so one ThreadX tick == 1 ms. */
+/* ThreadX tick rate. The SysTick handler (tx_glue.c) calls
+   _tx_timer_interrupt() every TX_GLUE_TICK_DIV ms, so the effective tick rate
+   is 1000 / TX_GLUE_TICK_DIV Hz. Keep this define in sync with that rate.
+   Default: 1 kHz (1 tick = 1 ms). Override with -DTX_TIMER_TICKS_PER_SECOND. */
+#ifndef TX_TIMER_TICKS_PER_SECOND
 #define TX_TIMER_TICKS_PER_SECOND  1000
+#endif
 
 #endif /* TX_USER_H */

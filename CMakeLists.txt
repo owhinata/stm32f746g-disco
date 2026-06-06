@@ -130,3 +130,78 @@ target_include_directories(threadx PRIVATE
 target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE)
 target_compile_options(threadx PRIVATE -O2)
 firmware_finalize(threadx)
+
+# --- App: thread_metric (optional Thread-Metric RTOS benchmark) -------------
+# Runs the EEMBC-style ThreadX benchmark suite. Pick the test with
+# -DTHREAD_METRIC_TEST=<name>. Reuses TX_DIR/TX_PORT/TX_CORE/TX_ASM from above.
+option(BUILD_THREAD_METRIC "Build the Thread-Metric RTOS benchmark app" OFF)
+if(BUILD_THREAD_METRIC)
+    set(THREAD_METRIC_TEST "basic" CACHE STRING
+        "Thread-Metric test: basic|cooperative|preemptive|memory|message|sync|interrupt|interrupt_preempt")
+    set(TM_DIR "${TX_DIR}/utility/benchmarks/thread_metric")
+
+    # Map the short test name to its source file; interrupt tests also need the
+    # SVC glue (TM_CAUSE_INTERRUPT == SVC #0).
+    set(TM_NEEDS_SVC FALSE)
+    if(THREAD_METRIC_TEST STREQUAL "basic")
+        set(TM_TEST_SRC "${TM_DIR}/tm_basic_processing_test.c")
+    elseif(THREAD_METRIC_TEST STREQUAL "cooperative")
+        set(TM_TEST_SRC "${TM_DIR}/tm_cooperative_scheduling_test.c")
+    elseif(THREAD_METRIC_TEST STREQUAL "preemptive")
+        set(TM_TEST_SRC "${TM_DIR}/tm_preemptive_scheduling_test.c")
+    elseif(THREAD_METRIC_TEST STREQUAL "memory")
+        set(TM_TEST_SRC "${TM_DIR}/tm_memory_allocation_test.c")
+    elseif(THREAD_METRIC_TEST STREQUAL "message")
+        set(TM_TEST_SRC "${TM_DIR}/tm_message_processing_test.c")
+    elseif(THREAD_METRIC_TEST STREQUAL "sync")
+        set(TM_TEST_SRC "${TM_DIR}/tm_synchronization_processing_test.c")
+    elseif(THREAD_METRIC_TEST STREQUAL "interrupt")
+        set(TM_TEST_SRC "${TM_DIR}/tm_interrupt_processing_test.c")
+        set(TM_NEEDS_SVC TRUE)
+    elseif(THREAD_METRIC_TEST STREQUAL "interrupt_preempt")
+        set(TM_TEST_SRC "${TM_DIR}/tm_interrupt_preemption_processing_test.c")
+        set(TM_NEEDS_SVC TRUE)
+    else()
+        message(FATAL_ERROR "Unknown THREAD_METRIC_TEST '${THREAD_METRIC_TEST}'")
+    endif()
+
+    set(TM_SRC
+        "${CMAKE_SOURCE_DIR}/src/app_thread_metric.c"
+        "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
+        "${TM_DIR}/threadx_example/tm_porting_layer_threadx.c"
+        "${TM_TEST_SRC}"
+        ${TX_CORE} ${TX_ASM})
+    if(TM_NEEDS_SVC)
+        list(APPEND TM_SRC "${CMAKE_SOURCE_DIR}/port/threadx/tm_svc.c")
+    endif()
+
+    add_executable(thread_metric ${TM_SRC})
+    target_link_libraries(thread_metric PRIVATE common)
+    target_include_directories(thread_metric PRIVATE
+        "${TX_DIR}/common/inc" "${TX_PORT}/inc"
+        "${CMAKE_SOURCE_DIR}/port/threadx"
+        "${TM_DIR}")
+    # ThreadX tick at 100 Hz to match the porting layer's
+    # TM_THREADX_TICKS_PER_SECOND (so tm_thread_sleep(seconds) is real seconds),
+    # plus the recommended Thread-Metric performance build options.
+    target_compile_definitions(thread_metric PRIVATE
+        TX_INCLUDE_USER_DEFINE_FILE
+        TX_TIMER_TICKS_PER_SECOND=100
+        TX_GLUE_TICK_DIV=10
+        TX_DISABLE_ERROR_CHECKING
+        TX_DISABLE_NOTIFY_CALLBACKS
+        TX_DISABLE_REDUNDANT_CLEARING
+        TX_DISABLE_STACK_FILLING
+        TX_NOT_INTERRUPTABLE
+        TX_TIMER_PROCESS_IN_ISR
+        TX_REACTIVATE_INLINE
+        TX_INLINE_THREAD_RESUME_SUSPEND)
+    target_compile_options(thread_metric PRIVATE -O2)
+    # The benchmark counters are plain (non-volatile) globals updated in tight
+    # infinite loops; at -O2 GCC keeps them in a register and never writes them
+    # back, so the reporting thread reads a stale value ("thread died"). Build
+    # the test source at -O0 so the counters hit memory. ThreadX itself stays
+    # at -O2, so the measured RTOS operations remain representative.
+    set_source_files_properties("${TM_TEST_SRC}" PROPERTIES COMPILE_OPTIONS "-O0")
+    firmware_finalize(thread_metric)
+endif()
