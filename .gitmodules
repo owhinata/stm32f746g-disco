@@ -11,3 +11,6 @@
 [submodule "lib/coremark"]
 	path = lib/coremark
 	url = https://github.com/eembc/coremark
+[submodule "lib/threadx"]
+	path = lib/threadx
+	url = https://github.com/eclipse-threadx/threadx
