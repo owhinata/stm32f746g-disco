@@ -88,6 +88,9 @@ int cli_init(struct cli_instance *sh)
 	sh->prev_cr     = 0;
 	sh->last_result = 0;
 	sh->rx_dropped  = 0;
+	sh->out_len     = 0;
+	sh->tx_failed   = 0;
+	sh->tx_dropped  = 0;
 
 	/*
 	 * Bring up the backend BEFORE creating any ThreadX object.  The common
@@ -146,4 +149,72 @@ void cli_transport_notify_rx(struct cli_instance *sh)
 void cli_transport_notify_tx(struct cli_instance *sh)
 {
 	tx_event_flags_set(&sh->events, CLI_EVT_TX, TX_OR);
+}
+
+/* Map a cli_config tick value to a ThreadX wait option (0 == wait forever). */
+static ULONG cli_wait(unsigned ticks)
+{
+	return ticks == 0u ? TX_WAIT_FOREVER : (ULONG)ticks;
+}
+
+/*
+ * Output lock (issue #5): the per-instance TX mutex guards a whole output call
+ * (format + stage + flush) so concurrent writers to one instance never corrupt
+ * out_buf/out_len.  TX_INHERIT (set in cli_init) bounds priority inversion while
+ * the lock is held across a TX-space wait.
+ */
+int cli_lock(struct cli_instance *sh)
+{
+	return tx_mutex_get(&sh->tx_lock, cli_wait(CLI_TX_MUTEX_WAIT)) == TX_SUCCESS
+	       ? 0 : -1;
+}
+
+void cli_unlock(struct cli_instance *sh)
+{
+	tx_mutex_put(&sh->tx_lock);
+}
+
+/*
+ * Push len bytes to the transport, realising req §11's "blocking until sent"
+ * semantics.  MUST be called with the output lock held (see cli_lock).  write()
+ * is non-blocking and returns the count accepted; when the TX buffer is full we
+ * suspend on CLI_EVT_TX (set by the backend when space frees) with a timeout.
+ * On timeout the rest is dropped (drop stat + failure).  CLI_EVT_KILL aborts the
+ * wait even with an infinite timeout, and is re-posted for the main loop.
+ * Returns 0 if all bytes were sent, <0 on drop/error.
+ */
+int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t len)
+{
+	struct cli_transport *tr = sh->tr;
+	size_t sent = 0;
+
+	while (sent < len) {
+		int n = tr->api->write(tr, data + sent, len - sent);
+		if (n < 0) {
+			sh->tx_failed = 1;
+			return -1;
+		}
+		if (n > 0) {
+			if ((size_t)n > len - sent)     /* defensive clamp */
+				n = (int)(len - sent);
+			sent += (size_t)n;
+			continue;
+		}
+
+		/* TX full: wait for space (or a kill request). */
+		ULONG flags;
+		if (tx_event_flags_get(&sh->events, CLI_EVT_TX | CLI_EVT_KILL,
+		                       TX_OR_CLEAR, &flags, cli_wait(CLI_TX_TIMEOUT))
+		    != TX_SUCCESS) {
+			sh->tx_dropped += (uint32_t)(len - sent);   /* timeout */
+			return -1;
+		}
+		if (flags & CLI_EVT_KILL) {
+			tx_event_flags_set(&sh->events, CLI_EVT_KILL, TX_OR); /* re-post */
+			sh->tx_dropped += (uint32_t)(len - sent);
+			return -1;
+		}
+		/* else CLI_EVT_TX: space freed, retry write */
+	}
+	return 0;
 }

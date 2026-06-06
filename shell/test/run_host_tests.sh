@@ -47,9 +47,21 @@ gcc $CFLAGS -DCLI_MAX_ARGC=8 -DCLI_MAX_SUBCMD_DEPTH=2 \
 # so the buffer-full (CLI_CMD_BUFFER_SIZE) and too-many-tokens (CLI_MAX_ARGC)
 # paths fit a compact input line.
 gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
+    -DCLI_USE_COLOR=0 \
     -I "$here/shim" -I "$inc" -I "$core" \
-    "$here/test_core.c" "$core/cli_session.c" "$core/cli_parse.c" \
+    "$here/test_core.c" "$core/cli_session.c" "$core/cli_printf.c" "$core/cli_parse.c" \
     $LDFLAGS -o "$out/test_core"
 "$out/test_core"
+
+# #5 -- output API: minimal formatter, 32 B staging + autoflush, VT100 colour,
+# hexdump, TX-failure drop/return.  cli_printf.c is ThreadX-free (the tx_* flow
+# control lives in cli_core.c), so it builds against the shim with no-op lock
+# stubs and a capturing cli_tx_send_blocking.  Colour ON (default) and the real
+# 32 B CLI_PRINTF_BUFFER_SIZE so the SGR escapes and autoflush are exercised.
+gcc $CFLAGS \
+    -I "$here/shim" -I "$inc" -I "$core" \
+    "$here/test_output.c" "$core/cli_printf.c" \
+    $LDFLAGS -o "$out/test_output"
+"$out/test_output"
 
 echo "host tests passed"

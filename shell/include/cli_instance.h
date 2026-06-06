@@ -61,13 +61,20 @@ struct cli_transport;
 
 /**
  * Backend transport interface.  The core talks to hardware only through this.
- * init/enable/write/read are mandatory; uninit/update may be NULL.  write is a
- * blocking send; read is a non-blocking drain returning 0..cap bytes copied.
+ * init/enable/write/read are mandatory; uninit/update may be NULL.
+ *
+ * write (#5 contract): NON-blocking.  Enqueue up to @p len bytes into the
+ * backend TX buffer and return the count actually accepted (0..len), or <0 on
+ * error.  It must NOT block.  If it accepts fewer than @p len (TX full), the
+ * backend is obliged to fire cli_transport_notify_tx() once space frees again --
+ * the core suspends on CLI_EVT_TX waiting for exactly that, and realises the
+ * "blocking until sent" behaviour of req §11 itself (with a timeout).
+ * read: non-blocking drain returning 0..cap bytes copied.
  */
 struct cli_transport_api {
 	int  (*init)(struct cli_transport *tr);                          /**< prepare; sh is tr->sh */
 	int  (*enable)(struct cli_transport *tr);                        /**< start RX (e.g. enable IRQ) */
-	int  (*write)(struct cli_transport *tr, const uint8_t *data, size_t len); /**< blocking; ret len or <0 */
+	int  (*write)(struct cli_transport *tr, const uint8_t *data, size_t len); /**< non-blocking; ret accepted 0..len or <0 */
 	int  (*read)(struct cli_transport *tr, uint8_t *data, size_t cap);        /**< non-blocking; ret 0..cap */
 	void (*uninit)(struct cli_transport *tr);                        /**< optional (NULL ok) */
 	void (*update)(struct cli_transport *tr);                        /**< optional periodic poll (NULL ok), req §4.1 */
@@ -110,9 +117,15 @@ struct cli_instance {
 
 	char prompt[CLI_PROMPT_BUFFER_SIZE];
 
+	/* Output staging + flow control (#5). */
+	char     out_buf[CLI_PRINTF_BUFFER_SIZE]; /**< staging buffer; flushed when full */
+	uint16_t out_len;
+	uint8_t  tx_failed;              /**< output dropped this command (TX timeout); reset each dispatch */
+
 	enum cli_state state;
 	int            last_result;      /**< return value of the most recent command */
 	uint32_t       rx_dropped;       /**< RX-overflow drop count (incremented in #7) */
+	uint32_t       tx_dropped;       /**< bytes dropped on TX timeout (#5) */
 };
 
 /**

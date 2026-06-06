@@ -86,12 +86,27 @@ void cli_input_byte(struct cli_instance *sh, uint8_t b);
 /** Parse and run the accumulated line, print the outcome, return to the prompt. */
 void cli_dispatch_line(struct cli_instance *sh);
 
-/** Blocking raw write straight to the transport (no lock; single-thread output
- *  in #4).  The locked/buffered output API is layered on top by #5. */
-int  cli_raw_write_unlocked(struct cli_instance *sh, const void *data, size_t len);
-
 /** Emit the instance prompt. */
 void cli_prompt(struct cli_instance *sh);
+
+/*
+ * Output plumbing (issue #5).  cli_printf.c (ThreadX-free) does the formatting
+ * and 32 B staging and reaches the transport only through these three hooks,
+ * which are implemented with ThreadX in cli_core.c (and stubbed in host tests):
+ *   - cli_lock/cli_unlock: take/release the per-instance TX mutex around a whole
+ *     output call so formatting + staging + flush are atomic (req §10).
+ *   - cli_tx_send_blocking: push len bytes to the transport, blocking on TX
+ *     space with a timeout; called only while the lock is held (req §11).
+ * cli_lock returns 0 on success, <0 if the mutex could not be acquired.
+ */
+int  cli_lock(struct cli_instance *sh);
+void cli_unlock(struct cli_instance *sh);
+int  cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t len);
+
+/* Staging primitives (cli_printf.c): append one byte (autoflush when full) and
+ * flush the staging buffer through cli_tx_send_blocking. */
+void cli_out_putc(struct cli_instance *sh, char c);
+void cli_out_flush(struct cli_instance *sh);
 
 #ifdef __cplusplus
 }

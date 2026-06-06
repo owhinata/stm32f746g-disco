@@ -29,7 +29,7 @@ The core never touches hardware directly; it talks to the backend through
 struct cli_transport_api {
     int  (*init)(struct cli_transport *tr);                          /* required */
     int  (*enable)(struct cli_transport *tr);                        /* required: start RX */
-    int  (*write)(struct cli_transport *tr, const uint8_t *d, size_t n);/* required: blocking */
+    int  (*write)(struct cli_transport *tr, const uint8_t *d, size_t n);/* required: non-blocking, returns accepted 0..n (finalised in #5) */
     int  (*read)(struct cli_transport *tr, uint8_t *d, size_t cap);  /* required: non-blocking, 0..cap */
     void (*uninit)(struct cli_transport *tr);                        /* optional (NULL ok) */
     void (*update)(struct cli_transport *tr);                        /* optional (NULL ok) */

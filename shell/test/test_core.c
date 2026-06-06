@@ -47,6 +47,27 @@ static const struct cli_transport_api cap_api = {
 	cap_init, cap_enable, cap_write, cap_read, NULL, NULL,
 };
 
+/* #5 output-path hooks (ThreadX glue is firmware-only): lock is a no-op on the
+ * host, and the "send" stub captures bytes -- or, when tx_fail is armed, drops
+ * them and fails so the dispatch can exercise the §11 non-zero promotion. */
+static int tx_fail;
+
+int cli_lock(struct cli_instance *sh)   { (void)sh; return 0; }
+void cli_unlock(struct cli_instance *sh) { (void)sh; }
+
+int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t len)
+{
+	struct cap *c = (struct cap *)sh->tr->ctx;
+	if (tx_fail) {
+		sh->tx_dropped += (uint32_t)len;
+		return -1;
+	}
+	for (size_t i = 0; i < len && c->n < sizeof c->buf - 1; i++)
+		c->buf[c->n++] = (char)data[i];
+	c->buf[c->n] = '\0';
+	return 0;
+}
+
 /* ---- test commands ----------------------------------------------------- */
 
 static int  ran_argc;
@@ -59,7 +80,7 @@ static int h_echo(struct cli_instance *sh, int argc, char **argv)
 	ran_a0[0] = ran_a1[0] = '\0';
 	if (argc > 0) { strncpy(ran_a0, argv[0], sizeof ran_a0 - 1); ran_a0[sizeof ran_a0 - 1] = '\0'; }
 	if (argc > 1) { strncpy(ran_a1, argv[1], sizeof ran_a1 - 1); ran_a1[sizeof ran_a1 - 1] = '\0'; }
-	cli_raw_write_unlocked(sh, "echo-ran\r\n", 10);
+	cli_write(sh, "echo-ran\r\n", 10);
 	return 0;
 }
 static int h_fail(struct cli_instance *sh, int argc, char **argv)
@@ -93,6 +114,7 @@ static void reset_sh(void)
 	cap_ctx.buf[0] = '\0';
 	ran_argc = -1;
 	ran_a0[0] = ran_a1[0] = '\0';
+	tx_fail = 0;
 }
 
 static void feed(const char *s)
@@ -245,6 +267,18 @@ static void test_fail_safe(void)
 	assert(cap_has("echo-ran"));
 }
 
+/* §11: a TX failure during a command forces a non-zero result even though the
+ * handler itself returned 0 (it did not check cli_print's return). */
+static void test_tx_failure_promotes_result(void)
+{
+	reset_sh();
+	tx_fail = 1;
+	feed("version\r");
+	tx_fail = 0;
+	assert(sh.last_result == CLI_DISPATCH_ERR);
+	assert(sh.tx_dropped > 0);
+}
+
 /* Two independent instances must not share state or cross output streams. */
 static void test_instance_isolation(void)
 {
@@ -275,6 +309,7 @@ int main(void)
 	test_newline_coalescing();
 	test_dispatch_errors();
 	test_fail_safe();
+	test_tx_failure_promotes_result();
 	test_instance_isolation();
 	printf("OK: ascii filter / state machine / dispatch / fail-safe / isolation pass\n");
 	return 0;

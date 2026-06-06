@@ -81,6 +81,27 @@
 #define CLI_RX_DRAIN_CHUNK 32
 #endif
 
+/* TX flow-control timeout in ThreadX ticks (impl. #5, req §11): how long an
+ * output blocks waiting for transport TX space before it gives up, drops the
+ * rest, bumps the drop stat and fails the call.  0 == wait forever (never drop).
+ * Default 1000 ~= 1 s on the usual 1 kHz ThreadX tick.  Plain integer (no
+ * ThreadX symbol here); cli_core.c maps 0 -> TX_WAIT_FOREVER. */
+#ifndef CLI_TX_TIMEOUT
+#define CLI_TX_TIMEOUT 1000
+#endif
+
+/* TX/output mutex acquire timeout in ThreadX ticks (impl. #5).  0 == wait
+ * forever; cli_core.c maps 0 -> TX_WAIT_FOREVER. */
+#ifndef CLI_TX_MUTEX_WAIT
+#define CLI_TX_MUTEX_WAIT 0
+#endif
+
+/* Colour output (impl. #5): 1 emits VT100 SGR for cli_error/warn/info, 0 emits
+ * none (monochrome terminals / logs). */
+#ifndef CLI_USE_COLOR
+#define CLI_USE_COLOR 1
+#endif
+
 /*
  * The number of registered commands is bounded only by the linker section
  * capacity (effectively unlimited; the scan is linear).  Tab-completion does

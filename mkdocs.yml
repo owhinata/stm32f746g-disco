@@ -57,6 +57,7 @@ nav:
       - rtos/shell-registration.md
       - rtos/shell-parser.md
       - rtos/shell-core.md
+      - rtos/shell-output.md
 
 markdown_extensions:
   - admonition

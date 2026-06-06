@@ -27,7 +27,7 @@
 struct cli_transport_api {
     int  (*init)(struct cli_transport *tr);                          /* 必須 */
     int  (*enable)(struct cli_transport *tr);                        /* 必須: RX 開始 */
-    int  (*write)(struct cli_transport *tr, const uint8_t *d, size_t n);/* 必須: ブロッキング */
+    int  (*write)(struct cli_transport *tr, const uint8_t *d, size_t n);/* 必須: 非ブロッキング, 受理 0..n 返却 (#5 で確定) */
     int  (*read)(struct cli_transport *tr, uint8_t *d, size_t cap);  /* 必須: 非ブロッキング, 0..cap */
     void (*uninit)(struct cli_transport *tr);                        /* 任意（NULL 可） */
     void (*update)(struct cli_transport *tr);                        /* 任意（NULL 可） */

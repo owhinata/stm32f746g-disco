@@ -133,6 +133,28 @@ struct cli_cmd {
 extern const struct cli_cmd __cli_root_cmds_start[];
 extern const struct cli_cmd __cli_root_cmds_end[];
 
+/*
+ * Output API (impl. #5).  Handlers print through these; each call formats into a
+ * per-instance staging buffer, flushes to the instance's own transport under the
+ * TX lock, and is flow-controlled (blocks on TX space, with a timeout).  Return
+ * 0 on full success, <0 if output failed (a TX timeout dropped bytes, or the
+ * output lock could not be acquired) -- a handler may propagate that as a
+ * non-zero exit, and the core also forces a non-zero command result when output
+ * failed (req §11).  Output API is thread-context only (it
+ * waits on a ThreadX mutex / event flag); never call it from an ISR.  cli_error
+ * is red, cli_warn yellow, cli_info green (req §2; disable with CLI_USE_COLOR=0).
+ */
+int cli_write(struct cli_instance *sh, const void *data, size_t len);
+int cli_print(struct cli_instance *sh, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+int cli_error(struct cli_instance *sh, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+int cli_warn(struct cli_instance *sh, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+int cli_info(struct cli_instance *sh, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+int cli_hexdump(struct cli_instance *sh, const void *data, size_t len);
+
 /** Iterate every registered root command in .shell_root_cmds order. */
 #define CLI_ROOT_CMD_FOREACH(it) \
 	for (const struct cli_cmd *it = __cli_root_cmds_start; \
