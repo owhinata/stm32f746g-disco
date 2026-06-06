@@ -1,17 +1,17 @@
-# STM32F746G-DISCO — bare-metal apps (blink / CoreMark)
+# STM32F746G-DISCO — Eclipse ThreadX on the official ST HAL
 
-OS-less samples for the STM32F746G-DISCO (STM32F746NGH6), built with the
-**official STMicroelectronics HAL**. The HAL/CMSIS sources and the ARM GNU
-toolchain are both fetched automatically — nothing to install by hand except
-`cmake`, `ninja`, `git`, `curl`, and (for flashing) `st-flash`.
-
-Two apps share the same board bring-up (`src/bsp.c`):
+STM32F746G-DISCO (STM32F746NGH6) firmware built with the **official
+STMicroelectronics HAL**. The HAL/CMSIS sources and the ARM GNU toolchain are
+fetched automatically — nothing to install by hand except `cmake`, `ninja`,
+`git`, `curl`, and (for flashing) `st-flash`.
 
 | App        | What it does                                                       |
 |------------|-------------------------------------------------------------------|
-| `blink`    | Blinks LD1 (PI1) at 1 Hz, prints `hello world` + a tick over VCP   |
-| `coremark` | Runs EEMBC CoreMark and prints the score over the VCP             |
 | `threadx`  | Eclipse ThreadX RTOS: two threads (LED blink + UART print)        |
+| `coremark` | EEMBC CoreMark benchmark — **optional**, off by default (see below)|
+
+Board bring-up (216 MHz clock, caches, VCP UART, printf) is shared in
+`src/bsp.c`.
 
 ## Chip configuration
 
@@ -28,19 +28,19 @@ Two apps share the same board bring-up (`src/bsp.c`):
 ## Layout
 
 ```
-include/        main.h, bsp.h, stm32f7xx_it.h
-src/            bsp.c (clock/cache/UART/printf), main.c (blink), stm32f7xx_it.c
-port/coremark/  core_portme.{c,h}   CoreMark port (SysTick timing, printf output)
-port/threadx/   tx_user.h, tx_glue.c (low-level init + SysTick), app in src/app_threadx.c
+include/        main.h (LED defines), bsp.h, stm32f7xx_it.h
+src/            bsp.c (clock/cache/UART/printf), app_threadx.c, stm32f7xx_it.c
+port/threadx/   tx_user.h, tx_glue.c (low-level init + SysTick)
+port/coremark/  core_portme.{c,h}   CoreMark port (kept for the optional app)
 ldscript/       STM32F746NGHx_FLASH.ld
 cmake/          arm-none-eabi-toolchain.cmake (auto-downloads the toolchain)
-CMakeLists.txt  builds all three apps (blink / coremark / threadx)
+CMakeLists.txt  builds threadx (and coremark when -DBUILD_COREMARK=ON)
 lib/            git submodules:
                   stm32f7xx_hal_driver   (ST official HAL)
                   cmsis_device_f7        (startup, system_*, device headers)
                   cmsis_core             (CMSIS Core, cm7 branch)
-                  coremark               (EEMBC CoreMark)
                   threadx                (Eclipse ThreadX RTOS)
+                  coremark               (EEMBC CoreMark — used by the optional app)
 ```
 
 `stm32f7xx_hal_conf.h` is generated at configure time from the upstream HAL
@@ -55,18 +55,24 @@ toolchain into `./tools` and inits the git submodules automatically.
 git clone --recurse-submodules <this repo>
 cd stm32f746g-disco
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-cmake --build build            # builds all three apps
+cmake --build build            # builds threadx
 ```
 
-Artifacts land in `build/<app>.{elf,hex,bin}` (one per app: blink, coremark,
-threadx). To build just one: `cmake --build build --target threadx`.
+Artifacts land in `build/threadx.{elf,hex,bin}`.
+
+To also build CoreMark (the submodule and port are kept in the tree):
+
+```bash
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DBUILD_COREMARK=ON
+cmake --build build            # now builds threadx + coremark
+```
 
 ## Flash / run
 
 ```bash
-cmake --build build --target flash-blink      # blink
-cmake --build build --target flash-coremark   # CoreMark
 cmake --build build --target flash-threadx    # ThreadX demo
+cmake --build build --target flash-coremark   # CoreMark (needs -DBUILD_COREMARK=ON)
 ```
 
 Each `flash-<app>` target writes `<app>.bin` to `0x08000000` over ST-Link and

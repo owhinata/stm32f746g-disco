@@ -86,32 +86,29 @@ function(firmware_finalize tgt)
         COMMENT "Flashing ${tgt} over ST-Link")
 endfunction()
 
-# --- App: blink ------------------------------------------------------------
-add_executable(blink
-    "${CMAKE_SOURCE_DIR}/src/main.c"
-    "${CMAKE_SOURCE_DIR}/src/stm32f7xx_it.c")
-target_link_libraries(blink PRIVATE common)
-target_compile_options(blink PRIVATE -Og)
-firmware_finalize(blink)
-
-# --- App: coremark ---------------------------------------------------------
-set(CMK_DIR "${CMAKE_SOURCE_DIR}/lib/coremark")
-add_executable(coremark
-    "${CMAKE_SOURCE_DIR}/src/stm32f7xx_it.c"
-    "${CMK_DIR}/core_list_join.c"
-    "${CMK_DIR}/core_main.c"
-    "${CMK_DIR}/core_matrix.c"
-    "${CMK_DIR}/core_state.c"
-    "${CMK_DIR}/core_util.c"
-    "${CMAKE_SOURCE_DIR}/port/coremark/core_portme.c")
-target_link_libraries(coremark PRIVATE common)
-target_include_directories(coremark PRIVATE
-    "${CMK_DIR}" "${CMAKE_SOURCE_DIR}/port/coremark")
-target_compile_definitions(coremark PRIVATE
-    ITERATIONS=0 PERFORMANCE_RUN=1 TOTAL_DATA_SIZE=2000)
-target_compile_options(coremark PRIVATE -O3 -funroll-loops)
-target_link_options(coremark PRIVATE -u _printf_float)  # nano printf %f
-firmware_finalize(coremark)
+# --- App: coremark (optional; kept for later, off by default) --------------
+# The lib/coremark submodule and port/coremark/ are retained on disk; enable
+# the build with: cmake -B build ... -DBUILD_COREMARK=ON
+option(BUILD_COREMARK "Build the EEMBC CoreMark benchmark app" OFF)
+if(BUILD_COREMARK)
+    set(CMK_DIR "${CMAKE_SOURCE_DIR}/lib/coremark")
+    add_executable(coremark
+        "${CMAKE_SOURCE_DIR}/src/stm32f7xx_it.c"
+        "${CMK_DIR}/core_list_join.c"
+        "${CMK_DIR}/core_main.c"
+        "${CMK_DIR}/core_matrix.c"
+        "${CMK_DIR}/core_state.c"
+        "${CMK_DIR}/core_util.c"
+        "${CMAKE_SOURCE_DIR}/port/coremark/core_portme.c")
+    target_link_libraries(coremark PRIVATE common)
+    target_include_directories(coremark PRIVATE
+        "${CMK_DIR}" "${CMAKE_SOURCE_DIR}/port/coremark")
+    target_compile_definitions(coremark PRIVATE
+        ITERATIONS=0 PERFORMANCE_RUN=1 TOTAL_DATA_SIZE=2000)
+    target_compile_options(coremark PRIVATE -O3 -funroll-loops)
+    target_link_options(coremark PRIVATE -u _printf_float)  # nano printf %f
+    firmware_finalize(coremark)
+endif()
 
 # --- App: threadx ----------------------------------------------------------
 # ThreadX provides its own PendSV_Handler, so src/stm32f7xx_it.c is omitted.
