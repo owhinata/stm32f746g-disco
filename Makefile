@@ -14,8 +14,11 @@
 #    make distclean  # also remove the downloaded toolchain
 # ============================================================================
 
-TARGET    := blink
-BUILD_DIR := build
+# Application selector:  make            -> blink (default)
+#                        make APP=coremark
+APP       ?= blink
+TARGET    := $(APP)
+BUILD_DIR := build/$(APP)
 
 # ---------------------------------------------------------------------------
 # Make sure HAL/CMSIS submodules are present before the wildcards below expand.
@@ -54,12 +57,38 @@ CMSIS_CORE := lib/cmsis_core
 # do not use simply compile to empty objects.
 HAL_SOURCES := $(filter-out %_template.c,$(wildcard $(HAL_DIR)/Src/*.c))
 
-C_SOURCES := \
-  src/main.c \
+# Sources common to every app (board bring-up + HAL + CMSIS).
+COMMON_SOURCES := \
+  src/bsp.c \
   src/stm32f7xx_it.c \
   $(CMSIS_DEV)/Source/Templates/system_stm32f7xx.c \
   $(HAL_SOURCES)
 
+# ---- Per-application sources / flags -------------------------------------
+ifeq ($(APP),coremark)
+  CMK_DIR      := lib/coremark
+  APP_SOURCES  := \
+    $(CMK_DIR)/core_list_join.c \
+    $(CMK_DIR)/core_main.c \
+    $(CMK_DIR)/core_matrix.c \
+    $(CMK_DIR)/core_state.c \
+    $(CMK_DIR)/core_util.c \
+    port/coremark/core_portme.c
+  APP_INCLUDES := -I$(CMK_DIR) -Iport/coremark
+  APP_DEFS     := -DITERATIONS=0 -DPERFORMANCE_RUN=1 -DTOTAL_DATA_SIZE=2000
+  APP_OPT      := -O3 -funroll-loops
+  APP_LDFLAGS  := -Wl,-u,_printf_float    # nano printf float support for %f
+else ifeq ($(APP),blink)
+  APP_SOURCES  := src/main.c
+  APP_INCLUDES :=
+  APP_DEFS     :=
+  APP_OPT      := -Og
+  APP_LDFLAGS  :=
+else
+  $(error Unknown APP '$(APP)'. Use APP=blink or APP=coremark)
+endif
+
+C_SOURCES   := $(COMMON_SOURCES) $(APP_SOURCES)
 ASM_SOURCES := $(CMSIS_DEV)/Source/Templates/gcc/startup_stm32f746xx.s
 
 # ---------------------------------------------------------------------------
@@ -77,24 +106,25 @@ FPU       := -mfpu=fpv5-sp-d16
 FLOAT_ABI := -mfloat-abi=hard
 MCU       := $(CPU) -mthumb $(FPU) $(FLOAT_ABI)
 
-C_DEFS := -DUSE_HAL_DRIVER -DSTM32F746xx
+C_DEFS := -DUSE_HAL_DRIVER -DSTM32F746xx $(APP_DEFS)
 
 C_INCLUDES := \
   -Iinclude \
   -I$(GEN_DIR) \
   -I$(HAL_DIR)/Inc \
   -I$(CMSIS_DEV)/Include \
-  -I$(CMSIS_CORE)/Include
+  -I$(CMSIS_CORE)/Include \
+  $(APP_INCLUDES)
 
-OPT := -Og
+OPT := $(APP_OPT)
 
 CFLAGS  := $(MCU) $(C_DEFS) $(C_INCLUDES) $(OPT) \
            -Wall -fdata-sections -ffunction-sections -g -gdwarf-2
-ASFLAGS := $(MCU) $(OPT) -Wall -fdata-sections -ffunction-sections -g -gdwarf-2
+ASFLAGS := $(MCU) -Og -Wall -fdata-sections -ffunction-sections -g -gdwarf-2
 
 LDSCRIPT := ldscript/STM32F746NGHx_FLASH.ld
 LIBS     := -lc -lm -lnosys
-LDFLAGS  := $(MCU) -specs=nano.specs -T$(LDSCRIPT) $(LIBS) \
+LDFLAGS  := $(MCU) -specs=nano.specs -T$(LDSCRIPT) $(APP_LDFLAGS) $(LIBS) \
             -Wl,-Map=$(BUILD_DIR)/$(TARGET).map,--cref -Wl,--gc-sections
 
 # ---------------------------------------------------------------------------

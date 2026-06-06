@@ -64,3 +64,8 @@ backup_full.bin
 
 # reference material
 _ref/
+
+# editor swap files
+*.swp
+*.swo
+*~

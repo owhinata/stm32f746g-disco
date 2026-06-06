@@ -8,3 +8,6 @@
 [submodule "lib/stm32f7xx_hal_driver"]
 	path = lib/stm32f7xx_hal_driver
 	url = https://github.com/STMicroelectronics/stm32f7xx_hal_driver
+[submodule "lib/coremark"]
+	path = lib/coremark
+	url = https://github.com/eembc/coremark

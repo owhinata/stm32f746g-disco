@@ -12,6 +12,4 @@
 #define LD1_GPIO_PORT    GPIOI
 #define LD1_GPIO_CLK_EN()  __HAL_RCC_GPIOI_CLK_ENABLE()
 
-void Error_Handler(void);
-
 #endif /* MAIN_H */
