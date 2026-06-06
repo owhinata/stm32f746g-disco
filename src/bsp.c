@@ -119,8 +119,15 @@ static void VCP_UART_Init(void)
 
 /**
  * @brief  Retarget newlib stdout/stderr to the VCP UART so printf works.
+ *
+ * Weak so a backend can override it: the interrupt-driven UART shell backend
+ * (shell/backend/cli_backend_uart.c, issue #7) supplies a strong _write that,
+ * once the console is up, routes printf through the same TX ring as the shell so
+ * USART1 has a single owner.  Apps that do not link that backend (blink /
+ * coremark / threadx demo / thread_metric / exec_profile) keep this blocking
+ * polling path unchanged.
  */
-int _write(int file, char *ptr, int len)
+__attribute__((weak)) int _write(int file, char *ptr, int len)
 {
     (void)file;
     HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len, HAL_MAX_DELAY);

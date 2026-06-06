@@ -88,4 +88,12 @@ gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
     $LDFLAGS -o "$out/test_integration"
 "$out/test_integration"
 
+# #7 -- UART backend byte ring: the pure, lock-free FIFO helpers (cli_uart_ring.h)
+# that the USART1 IRQ backend layers RX/TX on.  HAL/ThreadX-free, so it builds with
+# the host gcc and needs no shim -- only the backend include dir for the header.
+gcc $CFLAGS -I "$backend" \
+    "$here/test_uart_ring.c" \
+    $LDFLAGS -o "$out/test_uart_ring"
+"$out/test_uart_ring"
+
 echo "host tests passed"

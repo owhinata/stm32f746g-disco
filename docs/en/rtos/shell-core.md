@@ -39,7 +39,7 @@ struct cli_transport_api {
 - Backend-to-core wake-up is `cli_transport_notify_rx(sh)` (ISR-safe: it only
   sets an event flag, taking no lock and no suspend). `cli_transport_notify_tx`
   is reserved for #5.
-- The dummy backend (#6) and the USART1 VCP backend (#7) implement this.
+- The [dummy backend](shell-testing.md) (#6) and the [USART1 VCP backend](shell-backend-uart.md) (#7) implement this.
 
 ## ThreadX primitives (per instance)
 

@@ -36,7 +36,7 @@ struct cli_transport_api {
 
 - backend → コア通知は `cli_transport_notify_rx(sh)`（ISR からも安全：イベントフラグを
   set するだけで、ロック・サスペンドを取らない）。`cli_transport_notify_tx` は #5 用に予約。
-- dummy backend（#6）、USART1 VCP backend（#7）が本抽象を実装する。
+- [dummy backend](shell-testing.md)（#6）と [USART1 VCP backend](shell-backend-uart.md)（#7）が本抽象を実装する。
 
 ## ThreadX プリミティブ（インスタンス毎）
 
