@@ -138,6 +138,9 @@ struct cli_instance {
 	uint8_t  old_rows;               /**< physical rows the last render occupied (0 = none) */
 	uint8_t  draw_row;               /**< row of the physical cursor within the render (0-based) */
 	uint8_t  probing_cpr;            /**< a width probe (ESC[6n) is awaiting its CPR reply */
+	uint8_t  tab_list_armed;         /**< Tab completion (issue #11): 1 = next Tab lists candidates;
+	                                  *   set after an LCP-only extend or a no-extend first Tab,
+	                                  *   reset by any non-Tab byte (bash-style two-stage). */
 
 	char prompt[CLI_PROMPT_BUFFER_SIZE];
 

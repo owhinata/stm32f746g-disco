@@ -100,6 +100,7 @@ int cli_init(struct cli_instance *sh)
 	sh->old_rows    = 0;
 	sh->draw_row    = 0;
 	sh->probing_cpr = 0;
+	sh->tab_list_armed = 0;     /* Tab completion two-stage flag (issue #11) */
 	sh->last_result = 0;
 	sh->rx_dropped  = 0;
 	sh->out_len     = 0;

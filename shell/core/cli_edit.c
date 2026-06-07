@@ -445,6 +445,12 @@ void cli_input_byte(struct cli_instance *sh, uint8_t b)
 	if (b & 0x80u)
 		return;
 
+	/* Tab completion is bash-style two-stage (issue #11): the candidate list is
+	 * only shown on a SECOND consecutive Tab.  Any other key breaks the run, so
+	 * disarm here -- 0x09 is the sole byte that preserves the armed state. */
+	if (b != 0x09)
+		sh->tab_list_armed = 0;
+
 	/* Ctrl+C cancels the input line from ANY state, including a half-read
 	 * escape sequence -- so a stuck terminal always recovers (req §9). */
 	if (b == 0x03) {
@@ -544,6 +550,7 @@ void cli_input_byte(struct cli_instance *sh, uint8_t b)
 	case 0x10: cli_history_prev(sh); return;         /* Ctrl+p (#10 ring) */
 	case 0x15: op_kill_bol(sh);  return;             /* Ctrl+u */
 	case 0x17: op_del_word(sh);  return;             /* Ctrl+w */
+	case 0x09: cli_tab_complete(sh); return;         /* Tab: completion (#11) */
 	case 0x08:                                       /* Backspace */
 		op_backspace(sh);
 		return;
@@ -561,7 +568,7 @@ void cli_input_byte(struct cli_instance *sh, uint8_t b)
 		op_insert(sh, (char)b);
 		return;
 	}
-	/* Any other control byte (incl. Tab 0x09 -> issue #11): ignore. */
+	/* Any other control byte: ignore (req §13). */
 }
 
 /* ---- session start + config -------------------------------------------- */

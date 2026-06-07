@@ -109,6 +109,15 @@ void cli_prompt(struct cli_instance *sh);
  */
 void cli_edit_redraw(struct cli_instance *sh);
 
+/**
+ * Tab-completion (issue #11, cli_complete.c): complete the word ending at sh->cur against
+ * the command set selected by the preceding tokens.  Single match -> insert the remainder
+ * + a trailing space; multiple -> extend to the longest common prefix, then (bash-style,
+ * on the next Tab) list the candidates; none -> BEL.  No allocation; the command tree is
+ * scanned linearly (req §8).  Routed here by cli_edit.c on a 0x09 byte.
+ */
+void cli_tab_complete(struct cli_instance *sh);
+
 /*
  * Command history hooks (cli_history.c).  The line editor routes up/down
  * (ESC[A/B, Ctrl+p/n) to prev/next and the dispatcher records each submitted
