@@ -80,14 +80,36 @@ enum cli_parse_status cli_parse(char *line, char **argv, int argv_cap,
 /** last_result value stored for any non-OK dispatch outcome (req §9: non-zero). */
 #define CLI_DISPATCH_ERR (-1)
 
-/** Feed one received byte through the ASCII filter + RX state machine. */
+/** Feed one received byte through the ASCII filter + RX/edit state machine (cli_edit.c). */
 void cli_input_byte(struct cli_instance *sh, uint8_t b);
+
+/**
+ * Begin an interactive session on @p sh (cli_edit.c): kick off the terminal-width
+ * probe (CPR) and draw the first prompt with the cursor correctly placed even if
+ * the terminal never answers.  Called by the instance thread instead of a bare
+ * cli_prompt() (issue #9).
+ */
+void cli_edit_session_start(struct cli_instance *sh);
+
+/** Set the backspace mode at run time (issue #9): 0 = DEL erases backward,
+ *  1 = DEL (0x7F) deletes forward.  See CLI_BACKSPACE_MODE. */
+void cli_set_backspace_mode(struct cli_instance *sh, int mode);
 
 /** Parse and run the accumulated line, print the outcome, return to the prompt. */
 void cli_dispatch_line(struct cli_instance *sh);
 
 /** Emit the instance prompt. */
 void cli_prompt(struct cli_instance *sh);
+
+/*
+ * Command history hooks (cli_history.c).  No-op stubs in issue #9 -- they keep
+ * the line editor's up/down (ESC[A/B, Ctrl+p/n) and the dispatch-time record
+ * call wired to a stable seam that issue #10 fills in with the fixed ring, by
+ * replacing cli_history.c's body only.
+ */
+void cli_history_prev(struct cli_instance *sh);  /**< recall older entry (↑ / Ctrl+p) */
+void cli_history_next(struct cli_instance *sh);   /**< recall newer entry (↓ / Ctrl+n) */
+void cli_history_add(struct cli_instance *sh, const char *line); /**< record a submitted line */
 
 /*
  * Output plumbing (issue #5).  cli_printf.c (ThreadX-free) does the formatting

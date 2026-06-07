@@ -102,6 +102,24 @@
 #define CLI_USE_COLOR 1
 #endif
 
+/* Default terminal width in columns (impl. #9).  Used for line-wrap redraw until
+ * a CPR (cursor-position report) auto-detects the real width; also the fallback
+ * for terminals that never answer the probe.  Plain integer, host-includable. */
+#ifndef CLI_TERM_WIDTH
+#define CLI_TERM_WIDTH 80
+#endif
+
+/* Backspace mode (impl. #9): which of BS (0x08) / DEL (0x7F) deletes forward.
+ *   0 -- both 0x08 and 0x7F erase backward (Backspace).  Forward delete is on
+ *        Ctrl+d and the Delete key (ESC[3~) only.  (Default.)
+ *   1 -- 0x08 erases backward, 0x7F (DEL) deletes the char *under* the cursor
+ *        (for terminals whose Backspace key sends 0x08 and Delete sends 0x7F).
+ * Seeds the per-instance bs_swap field; flip at runtime with
+ * cli_set_backspace_mode(). */
+#ifndef CLI_BACKSPACE_MODE
+#define CLI_BACKSPACE_MODE 0
+#endif
+
 /*
  * The number of registered commands is bounded only by the linker section
  * capacity (effectively unlimited; the scan is linear).  Tab-completion does
@@ -120,5 +138,9 @@ _Static_assert(CLI_MAX_INSTANCES >= 1,      "CLI_MAX_INSTANCES must be >= 1");
 _Static_assert(CLI_MAX_SUBCMD_DEPTH >= 1,   "CLI_MAX_SUBCMD_DEPTH must be >= 1");
 _Static_assert(CLI_INSTANCE_PRIORITY <= 31, "CLI_INSTANCE_PRIORITY must be 0..31 (ThreadX)");
 _Static_assert(CLI_RX_DRAIN_CHUNK >= 1,     "CLI_RX_DRAIN_CHUNK must be >= 1");
+_Static_assert(CLI_TERM_WIDTH >= 20 && CLI_TERM_WIDTH <= 255,
+               "CLI_TERM_WIDTH must be 20..255 (fits uint8_t term_width)");
+_Static_assert(CLI_BACKSPACE_MODE == 0 || CLI_BACKSPACE_MODE == 1,
+               "CLI_BACKSPACE_MODE must be 0 or 1");
 
 #endif /* CLI_CONFIG_H */

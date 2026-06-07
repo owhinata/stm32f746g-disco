@@ -41,13 +41,16 @@ extern "C" {
 #define CLI_EVT_TX    0x2u   /**< reserved for #5 flow control; unused in #4 */
 #define CLI_EVT_KILL  0x4u   /**< request the thread to stop (full stop is future) */
 
-/* RX byte state machine (cli_session.c).  ESC/CSI form a minimal escape
- * *swallower* so arrow keys etc. never corrupt the line; the real VT100 cursor
- * handling that grows out of these states is issue #9. */
+/* RX byte state machine (cli_edit.c, issue #9).  ESC begins an escape sequence;
+ * '[' enters CSI (parameter-accumulating: arrows / Home / End / Del / Insert /
+ * the CPR width report), 'O' enters SS3 (application-mode arrows), and a bare
+ * 'b'/'f' is Alt+word-move.  Unknown / malformed sequences fall back to NORMAL
+ * and are ignored (req §13). */
 enum cli_rx_state {
 	CLI_RX_NORMAL = 0,
-	CLI_RX_ESC,            /**< saw ESC (0x1B), expecting '[' */
-	CLI_RX_CSI,            /**< inside a CSI sequence, skipping to its final byte */
+	CLI_RX_ESC,            /**< saw ESC (0x1B); next byte selects CSI/SS3/meta */
+	CLI_RX_CSI,            /**< inside ESC[ ... ; accumulating params to the final byte */
+	CLI_RX_SS3,            /**< inside ESC O ... ; one final byte, no params */
 };
 
 /* Instance lifecycle state. */
@@ -103,17 +106,29 @@ struct cli_instance {
 
 	struct cli_transport *tr;
 
-	/* Line input. */
+	/* Line input + cursor (issue #9: cur is split out from len for in-line edit). */
 	char     line[CLI_CMD_BUFFER_SIZE];
 	uint16_t len;                    /**< chars in line[]; line[len] kept NUL */
+	uint16_t cur;                    /**< cursor index, 0..len (insert point) */
+	uint8_t  overwrite;              /**< 0=insert (default), 1=overwrite; Insert key toggles */
 
 	/* Per-instance parser scratch (sized by #3's CLI_ARGV_CAP). */
 	char                  *argv[CLI_ARGV_CAP];
 	struct cli_parse_result pr;
 
-	/* RX state machine. */
+	/* RX state machine + escape parsing (issue #9). */
 	enum cli_rx_state rx;
 	uint8_t           prev_cr;       /**< last byte was CR: swallow a following LF */
+	uint16_t          esc_p[2];      /**< CSI numeric params (e.g. ESC[3~, ESC[r;cR) */
+	uint8_t           esc_np;        /**< number of params seen (0..2) */
+	uint8_t           esc_bad;       /**< current CSI had >2 params / extra ';' (reject CPR) */
+
+	/* Terminal / line-editor render state (issue #9). */
+	uint8_t  bs_swap;                /**< backspace mode: 1 makes DEL (0x7F) delete forward */
+	uint8_t  term_width;             /**< columns; CLI_TERM_WIDTH until a CPR updates it */
+	uint8_t  old_rows;               /**< physical rows the last render occupied (0 = none) */
+	uint8_t  draw_row;               /**< row of the physical cursor within the render (0-based) */
+	uint8_t  probing_cpr;            /**< a width probe (ESC[6n) is awaiting its CPR reply */
 
 	char prompt[CLI_PROMPT_BUFFER_SIZE];
 

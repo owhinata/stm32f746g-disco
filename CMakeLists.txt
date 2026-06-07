@@ -144,6 +144,8 @@ firmware_finalize(threadx)
 # exe, or the TX_THREAD / event-flags / mutex layouts disagree (ABI mismatch).
 add_library(shell_obj OBJECT
     "${CMAKE_SOURCE_DIR}/shell/core/cli_core.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_edit.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_history.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_parse.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_printf.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_session.c"

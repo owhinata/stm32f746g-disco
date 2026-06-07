@@ -12,11 +12,13 @@
 | `shell/include/cli.h` | 非依存 | コマンド登録の公開 API（`struct cli_instance` は前方宣言のみ） |
 | `shell/include/cli_instance.h` | 依存（`tx_api.h`） | `struct cli_instance` / transport 型 / `CLI_INSTANCE_DEFINE` / ライフサイクル API |
 | `shell/core/cli_core.c` | 依存 | `cli_init` / `cli_start` / スレッドループ / ISR 通知（`tx_*` を呼ぶ唯一のコア） |
-| `shell/core/cli_session.c` | **非呼び出し** | ASCII フィルタ / RX 状態機械 / dispatch / raw 出力 |
+| `shell/core/cli_edit.c` | **非呼び出し** | ASCII フィルタ / RX・escape 状態機械 / 行編集 / 再描画（[行編集](shell-editing.md)・#9） |
+| `shell/core/cli_session.c` | **非呼び出し** | 行 dispatch（パーサ呼び出し / エラー写像 / プロンプト復帰） |
+| `shell/core/cli_history.c` | **非呼び出し** | 履歴フック（#9 は no-op スタブ、#10 で固定リング） |
 
-`cli_session.c` は `tx_*` 関数を一切呼ばないため、ホスト gcc で
+`cli_edit.c` / `cli_session.c` は `tx_*` 関数を一切呼ばないため、ホスト gcc で
 型 shim（`shell/test/shim/tx_api.h`）と共にコンパイルし
-**状態機械と dispatch を実機なしで単体テスト**できる。`cli.h` 側は ThreadX 非依存を保ち、
+**状態機械・行編集・dispatch を実機なしで単体テスト**できる。`cli.h` 側は ThreadX 非依存を保ち、
 コマンド定義ファイルやパーサのホストテストは ThreadX ヘッダ無しでビルドできる。
 
 ## transport 抽象
@@ -47,20 +49,16 @@ struct cli_transport_api {
 | TX 排他 | `tx_mutex`（`TX_INHERIT`） | #4 は作成のみ。ロック付き出力は #5 |
 
 スレッドループ: `tx_event_flags_get(RX|KILL)` で起床 → `read()` で取りこぼさず drain →
-各バイトを状態機械へ → プロンプトへ復帰。`KILL` で終了（完全な stop/uninit は将来）。
+各バイトを状態機械（`cli_input_byte`）へ → プロンプトへ復帰。`KILL` で終了（完全な stop/uninit は将来）。
+起動時は `cli_prompt` ではなく `cli_edit_session_start()` を呼び、端末幅プローブ（CPR）を投げて
+最初のプロンプトを描く。
 
-## 受信状態機械と最小入力パイプライン（ASCII 前提）
+## 受信状態機械と行編集
 
-`cli_input_byte()` が 1 バイトずつ処理する。
-
-- **ASCII フィルタ**: 非 ASCII（`0x80–0xFF`）は破棄して行へ渡さない。
-- 印字可能（`0x20–0x7E`）: 行へ追加しエコー。満杯（`CLI_CMD_BUFFER_SIZE-1`）でベル（BEL）。
-- 改行: `\r` / `\n` で dispatch。`prev_cr` により `\r\n` は **1 回だけ** dispatch。
-- Backspace（`0x08`/`0x7F`）: 末尾 1 文字削除（最小行編集。完全版は #9）。
-- Ctrl+C（`0x03`）: 入力行を破棄して新プロンプト。
-- ESC（`0x1B`）→ `ESC`/`CSI` 状態で**エスケープを読み捨て**（矢印キー等が行を汚さない。
-  完全な VT100 解析は #9 がこの状態を拡張する）。
-- それ以外の制御文字は無視。
+`cli_input_byte()`（`cli_edit.c`）が 1 バイトずつ処理する。ASCII フィルタ（非 ASCII `0x80–0xFF`
+は破棄、§13）と `\r`/`\n` の dispatch（`prev_cr` により `\r\n` は **1 回だけ**）、Ctrl+C による
+行キャンセルが基本。`0x20–0x7E` の印字とカーソル移動・挿入/削除・メタキー・VT100 escape・
+端末幅折返し・色は **#9 の行編集**として実装する。詳細は [行編集・VT100・メタキー・色](shell-editing.md) を参照。
 
 ## dispatch とエラー写像
 
@@ -99,12 +97,14 @@ cli_start(&vcp_shell);   /* tx_thread_create（auto-start） */
 ## スコープ（#4）と後続
 
 #4 は骨格まで。出力 API/バッファ/色（#5）、dummy backend と通し自動テスト（#6）、
-USART1 VCP backend（#7）、shell アプリ + `flash-shell`（#8）、行編集/履歴/補完（#9–#11）は後続。
+USART1 VCP backend（#7）、shell アプリ + `flash-shell`（#8）は完了。[行編集・VT100・メタキー・色](shell-editing.md)（#9）も実装済み。
+履歴（#10）/ Tab 補完（#11）は後続。
 
 ## 検証（ホスト単体テスト）
 
-`shell/test/test_core.c` を `cli_session.c` + `cli_parse.c` と同時コンパイル（`shim/tx_api.h`
-を include パス先頭に、`CLI_CMD_BUFFER_SIZE`/`CLI_MAX_ARGC` を小さく上書きして満杯/トークン超過を検査）。
+`shell/test/test_core.c` を `cli_session.c` + `cli_edit.c` + `cli_history.c` + `cli_parse.c` と
+同時コンパイル（`shim/tx_api.h` を include パス先頭に、`CLI_CMD_BUFFER_SIZE`/`CLI_MAX_ARGC` を
+小さく上書きして満杯/トークン超過を検査）。
 出力と `tx_*` グルーは共有 [dummy backend + host glue](shell-testing.md) 経由
 （`cli_session.c` への注入は `cli_input_byte` 直接）。ASCII フィルタ・状態機械・CR/LF/CR-LF・
 dispatch 写像・fail-safe・**2 インスタンスの出力非混在**を assert する。

@@ -58,6 +58,7 @@ nav:
       - rtos/shell-parser.md
       - rtos/shell-core.md
       - rtos/shell-output.md
+      - rtos/shell-editing.md
       - rtos/shell-testing.md
       - rtos/shell-backend-uart.md
       - rtos/shell-app.md

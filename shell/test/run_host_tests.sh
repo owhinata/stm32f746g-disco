@@ -49,16 +49,18 @@ glue="$backend/cli_backend_dummy.c $here/host_glue.c"
 glue_inc="-I $here -I $backend"
 
 # #4 -- shell core: ASCII filter, RX state machine, dispatch, fail-safe.
-# cli_session.c is ThreadX-free (the tx_* glue lives in cli_core.c, firmware
-# only), so it builds on the host against the tx_api.h shim in test/shim, placed
-# first on the include path.  Output + tx_* glue now route through the shared
-# dummy backend.  Compiled with cli_parse.c and small CLI_* limits so the
-# buffer-full (CLI_CMD_BUFFER_SIZE) and too-many-tokens (CLI_MAX_ARGC) paths fit
-# a compact input line.
+# cli_session.c / cli_edit.c are ThreadX-free (the tx_* glue lives in cli_core.c,
+# firmware only), so they build on the host against the tx_api.h shim in
+# test/shim, placed first on the include path.  Output + tx_* glue now route
+# through the shared dummy backend.  cli_edit.c (the #9 line editor, owner of
+# cli_input_byte) + cli_history.c (the #9 no-op history seam) are linked
+# alongside.  Small CLI_* limits so the buffer-full (CLI_CMD_BUFFER_SIZE) and
+# too-many-tokens (CLI_MAX_ARGC) paths fit a compact input line.
 gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
     -DCLI_USE_COLOR=0 \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
-    "$here/test_core.c" "$core/cli_session.c" "$core/cli_printf.c" "$core/cli_parse.c" \
+    "$here/test_core.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
+    "$core/cli_printf.c" "$core/cli_parse.c" \
     $glue \
     $LDFLAGS -o "$out/test_core"
 "$out/test_core"
@@ -83,10 +85,26 @@ gcc $CFLAGS \
 gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
     -DCLI_USE_COLOR=0 \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
-    "$here/test_integration.c" "$core/cli_session.c" "$core/cli_printf.c" "$core/cli_parse.c" \
+    "$here/test_integration.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
+    "$core/cli_printf.c" "$core/cli_parse.c" \
     $glue \
     $LDFLAGS -o "$out/test_integration"
 "$out/test_integration"
+
+# #9 -- line editor: cursor model (cur split from len), in-line insert/overwrite/
+# delete, meta keys (Ctrl+a/b/d/e/f/k/u/w, Alt+b/f, Ctrl+l), VT100 escapes
+# (arrows / Home / End / Del / Insert / SS3), §13 invalid-escape ignore, the CPR
+# width probe + guarded reply, and wrap redraw at a forced small term_width.
+# Drives cli_input_byte directly (model assertions) so it needs no backend; the
+# default CLI_CMD_BUFFER_SIZE/term_width give room for multi-row cases.  Colour
+# OFF so escape bytes compare plainly.
+gcc $CFLAGS -DCLI_USE_COLOR=0 \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    "$here/test_edit.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
+    "$core/cli_printf.c" "$core/cli_parse.c" \
+    $glue \
+    $LDFLAGS -o "$out/test_edit"
+"$out/test_edit"
 
 # #7 -- UART backend byte ring: the pure, lock-free FIFO helpers (cli_uart_ring.h)
 # that the USART1 IRQ backend layers RX/TX on.  HAL/ThreadX-free, so it builds with

@@ -7,7 +7,7 @@
  * @brief   Shell ThreadX glue: instance lifecycle, thread loop, ISR notify.
  *
  * This is the only shell core file that calls ThreadX (tx_*) APIs; the line
- * editing / dispatch logic it drives lives in cli_session.c and stays
+ * editing (cli_edit.c) and dispatch (cli_session.c) logic it drives stays
  * ThreadX-free for host unit testing.  Per instance it owns one tx_thread, one
  * tx_event_flags group (RX / TX / KILL) and one tx_mutex.  The thread blocks on
  * the event flags, drains the transport on an RX signal and feeds each byte to
@@ -41,7 +41,7 @@ static void cli_thread_entry(ULONG arg)
 			tr->api->uninit(tr);
 		return;
 	}
-	cli_prompt(sh);
+	cli_edit_session_start(sh);   /* probe terminal width + draw the first prompt */
 
 	for (;;) {
 		if (tx_event_flags_get(&sh->events, CLI_EVT_RX | CLI_EVT_KILL,
@@ -83,9 +83,20 @@ int cli_init(struct cli_instance *sh)
 
 	tr->sh          = sh;
 	sh->len         = 0;
+	sh->cur         = 0;
 	sh->line[0]     = '\0';
 	sh->rx          = CLI_RX_NORMAL;
 	sh->prev_cr     = 0;
+	sh->esc_np      = 0;
+	sh->esc_bad     = 0;
+	sh->esc_p[0]    = 0;
+	sh->esc_p[1]    = 0;
+	sh->overwrite   = 0;
+	sh->bs_swap     = CLI_BACKSPACE_MODE;
+	sh->term_width  = CLI_TERM_WIDTH;
+	sh->old_rows    = 0;
+	sh->draw_row    = 0;
+	sh->probing_cpr = 0;
 	sh->last_result = 0;
 	sh->rx_dropped  = 0;
 	sh->out_len     = 0;

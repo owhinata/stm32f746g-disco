@@ -13,12 +13,15 @@ only Zephyr shell's *design*, no code reused.
 | `shell/include/cli.h` | independent | public command-registration API (`struct cli_instance` forward-declared only) |
 | `shell/include/cli_instance.h` | depends (`tx_api.h`) | `struct cli_instance` / transport types / `CLI_INSTANCE_DEFINE` / lifecycle API |
 | `shell/core/cli_core.c` | depends | `cli_init` / `cli_start` / thread loop / ISR notify (the only core file calling `tx_*`) |
-| `shell/core/cli_session.c` | **calls none** | ASCII filter / RX state machine / dispatch / raw output |
+| `shell/core/cli_edit.c` | **calls none** | ASCII filter / RX + escape state machine / line editing / redraw ([line editing](shell-editing.md), #9) |
+| `shell/core/cli_session.c` | **calls none** | line dispatch (parser call / error mapping / prompt return) |
+| `shell/core/cli_history.c` | **calls none** | history hooks (no-op stubs in #9; the fixed ring lands in #10) |
 
-Because `cli_session.c` never calls a `tx_*` function, it compiles on the host
-against a type shim (`shell/test/shim/tx_api.h`), so the **state machine and
-dispatch are unit-tested without hardware**. `cli.h` stays ThreadX-independent,
-so command source files and the host parser test build with no ThreadX headers.
+Because `cli_edit.c` / `cli_session.c` never call a `tx_*` function, they compile
+on the host against a type shim (`shell/test/shim/tx_api.h`), so the **state
+machine, line editing and dispatch are unit-tested without hardware**. `cli.h`
+stays ThreadX-independent, so command source files and the host parser test
+build with no ThreadX headers.
 
 ## Transport abstraction
 
@@ -50,21 +53,19 @@ struct cli_transport_api {
 | TX mutual exclusion | `tx_mutex` (`TX_INHERIT`) | created only in #4; locked output is #5 |
 
 Thread loop: wake on `tx_event_flags_get(RX|KILL)` -> drain with `read()` without
-dropping bytes -> feed each byte to the state machine -> return to the prompt.
-`KILL` exits (full stop/uninit is future work).
+dropping bytes -> feed each byte to the state machine (`cli_input_byte`) -> return
+to the prompt. `KILL` exits (full stop/uninit is future work). At start the thread
+calls `cli_edit_session_start()` instead of a bare `cli_prompt`, so it fires the
+terminal-width probe (CPR) and draws the first prompt.
 
-## RX state machine and minimal input pipeline (ASCII only)
+## RX state machine and line editing
 
-`cli_input_byte()` processes one byte at a time.
-
-- **ASCII filter**: non-ASCII bytes (`0x80–0xFF`) are dropped, never reaching the line.
-- printable (`0x20–0x7E`): append + echo. On full (`CLI_CMD_BUFFER_SIZE-1`) ring the bell (BEL).
-- newline: `\r` / `\n` dispatch. `prev_cr` makes `\r\n` dispatch **exactly once**.
-- Backspace (`0x08`/`0x7F`): erase one char (minimal editing; full version is #9).
-- Ctrl+C (`0x03`): discard the input line, show a fresh prompt.
-- ESC (`0x1B`) -> `ESC`/`CSI` states that **swallow the escape** (arrow keys etc. never
-  corrupt the line; the full VT100 parser in #9 grows out of these states).
-- any other control byte is ignored.
+`cli_input_byte()` (`cli_edit.c`) processes one byte at a time. The ASCII filter
+(non-ASCII `0x80–0xFF` dropped, §13), the `\r`/`\n` dispatch (`prev_cr` makes
+`\r\n` dispatch **exactly once**), and Ctrl+C line cancel are the baseline.
+Printable `0x20–0x7E` input plus cursor motion, in-line insert/delete, meta keys,
+VT100 escapes, terminal-width wrapping and colour are the **#9 line editor** — see
+[Line editing / VT100 / meta keys / colour](shell-editing.md).
 
 ## Dispatch and error mapping
 
@@ -106,15 +107,16 @@ callable during system initialisation.
 ## Scope (#4) and what follows
 
 #4 is the skeleton. The output API / buffering / colour (#5), the dummy backend
-and end-to-end auto tests (#6), the USART1 VCP backend (#7), the shell app +
-`flash-shell` (#8), and line editing / history / completion (#9–#11) come later.
+and end-to-end auto tests (#6), the USART1 VCP backend (#7) and the shell app +
+`flash-shell` (#8) are done. [Line editing / VT100 / meta keys / colour](shell-editing.md)
+(#9) is implemented too; history (#10) and Tab completion (#11) come next.
 
 ## Verification (host unit test)
 
-`shell/test/test_core.c` is compiled together with `cli_session.c` and
-`cli_parse.c` (with `shim/tx_api.h` first on the include path and small
-`CLI_CMD_BUFFER_SIZE`/`CLI_MAX_ARGC` overrides to exercise the full-buffer and
-too-many-tokens paths). Output and the `tx_*` glue go through the shared
+`shell/test/test_core.c` is compiled together with `cli_session.c`, `cli_edit.c`,
+`cli_history.c` and `cli_parse.c` (with `shim/tx_api.h` first on the include path
+and small `CLI_CMD_BUFFER_SIZE`/`CLI_MAX_ARGC` overrides to exercise the
+full-buffer and too-many-tokens paths). Output and the `tx_*` glue go through the shared
 [dummy backend + host glue](shell-testing.md) (bytes are injected at the session
 level via `cli_input_byte`). The test asserts the ASCII filter, the state
 machine, CR/LF/CR-LF coalescing, the dispatch mapping, fail-safe, and

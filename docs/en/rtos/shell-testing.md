@@ -15,6 +15,7 @@ code reused.
 | `shell/test/test_core.c` | independent | #4 session unit (ASCII filter / state machine / dispatch / fail-safe) |
 | `shell/test/test_output.c` | independent | #5 output unit (formatter / staging / colour / hexdump / TX failure) |
 | `shell/test/test_integration.c` | independent | #6 end-to-end through the backend (input->execute->output / flow control / abnormal / multi-instance) |
+| `shell/test/test_edit.c` | independent | #9 [line editor](shell-editing.md) unit (cursor / insert+overwrite / delete / word / VT100 / CPR / wrap) |
 
 The dummy backend is portable -- it drops straight into the on-target shell
 library (#8). It calls no `tx_*` other than `cli_transport_notify_rx`, so the same

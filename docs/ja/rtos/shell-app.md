@@ -3,11 +3,13 @@
 これまで実装した shell の各レイヤ（[登録](shell-registration.md) / [パーサ](shell-parser.md) /
 [コア](shell-core.md) / [出力](shell-output.md) / [dummy backend](shell-testing.md) /
 [UART(VCP) backend](shell-backend-uart.md)）を **CMake でライブラリ化し、実機で動く `shell`
-アプリ**として統合する。ST-Link 仮想 COM ポート（VCP）上で対話シェルを起動し、**VCP と dummy の
-2 インスタンスを同時稼働**させてマルチインスタンス構成を実機で実証する。
+アプリ**として統合する。ST-Link 仮想 COM ポート（VCP）上で対話シェルを起動する。
+マルチインスタンス構成（§4.2/§10）はホストテスト（2 つの dummy インスタンスで非混在を検証）と
+#8 で実証済みのため、本デモは **VCP 単一インスタンス**に絞り、行編集セッションを混信なく観測できる
+ようにしている（dummy backend はライブラリの正規 backend として残置）。
 
-ここで起動するのは現時点の**最小ライン入力**（エコー / Backspace / CR-LF dispatch / Ctrl+C /
-エスケープ swallow）。行編集・VT100・色は #9、履歴は #10、補完は #11、`version`/`uptime`/`reboot` は
+ここで起動する入力は [#9 の対話的行編集](shell-editing.md)（カーソル移動 / 行中挿入・削除 /
+メタキー / VT100 escape / 端末幅折返し / 色）を備える。履歴は #10、補完は #11、`version`/`uptime`/`reboot` は
 #12、`thread` は #13、`devmem` は #14 で追加する。
 
 ## CMake 構成
@@ -33,35 +35,20 @@
 
 ```c
 CLI_BACKEND_UART_DEFINE(vcp_tr, &huart1);   CLI_INSTANCE_DEFINE(vcp_sh, &vcp_tr, "sh> ");
-CLI_BACKEND_DUMMY_DEFINE(dum_tr);           CLI_INSTANCE_DEFINE(dum_sh, &dum_tr, "dum> ");
-static struct cli_instance *const shells[] = { &vcp_sh, &dum_sh };
+static struct cli_instance *const shells[] = { &vcp_sh };
 _Static_assert(SHELL_COUNT <= CLI_MAX_INSTANCES, ...);   /* §4.2 のコンパイル時ゲート */
 ```
 
 | スレッド | 優先度 | 役割 |
 |---|---|---|
 | `vcp_sh` shell | `CLI_INSTANCE_PRIORITY`=16 | USART1 VCP 上の対話シェル |
-| `dum_sh` shell | 16 | dummy backend（I/O ピン無し）上のシェル |
 | `led` | 10 | LD1（PI1）を 250 ms で点滅（他スレッドとの共存提示） |
-| `dummy_drv` | 17 | dummy を駆動して transcript を VCP に mirror |
 
 `tx_application_define()` で `shells[]` を `cli_init()` → 成功時のみ `cli_start()`。
 `cli_init`（backend / ThreadX オブジェクト生成）も `cli_start`（`tx_thread_create`）も失敗し得るので、
 **どちらの失敗でも当該インスタンスだけ無効化して継続**（§9 fail-safe）。`enable()` 失敗は起動済み
-スレッド内で uninit→exit するため、ここでは扱わない。
-
-### dummy 駆動の race-free 設計
-
-`dummy_drv` は dummy shell スレッド（16）より**スケジューリング優先度が低い**（数値 17、ThreadX は
-数値が大きいほど低優先度）。ThreadX の strict-priority preemption により、`dummy_drv` は dummy shell
-スレッドが ready でない間（= RX イベント待ちで
-block 中 = `dummy_write()` の外）にしか走らない。`cli_dummy_inject()` 末尾の
-`cli_transport_notify_rx()` で高優先度の dummy shell が即 preempt して 1 行を処理し再 block するため、
-`inject()` 復帰時点で処理は完了している。よって driver の `cli_dummy_clear_output()`（inject 前）と
-capture スナップショット（inject 後）は `dummy_write()` と重ならない。dummy backend は無排他設計
-（[テスト doc](shell-testing.md) 参照）だが、この優先度 invariant で安全。settle sleep は保険。
-万一の綻びも **cosmetic な `[dummy]` 行を乱すだけ**で、状態が分離された VCP インスタンスには波及
-しない（§10）。
+スレッド内で uninit→exit するため、ここでは扱わない。`shells[]` に transport を足せば
+インスタンスを増やせる（上限は §4.2 のコンパイル時ゲート）。
 
 ## 組込みコマンド（`shell/cmds/cmd_builtin.c`）
 
@@ -83,23 +70,23 @@ picocom -b 115200 /dev/ttyACM0               # VCP 接続（8N1）
 ```
 
 接続すると `sh> ` プロンプトが出る。`help` でコマンド一覧、`echo hello world` で `hello world`、
-未知コマンドは赤字で `…: command not found`、Ctrl+C で入力行キャンセル。数秒ごとに `[dummy] …` が
-2 番目のインスタンスの transcript を mirror する。
+未知コマンドは赤字で `…: command not found`、Ctrl+C で入力行キャンセル。カーソル移動・行中編集・
+メタキー・折返し再描画など [#9 の行編集](shell-editing.md)が効く。
 
 !!! note "PA9 = VCP_TX / OTG_FS_VBUS 共用（UM1907）"
     PA9 は VCP_TX と OTG_FS_VBUS の共用ピン。**工場出荷のソルダーブリッジ**なら VCP が有効。
     USB-OTG ホスト用にブリッジを変更した個体では VCP_TX が使えない。
 
-!!! warning "表示の interleave は既知制約（§10）"
-    `[dummy]` の mirror（printf）と `sh>` の入力行は**同じ USART1** に出るため、表示上は混在し得る。
-    最小ライン編集は入力行を再描画しないため。**状態は破壊されない**（インスタンス毎に分離）。
-    入力行の再描画は #9。
+!!! warning "他スレッド printf との interleave（§10）"
+    起動バナーや他スレッドの `printf` も**同じ USART1** に出る。編集中の行に printf が割り込むと
+    表示が乱れ得るが、**状態は破壊されない**（インスタンス毎に分離）。`Ctrl+l` で入力行を
+    [再描画](shell-editing.md)して復旧できる。
 
 ## 検証
 
 - **ビルド**: `cmake --build build` で `threadx` と `shell` が通る。optional demo
   （`-DBUILD_COREMARK=ON` 等）も configure/build できる（既存 demo を壊さない, DoD）。
 - **ホスト単体テスト**: `sh shell/test/run_host_tests.sh` が通る（本アプリ追加の影響を受けない別ビルド）。
-- **実機**（`/dev/ttyACM0` @115200 8N1, §18）: プロンプト / エコー / Backspace / `help` / `echo` /
-  未知コマンド / Ctrl+C / `[dummy]` 2 インスタンス共存 / LD1 点滅を確認。エコー遅延 < 5 ms（§15
-  暫定）、長行・連続貼付けで受信リング容量内の取りこぼし無し。
+- **実機**（`/dev/ttyACM0` @115200 8N1, §18）: プロンプト / エコー / [行編集](shell-editing.md)
+  （カーソル移動・行中挿入削除・メタキー・折返し）/ `help` / `echo` / 未知コマンド / Ctrl+C /
+  LD1 点滅を確認。エコー遅延 < 5 ms・操作応答 < 50 ms（§15）、長行・連続貼付けで受信リング容量内の取りこぼし無し。
