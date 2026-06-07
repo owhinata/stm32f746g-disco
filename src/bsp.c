@@ -15,6 +15,7 @@ UART_HandleTypeDef huart1;
 
 static void SystemClock_Config(void);
 static void VCP_UART_Init(void);
+static void exec_timebase_init(void);
 
 void bsp_init(void)
 {
@@ -26,9 +27,35 @@ void bsp_init(void)
     HAL_Init();
     SystemClock_Config();
     VCP_UART_Init();
+    exec_timebase_init();   /* TIM2 free-run = ThreadX exec-profile time source (issue #19) */
 
     /* Unbuffered stdout so each printf reaches the VCP immediately. */
     setvbuf(stdout, NULL, _IONBF, 0);
+}
+
+/**
+ * @brief  TIM2 as a free-running 32-bit time source for the ThreadX Execution
+ *         Profile Kit (issue #19: `thread` cpu% column).
+ *
+ * TIM2CLK = 2*PCLK1 = 108 MHz (APB1 /4, TIMPRE = 0), so the counter advances at
+ * ~9.26 ns/count and wraps every ~39.77 s -- far longer than any single
+ * enter/exit or 1 ms idle interval, which is all the kit measures between ticks.
+ *
+ * Chosen over the kit default DWT_CYCCNT: DWT freezes when the core clock is
+ * gated by WFI (#20), whereas TIM2 keeps its clock in Sleep (TIM2LPEN reset = 1)
+ * and so keeps counting -- idle/cpu% stay correct once WFI is enabled.  No
+ * interrupt is used; the kit just reads TIM2->CNT (see tx_user.h).  Started after
+ * SystemClock_Config() so PCLK1 is final, and before tx_kernel_enter() so the
+ * source is live when _tx_execution_initialize() samples it.
+ */
+static void exec_timebase_init(void)
+{
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    TIM2->PSC = 0u;             /* full 108 MHz resolution */
+    TIM2->ARR = 0xFFFFFFFFu;    /* 32-bit free-run */
+    TIM2->CNT = 0u;
+    TIM2->EGR = TIM_EGR_UG;     /* latch PSC/ARR */
+    TIM2->CR1 = TIM_CR1_CEN;    /* up-count, no interrupt */
 }
 
 /**

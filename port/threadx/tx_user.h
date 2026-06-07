@@ -15,4 +15,32 @@
 #define TX_TIMER_TICKS_PER_SECOND  1000
 #endif
 
+/* ThreadX Execution Profile Kit (issue #19: `thread` cpu% column).
+ *
+ * Enabling this here (rather than via CMake -D) keeps the define in one place so
+ * every translation unit that sees TX_THREAD agrees on its layout: the kit adds
+ * tx_thread_execution_time_total / _last_start to TX_THREAD (tx_api.h), and
+ * tx_api.h auto-includes tx_execution_profile.h, both only when this is defined.
+ * tx_user.h is included by the port asm (unconditionally) and by the C core +
+ * shell_obj (via TX_INCLUDE_USER_DEFINE_FILE), so all of them stay ABI-consistent.
+ */
+#define TX_EXECUTION_PROFILE_ENABLE
+
+/* Use the Cortex-M execution-profile path (nest counter) for ISR accounting.
+ * Mandatory here: this port's TX_THREAD_GET_SYSTEM_STATE() ORs in the IPSR
+ * (tx_port.h), so inside an ISR it is never == 1; the non-EPK "== 1" guard in
+ * tx_execution_profile.c would drop all ISR time.  The EPK path guards on
+ * "truthy && nest_counter == 1", which works when our plain-C ISRs
+ * (SysTick_Handler / USART1_IRQHandler) call _tx_execution_isr_enter/exit. */
+#define TX_CORTEX_M_EPK
+
+/* Time source for the execution profile = TIM2->CNT (0x40000024): APB1, 32-bit,
+ * free-running at TIM2CLK = 2*PCLK1 = 108 MHz (wrap ~39.77 s).  TIM2 is started
+ * in bsp.c (exec_timebase_init).  Chosen over the kit default DWT_CYCCNT because
+ * DWT freezes when the core clock is gated by WFI (#20): TIM2 keeps counting in
+ * Sleep (TIM2LPEN reset = 1), so idle/cpu% stay correct once WFI is enabled.
+ * TX_EXECUTION_MAX_TIME_SOURCE keeps its 0xFFFFFFFF default (32-bit). */
+#define TX_EXECUTION_TIME_SOURCE \
+    ((EXECUTION_TIME_SOURCE_TYPE)(*(volatile ULONG *)0x40000024UL))
+
 #endif /* TX_USER_H */

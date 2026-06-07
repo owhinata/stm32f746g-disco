@@ -24,6 +24,15 @@ static UCHAR tx_unused_memory[4];
    exist (SysTick is already ticking from bsp_init()/HAL_Init()). */
 static volatile UINT tx_timer_active = 0u;
 
+/* Separate gate for the execution-profile ISR hooks (issue #19).  It must turn
+   on only AFTER _tx_execution_initialize() (which the kernel runs after
+   tx_application_define()), so it is NOT tx_timer_active (set inside
+   tx_application_define, i.e. before the kit is initialized).  The first
+   application thread to run is past _tx_execution_initialize(), so it is the
+   earliest safe point; led_entry() flips this via tx_glue_profile_enable().
+   TIM2 (the time source) is already live from bsp_init() by then. */
+static volatile UINT profile_active = 0u;
+
 void _tx_initialize_low_level(void)
 {
     /* PendSV (context switch) at the lowest priority.  SysTick MUST be a
@@ -46,6 +55,13 @@ void tx_glue_timer_enable(void)
     tx_timer_active = 1u;
 }
 
+/* Called from the first application thread to run (led_entry), which is past
+   _tx_execution_initialize(): enable the execution-profile ISR hooks (issue #19). */
+void tx_glue_profile_enable(void)
+{
+    profile_active = 1u;
+}
+
 /* Number of 1 ms SysTicks per ThreadX tick. Default 1 (1 kHz ThreadX tick).
    Override with -DTX_GLUE_TICK_DIV (e.g. 10 -> 100 Hz). Keep in sync with
    TX_TIMER_TICKS_PER_SECOND in tx_user.h. */
@@ -55,6 +71,20 @@ void tx_glue_timer_enable(void)
 
 void SysTick_Handler(void)
 {
+#if defined(TX_EXECUTION_PROFILE_ENABLE)
+    /* Account this ISR to the execution profile (issue #19).  Gated on
+       profile_active so it never runs before the kit is initialized or before
+       TIM2 (the time source) is live.  Snapshot the gate (0->1 one-shot) so
+       enter/exit stay paired.  The enter/exit bookkeeping (nest counter + 64-bit
+       totals, read-modify-write) must be atomic against a higher-priority ISR
+       that also profiles (USART1 at priority 5 can preempt SysTick at 14), so
+       wrap just those calls in PRIMASK; the actual tick work below runs with
+       interrupts enabled, so nesting is still allowed. */
+    UINT prof = profile_active;
+    if (prof) { uint32_t pm = __get_PRIMASK(); __disable_irq();
+                _tx_execution_isr_enter(); __set_PRIMASK(pm); }
+#endif
+
     HAL_IncTick();   /* HAL timebase stays at 1 ms */
 
     if (tx_timer_active != 0u)
@@ -66,4 +96,9 @@ void SysTick_Handler(void)
             _tx_timer_interrupt();
         }
     }
+
+#if defined(TX_EXECUTION_PROFILE_ENABLE)
+    if (prof) { uint32_t pm = __get_PRIMASK(); __disable_irq();
+                _tx_execution_isr_exit(); __set_PRIMASK(pm); }
+#endif
 }

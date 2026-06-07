@@ -39,6 +39,7 @@
 #include <stdio.h>
 
 void tx_glue_timer_enable(void);
+void tx_glue_profile_enable(void);   /* issue #19: arm exec-profile ISR hooks */
 
 /* ---- shell instances --------------------------------------------------- */
 
@@ -70,6 +71,12 @@ static void led_entry(ULONG arg)
 	GPIO_InitTypeDef g = {0};
 
 	(void)arg;
+
+	/* First application thread to run (priority 10) -- this point is past
+	 * _tx_execution_initialize(), so it is the earliest safe spot to arm the
+	 * execution-profile ISR hooks (issue #19).  See tx_glue.c profile_active. */
+	tx_glue_profile_enable();
+
 	LD1_GPIO_CLK_EN();
 	g.Pin   = LD1_PIN;
 	g.Mode  = GPIO_MODE_OUTPUT_PP;

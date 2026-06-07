@@ -18,6 +18,7 @@
  */
 #include "cli_backend_uart.h"
 #include "bsp.h"   /* extern huart1: the pre-enable polling fallback for _write */
+#include "tx_api.h" /* execution-profile ISR hooks (auto-pulls tx_execution_profile.h) */
 
 /* The one active UART console (set in init).  The HAL Rx/Tx/Error callbacks and
  * _write reach the context through this; NULL until the first cli_init(). */
@@ -155,10 +156,24 @@ const struct cli_transport_api cli_uart_api = {
 
 void USART1_IRQHandler(void)
 {
+#if defined(TX_EXECUTION_PROFILE_ENABLE)
+	/* Charge this ISR to the execution profile (issue #19).  No profile_active
+	 * gate is needed: USART1's IRQ is only enabled from uart_enable(), which runs
+	 * in the shell thread -- i.e. after the scheduler and _tx_execution_initialize().
+	 * PRIMASK-protect the enter/exit so the kit's nest counter + 64-bit totals stay
+	 * atomic if SysTick (priority 14) is preempted... actually USART1 (priority 5)
+	 * is the preemptor, so this guards the reverse case symmetrically. */
+	CLI_UART_CRIT_ENTER(); _tx_execution_isr_enter(); CLI_UART_CRIT_EXIT();
+#endif
+
 	struct cli_uart *u = g_uart_console;
 
 	if (u != NULL && u->huart != NULL)
 		HAL_UART_IRQHandler(u->huart);   /* dispatches to the callbacks below */
+
+#if defined(TX_EXECUTION_PROFILE_ENABLE)
+	CLI_UART_CRIT_ENTER(); _tx_execution_isr_exit(); CLI_UART_CRIT_EXIT();
+#endif
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)

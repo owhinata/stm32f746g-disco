@@ -152,6 +152,7 @@ target_include_directories(shell_obj
     PRIVATE "${CMAKE_SOURCE_DIR}/shell/core"
             "${CMAKE_SOURCE_DIR}/shell/backend"
             "${TX_DIR}/common/inc" "${TX_PORT}/inc"
+            "${TX_DIR}/utility/execution_profile_kit"   # tx_api.h auto-includes tx_execution_profile.h (EPK)
             "${CMAKE_SOURCE_DIR}/port/threadx")
 target_compile_definitions(shell_obj PRIVATE TX_INCLUDE_USER_DEFINE_FILE)
 target_compile_options(shell_obj PRIVATE -O2)
@@ -187,11 +188,13 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_coremark.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
+    "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c"  # EPK (issue #19 cpu%)
     ${TX_CORE}
     ${TX_ASM})
 target_link_libraries(threadx PRIVATE common shell_obj coremark_obj)
 target_include_directories(threadx PRIVATE
     "${TX_DIR}/common/inc" "${TX_PORT}/inc"
+    "${TX_DIR}/utility/execution_profile_kit"   # EPK header (issue #19 cpu%)
     "${CMAKE_SOURCE_DIR}/port/threadx"
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
