@@ -10,6 +10,7 @@ automatically on the first configure.
 - [Hardware / board](hardware/board.md) — clock, caches, VCP, LED, memory map, references
 - [Build (CMake)](build/cmake.md) — configure / build / flash, toolchain auto-download, submodules
 - [RTOS (ThreadX)](rtos/threadx.md) — ThreadX integration and the interrupt-priority gotcha
+- [Shell architecture](rtos/shell-architecture.md) — the whole shell (defining commands / adding backends / pin & UART assumptions / dangerous command gate)
 
 ## Firmware
 

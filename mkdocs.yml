@@ -54,6 +54,7 @@ nav:
       - build/cmake.md
   - RTOS:
       - rtos/threadx.md
+      - rtos/shell-architecture.md
       - rtos/shell-registration.md
       - rtos/shell-parser.md
       - rtos/shell-core.md

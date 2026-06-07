@@ -1,0 +1,56 @@
+ThreadX Shell for STM32F746G-DISCO
+Copyright (c) 2026 ThreadX Shell Project
+
+This product is licensed under the MIT License (see LICENSE).
+
+================================================================================
+Clean-room notice
+================================================================================
+
+The interactive CLI shell under shell/ is a clean-room implementation.
+
+Its design was informed only by the *concepts* and the *public API behaviour* of
+the Zephyr RTOS shell (a Linux Foundation project, Apache-2.0) and -- for the
+line editor -- by the behaviour of GNU readline / linenoise / bash. No source
+code, comments, or specific wording from Zephyr (or any of those projects) was
+copied. Zephyr was used as a design reference only; none of its code is present
+in this repository.
+
+All shell source files (shell/) are original work under the MIT License, carrying
+the header:
+
+    SPDX-License-Identifier: MIT
+    Copyright (c) 2026 ThreadX Shell Project
+
+================================================================================
+Third-party components
+================================================================================
+
+This firmware is built from, and at runtime incorporates, the following
+third-party components. They are git submodules under lib/ (fetched at configure
+time) and remain under their own licenses; see each submodule's LICENSE for the
+authoritative terms.
+
+- STMicroelectronics STM32F7xx HAL driver  -- BSD-3-Clause
+    lib/stm32f7xx_hal_driver/LICENSE.md    (Copyright STMicroelectronics)
+
+- STMicroelectronics CMSIS Device F7       -- Apache-2.0
+    lib/cmsis_device_f7/LICENSE.md         (startup, system_*, device headers)
+
+- ARM CMSIS-Core                           -- Apache-2.0
+    lib/cmsis_core/LICENSE.txt
+
+- Eclipse ThreadX                          -- MIT
+    lib/threadx/LICENSE.txt
+    A project of the Eclipse Foundation (donated by Microsoft from Azure RTOS);
+    the sources carry both Microsoft and Eclipse copyrights.
+
+- EEMBC CoreMark                           -- Apache-2.0
+    lib/coremark/LICENSE.md
+    Run as the shell `coremark` command; the board port under port/coremark/ is
+    derived from EEMBC's barebones core_portme.{c,h}. CoreMark(R) is a registered
+    trademark of EEMBC; see lib/coremark/LICENSE.md (CoreMark Acceptable Use
+    Agreement) for the trademark terms.
+
+The ARM GNU (arm-none-eabi) toolchain is downloaded into ./tools at build time
+and is not redistributed as part of this repository.
