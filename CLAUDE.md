@@ -180,7 +180,8 @@ cmake --build build --target flash   # 書き込み
 - VCP: USART1、TX=PA9 / RX=PB7、115200 8N1（`/dev/ttyACM0`）。**PA9 は OTG_FS_VBUS と共用**（既定ブリッジで VCP 有効、UM1907）
 - LED: LD1（緑）= PI1
 - メモリ: Flash 0x08000000(1MB) / ITCM 0x00000000(16KB) / DTCM 0x20000000(64KB) / SRAM 0x20010000(256KB)
-- リファレンス: `_ref/`（git 管理外）に RM0385、UM1907
+- リファレンス: `_ref/`（git 管理外）に RM0385、UM1907、および ST 公式デモソース（下記）
+- 出荷時デモ: `_ref/backup_full.bin` はボード出荷時プリインストール（STemWin 版「STM32Cube Demonstration」、V1.2.0/2016）のフラッシュ全域ダンプ。その**公式リファレンスソース**は `_ref/STM32Cube_FW_F7_V1.17.0/Projects/STM32746G-Discovery/Demonstrations/STemWin/`（FW V1.17.0 同梱の同デモ後継リビジョン＝byte 一致ではない）。ST 公式の BSP / クロック / ペリフェラル / RTOS 統合の参照実装として読む（read-only、編集しない）
 
 ### 既知の教訓
 

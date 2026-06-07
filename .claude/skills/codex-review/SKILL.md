@@ -21,6 +21,7 @@ argument-hint: <plan | PR number | file path | design description>
 2. 必要に応じて `_ref/`（git 管理外）のリファレンスを参照する
    - `_ref/rm0385-*.pdf` — STM32F75x/F74x リファレンスマニュアル（レジスタ/ペリフェラル根拠）
    - `_ref/um1907-*.pdf` — Discovery キット UM（ボード配線・ピン・ソルダーブリッジ）
+   - `_ref/STM32Cube_FW_F7_V1.17.0/Projects/STM32746G-Discovery/Demonstrations/STemWin/` — ST 公式の出荷時デモ（STemWin 版「STM32Cube Demonstration」、`_ref/backup_full.bin` に対応）の参照ソース。BSP/クロック/ペリフェラル/RTOS 統合を ST 公式実装と照合する根拠に使える（read-only）
 3. 以下の「3 面レビュー観点」に基づいてレビュープロンプトを構成する
 4. `mcp__codex__codex` で Codex にレビューを依頼する
 5. 結果を整理してユーザーに報告する

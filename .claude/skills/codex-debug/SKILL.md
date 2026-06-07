@@ -55,6 +55,7 @@ Codex に以下を求める:
 - Flash wait states / over-drive / VOS とクロックの不整合
 - HardFault の有無（`CFSR`/`HFSR`/`BFAR`、スタックフレーム）。ハンドラ未定義で `Default_Handler` の無限ループに落ちていないか
 - スタックサイズ不足（ThreadX スレッドスタック、MSP）
+- ST 公式デモ（`_ref/STM32Cube_FW_F7_V1.17.0/Projects/STM32746G-Discovery/Demonstrations/STemWin/`）の同等ペリフェラル/クロック/キャッシュ/BSP 設定と突き合わせ（出荷時 `backup_full.bin` の参照ソース、read-only）
 
 ### 4. 観測の確実性
 
