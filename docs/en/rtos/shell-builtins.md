@@ -101,8 +101,8 @@ descriptor never enters `.shell_root_cmds` — it disappears from `help` and Tab
 # production-style build (dangerous commands disabled)
 cmake -B build-safe -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
       -DCLI_ENABLE_DANGEROUS_CMDS=OFF
-cmake --build build-safe --target shell
-arm-none-eabi-nm build-safe/shell.elf | grep -i reboot   # prints nothing (reboot gone)
+cmake --build build-safe --target threadx
+arm-none-eabi-nm build-safe/threadx.elf | grep -i reboot   # prints nothing (reboot gone)
 ```
 
 ## Verification

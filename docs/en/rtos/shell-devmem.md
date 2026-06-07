@@ -124,8 +124,8 @@ cache variable of the same name) is rejected. A zero length is a no-op.
 ```bash
 cmake -B build-safe -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
       -DCLI_ENABLE_DANGEROUS_CMDS=OFF
-cmake --build build-safe --target shell
-arm-none-eabi-nm build-safe/shell.elf | grep -i devmem   # prints nothing
+cmake --build build-safe --target threadx
+arm-none-eabi-nm build-safe/threadx.elf | grep -i devmem   # prints nothing
 ```
 
 ## Verification
@@ -134,7 +134,7 @@ arm-none-eabi-nm build-safe/shell.elf | grep -i devmem   # prints nothing
   (`shell/test/run_host_tests.sh`) green, including the `cli_hexdump_base` cases.
 - **Gate OFF**: `devmem` (and `reboot`) symbols absent from the `build-safe` ELF
   (spec §18.10).
-- **On hardware** (`/dev/ttyACM0`, 115200 8N1, `flash-shell`):
+- **On hardware** (`/dev/ttyACM0`, 115200 8N1, `flash`):
     - `devmem peek 0x20000000` reads DTCM; `devmem peek 0x08000000 16` reads Flash.
     - `devmem dump 0x08000000 64` shows the vector table with absolute addresses.
     - `devmem poke 0x20000000 0xdeadbeef` writes and reads back; confirm with `peek`.

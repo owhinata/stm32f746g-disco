@@ -78,8 +78,10 @@ supplies a **strong** `_write` that overrides it (only in builds linking the she
   background), giving USART1 a single TX owner.
 - Before enable (early boot logs, `g_uart_console==NULL` / `!enabled`): poll
   `huart1` with `HAL_UART_Transmit`. No IT TX is armed yet, so there is no clash.
-- Demos that do not link this backend (blink / coremark / threadx / thread_metric /
-  exec_profile) keep the weak polling `_write` and behave exactly as before.
+- **LF→CRLF**: once enabled, `_write` translates a bare `\n` in printf output to
+  `\r\n` (no double CR if a `\r` already precedes it), so the `coremark` report's
+  `\n`-terminated lines render cleanly without a terminal-side map (`--imap lfcrlf`).
+  The shell's `cli_print` goes through `write()`, not `_write`, so it is unaffected.
 
 ## Known limitation
 
@@ -108,14 +110,14 @@ cli_init(&vcp_sh);   /* backend init → event flags → mutex */
 cli_start(&vcp_sh);  /* tx_thread_create (auto-start) */
 ```
 
-The library-ised `shell` app, the `flash-shell` target and the dummy 2nd instance
-are issue #8.
+The library-ised shell app, the `flash` target (then named `flash-shell`)
+and the dummy 2nd instance are issue #8.
 
 ## Verification
 
 - **Host unit test**: `sh shell/test/run_host_tests.sh` asserts the ring helper's
   fill/drain/wrap/overflow/contig (no HAL/ThreadX needed).
 - **On-target verify** (#7 uses temporary wiring, not committed): temporarily wire
-  the backend into `app_threadx.c`, `flash-threadx`, then over
+  the backend into `app_threadx.c`, `flash`, then over
   `picocom -b 115200 /dev/ttyACM0` confirm the prompt, command echo, no drops
   within the ring on long / pasted lines, and clean boot-log output.

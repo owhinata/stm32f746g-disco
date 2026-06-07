@@ -11,12 +11,18 @@ automatically on the first configure.
 - [Build (CMake)](build/cmake.md) — configure / build / flash, toolchain auto-download, submodules
 - [RTOS (ThreadX)](rtos/threadx.md) — ThreadX integration and the interrupt-priority gotcha
 
-## Apps
+## Firmware
 
-| App | What it does |
-|-----|--------------|
-| `threadx` | Eclipse ThreadX: two threads (LED blink + UART print) |
-| `coremark` | EEMBC CoreMark (optional, `-DBUILD_COREMARK=ON`) |
+A single firmware, **`threadx`** = the interactive ThreadX shell (USART1 VCP).
+Everything else runs as a shell command.
+
+| Command | What it does |
+|---------|--------------|
+| `help` / `echo` | list commands / echo |
+| `version` / `uptime` / `reboot` | firmware & MCU info / uptime / reset |
+| `thread` | thread list + stack usage |
+| `devmem` | memory peek/poke/dump (address-range gated) |
+| `coremark` | run the EEMBC CoreMark benchmark (~12s) |
 
 ## Chip configuration
 

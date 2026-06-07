@@ -10,36 +10,25 @@
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-cmake --build build            # threadx をビルド
+cmake --build build            # 唯一のターゲット threadx をビルド
 ```
 
-成果物: `build/threadx.{elf,hex,bin}`。
-
-### CoreMark を含める
-
-```bash
-cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
-      -DBUILD_COREMARK=ON
-cmake --build build            # threadx + coremark
-```
-
-`lib/coremark`（submodule）と `port/coremark/` はツリーに残してあるので、オプション 1 つで復活する。
+成果物: `build/threadx.{elf,hex,bin}`。`threadx` は対話 ThreadX シェルで、**唯一の firmware**。CoreMark は別イメージではなく shell の `coremark` コマンドとして実行する（[CoreMark コマンド](../rtos/shell-coremark.md)）。
 
 ## flash
 
 ```bash
-cmake --build build --target flash-threadx     # ThreadX
-cmake --build build --target flash-coremark    # CoreMark（-DBUILD_COREMARK=ON 必要）
+cmake --build build --target flash     # ST-Link で書き込み
 ```
 
-各 `flash-<app>` は `st-flash --reset write <app>.bin 0x08000000` を実行。
+`flash` は `st-flash --reset write threadx.bin 0x08000000` を実行。
 
 ## 構成のポイント
 
 - `cmake/arm-none-eabi-toolchain.cmake`: ツールチェーン自動 DL（`tools/.../arm-none-eabi-gcc` が無ければ取得）
-- `CMakeLists.txt`: HAL + CMSIS + `bsp.c` を `common` オブジェクトライブラリに集約し各アプリで共有
+- `CMakeLists.txt`: HAL + CMSIS + `bsp.c` を `common` オブジェクトライブラリに集約。shell コア/backend は `shell_obj`、CoreMark は `coremark_obj`（`-O3`）に分離し、`threadx` exe へまとめてリンク
 - `stm32f7xx_hal_conf.h` は configure 時に upstream テンプレートから生成（既定 HSE 25 MHz がボードと一致）
-- リンクは `-specs=nano.specs -specs=nosys.specs`、CoreMark のみ `-u _printf_float`（`%f` 用）
+- リンクは `-specs=nano.specs -specs=nosys.specs`。`threadx` は CoreMark の `%f` スコア用に `-u _printf_float` を付与
 
 ## クリーンアップ
 

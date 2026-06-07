@@ -97,7 +97,7 @@ cli_start(&vcp_shell);   /* tx_thread_create（auto-start） */
 ## スコープ（#4）と後続
 
 #4 は骨格まで。出力 API/バッファ/色（#5）、dummy backend と通し自動テスト（#6）、
-USART1 VCP backend（#7）、shell アプリ + `flash-shell`（#8）は完了。[行編集・VT100・メタキー・色](shell-editing.md)（#9）と
+USART1 VCP backend（#7）、shell アプリ + `flash`（#8）は完了。[行編集・VT100・メタキー・色](shell-editing.md)（#9）と
 [コマンド履歴 固定リング](shell-editing.md)（#10）も実装済み。Tab 補完（#11）は後続。
 
 ## 検証（ホスト単体テスト）

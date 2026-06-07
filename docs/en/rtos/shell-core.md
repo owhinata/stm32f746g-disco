@@ -108,7 +108,7 @@ callable during system initialisation.
 
 #4 is the skeleton. The output API / buffering / colour (#5), the dummy backend
 and end-to-end auto tests (#6), the USART1 VCP backend (#7) and the shell app +
-`flash-shell` (#8) are done. [Line editing / VT100 / meta keys / colour](shell-editing.md)
+`flash` (#8) are done. [Line editing / VT100 / meta keys / colour](shell-editing.md)
 (#9) and the [command history fixed ring](shell-editing.md#history-10) (#10) are
 implemented too; Tab completion (#11) comes next.
 

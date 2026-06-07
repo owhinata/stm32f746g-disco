@@ -1,16 +1,21 @@
-# STM32F746G-DISCO — Eclipse ThreadX on the official ST HAL
+# STM32F746G-DISCO — Eclipse ThreadX shell on the official ST HAL
 
 STM32F746G-DISCO (STM32F746NGH6) firmware built with the **official
-STMicroelectronics HAL**. The HAL/CMSIS sources and the ARM GNU toolchain are
-fetched automatically — nothing to install by hand except `cmake`, `ninja`,
-`git`, `curl`, and (for flashing) `st-flash`.
+STMicroelectronics HAL**. The HAL/CMSIS/ThreadX/CoreMark sources and the ARM GNU
+toolchain are fetched automatically — nothing to install by hand except `cmake`,
+`ninja`, `git`, `curl`, and (for flashing) `st-flash`.
 
-| App             | What it does                                                       |
-|-----------------|-------------------------------------------------------------------|
-| `threadx`       | Eclipse ThreadX RTOS: two threads (LED blink + UART print)        |
-| `coremark`      | EEMBC CoreMark benchmark — **optional**, `-DBUILD_COREMARK=ON`     |
-| `thread_metric` | Thread-Metric RTOS benchmark — **optional**, `-DBUILD_THREAD_METRIC=ON` |
-| `exec_profile`  | ThreadX Execution Profile Kit demo — **optional**, `-DBUILD_EXEC_PROFILE=ON` |
+There is a **single firmware**, `threadx`: an interactive **Eclipse ThreadX CLI
+shell** over the ST-Link VCP. Other functionality runs as shell commands rather
+than separate images.
+
+| Command | What it does |
+|---------|--------------|
+| `help` / `echo` | list commands / echo the line |
+| `version` / `uptime` / `reboot` | firmware & MCU identity / uptime / reset |
+| `thread` | thread list + per-thread stack usage |
+| `devmem` | memory peek / poke / dump (address-range gated) |
+| `coremark` | run the EEMBC CoreMark benchmark (~12 s) |
 
 Board bring-up (216 MHz clock, caches, VCP UART, printf) is shared in
 `src/bsp.c`.
@@ -30,19 +35,20 @@ Board bring-up (216 MHz clock, caches, VCP UART, printf) is shared in
 ## Layout
 
 ```
-include/        main.h (LED defines), bsp.h, stm32f7xx_it.h
-src/            bsp.c (clock/cache/UART/printf), app_threadx.c, stm32f7xx_it.c
+include/        main.h (LED defines), bsp.h
+src/            main.c (shell instance + LED + tx_application_define), bsp.c
+shell/          the CLI shell library: core/ backend/ cmds/ include/ test/
 port/threadx/   tx_user.h, tx_glue.c (low-level init + SysTick)
-port/coremark/  core_portme.{c,h}   CoreMark port (kept for the optional app)
+port/coremark/  core_portme.{c,h}   CoreMark port (used by the `coremark` command)
 ldscript/       STM32F746NGHx_FLASH.ld
 cmake/          arm-none-eabi-toolchain.cmake (auto-downloads the toolchain)
-CMakeLists.txt  builds threadx (and coremark when -DBUILD_COREMARK=ON)
+CMakeLists.txt  builds the single firmware: threadx
 lib/            git submodules:
                   stm32f7xx_hal_driver   (ST official HAL)
                   cmsis_device_f7        (startup, system_*, device headers)
                   cmsis_core             (CMSIS Core, cm7 branch)
                   threadx                (Eclipse ThreadX RTOS)
-                  coremark               (EEMBC CoreMark — used by the optional app)
+                  coremark               (EEMBC CoreMark — the `coremark` command)
 ```
 
 `stm32f7xx_hal_conf.h` is generated at configure time from the upstream HAL
@@ -57,50 +63,48 @@ toolchain into `./tools` and inits the git submodules automatically.
 git clone --recurse-submodules <this repo>
 cd stm32f746g-disco
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-cmake --build build            # builds threadx
+cmake --build build            # builds the single firmware: threadx
 ```
 
 Artifacts land in `build/threadx.{elf,hex,bin}`.
 
-To also build CoreMark (the submodule and port are kept in the tree):
-
-```bash
-cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
-      -DBUILD_COREMARK=ON
-cmake --build build            # now builds threadx + coremark
-```
-
 ## Flash / run
 
 ```bash
-cmake --build build --target flash-threadx    # ThreadX demo
-cmake --build build --target flash-coremark   # CoreMark (needs -DBUILD_COREMARK=ON)
+cmake --build build --target flash    # write threadx.bin over ST-Link
 ```
 
-Each `flash-<app>` target writes `<app>.bin` to `0x08000000` over ST-Link and
-resets. (`st-flash reset` resets without reflashing.)
+`flash` writes `threadx.bin` to `0x08000000` over ST-Link and resets.
+(`st-flash reset` resets without reflashing.)
 
 Watch the VCP (`/dev/ttyACM0`) with any serial terminal at 115200 8N1, e.g.:
 
 ```bash
-picocom -b 115200 --imap lfcrlf /dev/ttyACM0
+picocom -b 115200 /dev/ttyACM0
 ```
+
+(The firmware's printf retarget maps LF→CRLF, so `--imap lfcrlf` is not needed —
+even the `coremark` report renders cleanly.)
+
+At the `sh> ` prompt, `help` lists the commands; try `coremark`.
 
 ## ThreadX (Eclipse ThreadX)
 
-The `threadx` app runs the upstream **Eclipse ThreadX** RTOS (MIT,
-`lib/threadx` submodule) with the Cortex-M7/GNU port. `tx_application_define()`
-creates two threads:
+The firmware runs the upstream **Eclipse ThreadX** RTOS (MIT, `lib/threadx`
+submodule) with the Cortex-M7/GNU port. `tx_application_define()` creates:
 
-- `led`   — toggles LD1 every 250 ms
-- `print` — prints a counter over the VCP every 1 s (run them concurrently)
+- the shell instance thread (`vcp_sh`, priority 16) — the interactive CLI on the
+  USART1 VCP
+- `led` (priority 10) — toggles LD1 every 250 ms as a heartbeat (it keeps
+  blinking even while `coremark` runs)
 
 Integration lives in `port/threadx/`:
 
 - `tx_glue.c` provides `_tx_initialize_low_level()` and the `SysTick_Handler`,
   which drives both the HAL tick (`HAL_IncTick`) and ThreadX (`_tx_timer_interrupt`)
   off the single 1 ms SysTick. ThreadX's `PendSV_Handler` comes from the port, so
-  `src/stm32f7xx_it.c` is excluded from this app.
+  the firmware ships no `src/stm32f7xx_it.c` (other vectors fall to the startup
+  file's weak `Default_Handler`).
 - `tx_user.h` sets `TX_TIMER_TICKS_PER_SECOND = 1000` (1 tick = 1 ms).
 
 **Interrupt-priority gotcha (important):** SysTick must be a *higher* priority
@@ -110,13 +114,16 @@ PendSV's priority it could not preempt that spin, the tick would stall, and
 sleeping threads would never wake. Critical sections use PRIMASK, so the higher
 SysTick priority is still masked safely inside ThreadX.
 
-## CoreMark result (optional app)
+## CoreMark (the `coremark` command)
 
-Built with `-DBUILD_COREMARK=ON` and measured on this board (216 MHz, GCC 13.3,
-`-O3`, performance run, auto-calibrated to ~11.8 s / 11000 iterations):
+Run `coremark` at the shell prompt. CoreMark is built once into the firmware
+(`coremark_obj`: `-O3 -funroll-loops`, `MEM_METHOD=MEM_STATIC`, `core_main.c`
+compiled `-Dmain=coremark_main`) and runs synchronously in the shell thread
+(~12 s); details in `docs/*/rtos/shell-coremark.md`. Measured on this board
+(216 MHz, GCC 13.3, `-O3`, performance run, auto-calibrated):
 
 ```
-CoreMark 1.0 : 928.818711 / GCC13.3.1 -O3 -mcpu=cortex-m7 -mfpu=fpv5-sp-d16 -mfloat-abi=hard / STACK
+CoreMark 1.0 : 928.818711 / GCC13.3.1 -O3 -mcpu=cortex-m7 -mfpu=fpv5-sp-d16 -mfloat-abi=hard / STATIC
 Correct operation validated.
 ```
 
@@ -127,81 +134,18 @@ the hot loops are cache-resident, so the flash 7-wait-state penalty is already
 hidden — moving the kernels into ITCM was measured to add only ~0.6 %, and the
 remaining gap to ST's published ~1082 (5.0/MHz) is compiler-bound (IAR vs GCC).
 
-## Thread-Metric (optional app)
-
-The Thread-Metric RTOS benchmark suite (8 tests measuring RTOS event throughput)
-runs on ThreadX. The `lib/threadx/utility/benchmarks/thread_metric` sources are
-used as-is; the runner lives in `src/app_thread_metric.c` + `port/threadx/`.
-
-```bash
-cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
-      -DBUILD_THREAD_METRIC=ON -DTHREAD_METRIC_TEST=basic
-cmake --build build --target flash-thread_metric
-```
-
-`THREAD_METRIC_TEST` selects the test: `basic` (default), `cooperative`,
-`preemptive`, `memory`, `message`, `sync`, `interrupt`, `interrupt_preempt`.
-Results print over the VCP every 30 s, e.g. the basic test:
-
-```
-**** Thread-Metric Basic Single Thread Processing Test **** Relative Time: 30
-Time Period Total:  252879
-```
-
-Integration notes:
-
-- ThreadX runs at **100 Hz** here (`TX_GLUE_TICK_DIV=10`,
-  `TX_TIMER_TICKS_PER_SECOND=100`) to match the porting layer's
-  `TM_THREADX_TICKS_PER_SECOND`, so `tm_thread_sleep(30)` is a real 30 s.
-- The interrupt tests raise `SVC #0` (`TM_CAUSE_INTERRUPT`); `port/threadx/tm_svc.c`
-  routes `SVC_Handler` to `tm_interrupt_handler` (linked only for those tests).
-- The benchmark counters are non-volatile globals updated in tight loops, so the
-  selected test source is built at `-O0` (otherwise GCC keeps the counter in a
-  register and the reporting thread sees a stale 0 → "thread died"). ThreadX
-  itself stays at `-O2`, so the measured RTOS operations are representative.
-
-## Execution Profile Kit (optional app)
-
-`exec_profile` uses the ThreadX Execution Profile Kit to measure per-thread /
-ISR / idle CPU time via the Cortex-M7 **DWT cycle counter** (the kit's default
-`TX_EXECUTION_TIME_SOURCE` is `DWT->CYCCNT` at `0xE0001004`). Two worker threads
-do different amounts of work; a reporter thread prints the distribution every 3 s.
-
-```bash
-cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
-      -DBUILD_EXEC_PROFILE=ON
-cmake --build build --target flash-exec_profile
-```
-
-Measured (worker_a does 2.5× the work of worker_b):
-
-```
-exec_profile (cycles / 3 s @216 MHz):
-  worker_a :  273166163  (42%)
-  worker_b :  109277261  (16%)
-  ISR      :          0  ( 0%)
-  idle     :  265319044  (40%)
-```
-
-Integration notes:
-
-- `-DBUILD_EXEC_PROFILE=ON` defines `TX_EXECUTION_PROFILE_ENABLE`, which makes
-  the ThreadX port asm call the profile hooks; ThreadX core + port are rebuilt
-  with it, and `tx_execution_profile.c` is added.
-- **Cortex-M7 DWT lock:** the cycle counter only runs after unlocking the DWT
-  Lock Access Register (`*(uint32_t*)0xE0001FB0 = 0xC5ACCE55`) — without it
-  `CYCCNT` stays 0 and every measurement reads 0.
-- **ISR time reads 0 here:** the kit counts ISR time via the ThreadX context
-  save/restore path, but this port's `SysTick_Handler` is a plain C handler, so
-  SysTick time is not attributed to ISR. To profile an ISR, call
-  `_tx_execution_isr_enter()` / `_tx_execution_isr_exit()` around its body.
+> The former standalone `thread_metric` and `exec_profile` images were retired:
+> their ThreadX build configs (100 Hz tick + `TX_DISABLE_*`, and
+> `TX_EXECUTION_PROFILE_ENABLE` rebuilding the port asm) are incompatible with the
+> interactive shell's, so they cannot share the single firmware. Restore from git
+> history (≤ `5078914`) if needed.
 
 ## Notes
 
-- No software bootloader: each app is linked at `0x08000000` and uses the full
+- No software bootloader: the firmware is linked at `0x08000000` and uses the full
   1 MB flash. Field updates can use the STM32 ROM bootloader (BOOT0 high → USB
   DFU / UART) without changing the image.
 - `rm -rf build` clears build artifacts; `rm -rf tools` also removes the
   downloaded toolchain.
-- The VCP `printf` float support (`%f` in CoreMark) is enabled by linking with
-  `-u _printf_float` (nano newlib) on the `coremark` target only.
+- The VCP `printf` float support (`%f` in CoreMark's score line) is enabled by
+  linking the `threadx` target with `-u _printf_float` (nano newlib).

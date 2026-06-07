@@ -66,6 +66,7 @@ nav:
       - rtos/shell-builtins.md
       - rtos/shell-thread.md
       - rtos/shell-devmem.md
+      - rtos/shell-coremark.md
 
 markdown_extensions:
   - admonition

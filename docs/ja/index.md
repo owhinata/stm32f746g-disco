@@ -8,12 +8,17 @@ STM32F746G-DISCO（STM32F746NGH6 / Cortex-M7）向けの **ベアメタル + Ecl
 - [ビルド (CMake)](build/cmake.md) — configure / build / flash、ツールチェーン自動 DL、submodule
 - [RTOS (ThreadX)](rtos/threadx.md) — ThreadX 統合と割込み優先度の注意点
 
-## アプリ
+## ファームウェア
 
-| アプリ | 内容 |
+単一の firmware **`threadx`** = 対話 ThreadX シェル（USART1 VCP）。アプリは shell コマンドとして起動する。
+
+| コマンド | 内容 |
 |--------|------|
-| `threadx` | Eclipse ThreadX：2 スレッド（LED 点滅 + UART 出力）|
-| `coremark` | EEMBC CoreMark（オプション、`-DBUILD_COREMARK=ON`）|
+| `help` / `echo` | コマンド一覧 / エコー |
+| `version` / `uptime` / `reboot` | FW・MCU 情報 / 稼働時間 / 再起動 |
+| `thread` | スレッド一覧 + スタック使用量 |
+| `devmem` | メモリ peek/poke/dump（アドレス範囲ゲート付き） |
+| `coremark` | EEMBC CoreMark ベンチを実行（~12s）|
 
 ## チップ構成
 

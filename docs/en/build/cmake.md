@@ -11,41 +11,32 @@ toolchain into `./tools` and inits the git submodules.
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-cmake --build build            # builds threadx
+cmake --build build            # builds the single target, threadx
 ```
 
-Artifacts: `build/threadx.{elf,hex,bin}`.
-
-### Include CoreMark
-
-```bash
-cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
-      -DBUILD_COREMARK=ON
-cmake --build build            # threadx + coremark
-```
-
-`lib/coremark` (submodule) and `port/coremark/` are kept in the tree, so a single
-option brings the app back.
+Artifacts: `build/threadx.{elf,hex,bin}`. `threadx` is the interactive ThreadX
+shell and the **only firmware**; CoreMark is not a separate image but the shell's
+`coremark` command (see [CoreMark command](../rtos/shell-coremark.md)).
 
 ## flash
 
 ```bash
-cmake --build build --target flash-threadx     # ThreadX
-cmake --build build --target flash-coremark    # CoreMark (needs -DBUILD_COREMARK=ON)
+cmake --build build --target flash     # write over ST-Link
 ```
 
-Each `flash-<app>` runs `st-flash --reset write <app>.bin 0x08000000`.
+`flash` runs `st-flash --reset write threadx.bin 0x08000000`.
 
 ## Build structure
 
 - `cmake/arm-none-eabi-toolchain.cmake`: toolchain auto-download (fetched if
   `tools/.../arm-none-eabi-gcc` is missing)
 - `CMakeLists.txt`: HAL + CMSIS + `bsp.c` collected into a `common` object
-  library shared by each app
+  library; the shell core/backends are a `shell_obj` object library and CoreMark
+  a `coremark_obj` one (`-O3`), all linked into the `threadx` exe
 - `stm32f7xx_hal_conf.h` is generated at configure time from the upstream
   template (default HSE 25 MHz matches the board)
-- Linked with `-specs=nano.specs -specs=nosys.specs`; CoreMark also uses
-  `-u _printf_float` (for `%f`)
+- Linked with `-specs=nano.specs -specs=nosys.specs`; `threadx` adds
+  `-u _printf_float` for CoreMark's `%f` score line
 
 ## Cleanup
 

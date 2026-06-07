@@ -107,8 +107,8 @@ override 可）を超える要求は拒否する。長さ 0 は no-op。
 ```bash
 cmake -B build-safe -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
       -DCLI_ENABLE_DANGEROUS_CMDS=OFF
-cmake --build build-safe --target shell
-arm-none-eabi-nm build-safe/shell.elf | grep -i devmem   # 何も出ない
+cmake --build build-safe --target threadx
+arm-none-eabi-nm build-safe/threadx.elf | grep -i devmem   # 何も出ない
 ```
 
 ## 検証
@@ -116,7 +116,7 @@ arm-none-eabi-nm build-safe/shell.elf | grep -i devmem   # 何も出ない
 - **ビルド**: 既定 ON で `cmake --build build`（threadx + shell）が通る。ホストテスト
   （`shell/test/run_host_tests.sh`）が緑（`cli_hexdump_base` ケース含む）。
 - **ゲート OFF**: `build-safe` の ELF に `devmem`（と `reboot`）シンボルが無い（要件 §18.10）。
-- **実機**（`/dev/ttyACM0`, 115200 8N1, `flash-shell`）:
+- **実機**（`/dev/ttyACM0`, 115200 8N1, `flash`）:
     - `devmem peek 0x20000000` で DTCM read / `devmem peek 0x08000000 16` で Flash read。
     - `devmem dump 0x08000000 64` で先頭ベクタ表を絶対アドレス付き表示。
     - `devmem poke 0x20000000 0xdeadbeef` で write+リードバック、`peek` で確認。

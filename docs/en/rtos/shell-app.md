@@ -1,10 +1,10 @@
-# Shell app (`shell` / `flash-shell`)
+# Shell app (`threadx` / `flash`)
 
 Packages every shell layer built so far ([registration](shell-registration.md) /
 [parser](shell-parser.md) / [core](shell-core.md) / [output](shell-output.md) /
 [dummy backend](shell-testing.md) / [UART(VCP) backend](shell-backend-uart.md))
-into a **CMake library and a `shell` application that runs on real hardware**. It
-brings up an interactive shell over the ST-Link Virtual COM Port (VCP). The
+into a **CMake library and the single `threadx` firmware that runs on real
+hardware**. It brings up an interactive shell over the ST-Link Virtual COM Port (VCP). The
 multi-instance architecture (§4.2/§10) is exercised by the host tests (two dummy
 instances, no crosstalk) and was demonstrated on silicon in #8, so this demo keeps
 a **single VCP instance** to give the line editor a clean, uninterrupted session
@@ -13,29 +13,31 @@ a **single VCP instance** to give the line editor a clean, uninterrupted session
 The input here has the full [#9 interactive line editor](shell-editing.md) (cursor
 motion / in-line insert+delete / meta keys / VT100 escapes / terminal-width wrap /
 colour). History is #10, completion #11,
-[`version`/`uptime`/`reboot`](shell-builtins.md) #12, `thread` #13, `devmem` #14.
+[`version`/`uptime`/`reboot`](shell-builtins.md) #12, `thread` #13, `devmem` #14,
+[`coremark`](shell-coremark.md) #17.
 
 ## CMake layout
 
-`shell/` is integrated in two layers (existing demos are kept building):
+`shell/` is integrated in two layers to form the single `threadx` firmware:
 
 | target | kind | contents |
 |---|---|---|
 | `shell_obj` | OBJECT library | shell core (`shell/core/*.c`) + backends (`cli_backend_uart.c` / `cli_backend_dummy.c`); carries `bsp_iface` (HAL/CMSIS/`bsp.h`) + ThreadX includes |
-| `shell` | executable | `src/app_shell.c` + `shell/cmds/cmd_builtin.c` + `tx_glue.c` + ThreadX core/asm, linking `common` and `shell_obj`; grows the `flash-shell` target |
+| `coremark_obj` | OBJECT library | CoreMark (`lib/coremark` + `port/coremark`) built at `-O3`, `MEM_METHOD=MEM_STATIC`, with `core_main.c` compiled `-Dmain=coremark_main` ([CoreMark command](shell-coremark.md)) |
+| `threadx` | executable | `src/main.c` + `shell/cmds/cmd_*.c` (builtin/system/thread/devmem/coremark) + `tx_glue.c` + ThreadX core/asm, linking `common` / `shell_obj` / `coremark_obj`; adds `-u _printf_float` and grows the `flash` target |
 
-- The objlib is named **`shell_obj`, not `shell`**: CMake target names are global
-  and the executable takes `shell`.
+- The objlib is named **`shell_obj`, not `threadx`**: CMake target names are global
+  and the executable takes `threadx`.
 - **`TX_INCLUDE_USER_DEFINE_FILE` is set on both** the objlib and the exe. Because
   `cli_instance.h` pulls in `tx_api.h`, the objlib must see the **same
   `port/threadx/tx_user.h`** as the ThreadX core linked into the exe, or the
   `TX_THREAD` / event-flags / mutex layouts disagree (ABI mismatch).
-- Like the `threadx` app, **`src/stm32f7xx_it.c` is omitted** (ThreadX supplies
-  PendSV); `USART1_IRQHandler` comes from the UART backend.
+- **`src/stm32f7xx_it.c` is not in the build** (ThreadX supplies PendSV; SVC has
+  no user); `USART1_IRQHandler` comes from the UART backend.
 - `cmd_builtin.c` (`help`/`echo`) is compiled **into the exe only**. The host
   tests are a separate build, so their registered command set is unaffected.
 
-## Instances and threads (`src/app_shell.c`)
+## Instances and threads (`src/main.c`)
 
 ```c
 CLI_BACKEND_UART_DEFINE(vcp_tr, &huart1);   CLI_INSTANCE_DEFINE(vcp_sh, &vcp_tr, "sh> ");
@@ -70,8 +72,8 @@ are reentrant when several instances run the same command at once (§10).
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-cmake --build build                          # threadx + shell
-cmake --build build --target flash-shell     # write over ST-Link
+cmake --build build                          # the single target, threadx
+cmake --build build --target flash   # write over ST-Link
 picocom -b 115200 /dev/ttyACM0               # connect to the VCP (8N1)
 ```
 
@@ -93,9 +95,7 @@ motion, in-line editing, meta keys, wrap redraw — works on the line.
 
 ## Verification
 
-- **Build**: `cmake --build build` builds `threadx` and `shell`; the optional
-  demos (`-DBUILD_COREMARK=ON`, etc.) still configure/build (existing demos kept
-  building — DoD).
+- **Build**: `cmake --build build` builds the single target `threadx`.
 - **Host unit tests**: `sh shell/test/run_host_tests.sh` passes (a separate build,
   unaffected by this app).
 - **On target** (`/dev/ttyACM0` @115200 8N1, §18): prompt / echo /

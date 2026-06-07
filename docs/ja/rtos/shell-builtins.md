@@ -93,8 +93,8 @@ OFF にすると `reboot` のハンドラと `CLI_CMD_REGISTER` が丸ごと `#i
 # 本番想定（危険コマンド無効）ビルド
 cmake -B build-safe -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
       -DCLI_ENABLE_DANGEROUS_CMDS=OFF
-cmake --build build-safe --target shell
-arm-none-eabi-nm build-safe/shell.elf | grep -i reboot   # 何も出ない（reboot 無効）
+cmake --build build-safe --target threadx
+arm-none-eabi-nm build-safe/threadx.elf | grep -i reboot   # 何も出ない（reboot 無効）
 ```
 
 ## 検証
