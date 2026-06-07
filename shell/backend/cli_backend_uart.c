@@ -223,11 +223,41 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 /* ---- printf / _write coexistence (single TX owner) --------------------- */
 
 /*
+ * Push one byte into the TX ring, spinning (bounded) until it fits while the TX
+ * ISR drains in the background, and keep TX running.  Returns 1 on success, 0 if
+ * TX stayed wedged past the spin cap.  *stall carries the idle-iteration count
+ * and resets on progress.  Used by _write for byte-granular LF->CRLF translation.
+ */
+static int tx_putc_spin(struct cli_uart *u, uint8_t b, uint32_t *stall)
+{
+	for (;;) {
+		int ok;
+		CLI_UART_CRIT_ENTER();
+		ok = cli_uart_ring_put(&u->tx_ring, b);
+		tx_start_locked(u);
+		CLI_UART_CRIT_EXIT();
+
+		if (ok) {
+			*stall = 0;
+			return 1;
+		}
+		if (++*stall > CLI_UART_WRITE_SPIN_MAX)
+			return 0;               /* TX wedged: give up (best-effort) */
+	}
+}
+
+/*
  * Strong _write that overrides the weak polling one in bsp.c when this backend is
  * linked.  Once the console is enabled, route printf through the same TX ring as
  * the shell so USART1 has exactly one owner; before that (early boot logs, or no
  * console bound yet) fall back to blocking polling, which is safe because no IT TX
  * has been armed.  printf is best-effort: a wedged TX drops the remainder.
+ *
+ * Bare LF is translated to CR+LF so a raw terminal (without picocom's --imap
+ * lfcrlf) shows printf output -- notably the CoreMark report, whose lines end in
+ * '\n' -- without staircasing; an existing CR before the LF is left as-is (no
+ * double CR).  Only C-library printf flows through _write: the shell's own
+ * cli_print emits CRLF through the transport write() path and is unaffected.
  */
 int _write(int file, char *ptr, int len)
 {
@@ -239,21 +269,20 @@ int _write(int file, char *ptr, int len)
 
 	if (u != NULL && u->enabled) {
 		const uint8_t *d = (const uint8_t *)ptr;
-		size_t total = (size_t)len, off = 0;
 		uint32_t stall = 0;
+		uint8_t  prev = 0;
+		int i;
 
-		while (off < total) {
-			size_t acc;
-			CLI_UART_CRIT_ENTER();
-			acc = cli_uart_ring_put_buf(&u->tx_ring, d + off, total - off);
-			tx_start_locked(u);
-			CLI_UART_CRIT_EXIT();
+		for (i = 0; i < len; i++) {
+			uint8_t b = (uint8_t)d[i];
 
-			off += acc;
-			if (off < total && ++stall > CLI_UART_WRITE_SPIN_MAX)
-				break;          /* TX wedged: drop the rest (best-effort) */
-			if (acc != 0u)
-				stall = 0;
+			if (b == (uint8_t)'\n' && prev != (uint8_t)'\r') {
+				if (!tx_putc_spin(u, (uint8_t)'\r', &stall))
+					return len;     /* wedged: drop the rest */
+			}
+			if (!tx_putc_spin(u, b, &stall))
+				return len;             /* wedged: drop the rest */
+			prev = b;
 		}
 		return len;
 	}
