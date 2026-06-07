@@ -12,8 +12,8 @@ a **single VCP instance** to give the line editor a clean, uninterrupted session
 
 The input here has the full [#9 interactive line editor](shell-editing.md) (cursor
 motion / in-line insert+delete / meta keys / VT100 escapes / terminal-width wrap /
-colour). History is #10, completion #11, `version`/`uptime`/`reboot` #12, `thread`
-#13, `devmem` #14.
+colour). History is #10, completion #11,
+[`version`/`uptime`/`reboot`](shell-builtins.md) #12, `thread` #13, `devmem` #14.
 
 ## CMake layout
 

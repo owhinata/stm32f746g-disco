@@ -162,9 +162,29 @@ target_include_directories(shell_obj
 target_compile_definitions(shell_obj PRIVATE TX_INCLUDE_USER_DEFINE_FILE)
 target_compile_options(shell_obj PRIVATE -O2)
 
+# Embed a firmware version header for the `version` builtin (issue #12).  git
+# describe is captured at configure time (a snapshot; re-run cmake to refresh)
+# and substituted into cli_version.h under GEN_DIR, which is already on the
+# bsp_iface include path so cmd_system.c can #include "cli_version.h".
+execute_process(
+    COMMAND git -C "${CMAKE_SOURCE_DIR}" describe --always --dirty --tags
+    OUTPUT_VARIABLE CLI_GIT_DESC OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT CLI_GIT_DESC)
+    set(CLI_GIT_DESC "unknown")
+endif()
+configure_file("${CMAKE_SOURCE_DIR}/cmake/cli_version.h.in"
+               "${GEN_DIR}/cli_version.h" @ONLY)
+
+# Compile-time gate for the dangerous shell commands (reboot now; #14 devmem
+# later), spec §12.  ON by default for the demo; production builds pass
+# -DCLI_ENABLE_DANGEROUS_CMDS=OFF.  A cache var alone does NOT reach the
+# compiler, so forward it explicitly to the define cli_config.h expects.
+option(CLI_ENABLE_DANGEROUS_CMDS "Build the dangerous shell commands (reboot, devmem)" ON)
+
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/src/app_shell.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_system.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     ${TX_CORE}
     ${TX_ASM})
@@ -175,7 +195,8 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
     "${CMAKE_SOURCE_DIR}/shell/backend")  # CLI_BACKEND_*_DEFINE macros
-target_compile_definitions(shell PRIVATE TX_INCLUDE_USER_DEFINE_FILE)
+target_compile_definitions(shell PRIVATE TX_INCLUDE_USER_DEFINE_FILE
+    CLI_ENABLE_DANGEROUS_CMDS=$<BOOL:${CLI_ENABLE_DANGEROUS_CMDS}>)
 target_compile_options(shell PRIVATE -O2)
 firmware_finalize(shell)
 

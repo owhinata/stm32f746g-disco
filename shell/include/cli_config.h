@@ -120,6 +120,16 @@
 #define CLI_BACKSPACE_MODE 0
 #endif
 
+/* Compile-time gate for dangerous commands (reboot now; #14 devmem poke later),
+ * spec §12.  1 == built in (shell demo default), 0 == compiled out entirely so
+ * the descriptor never reaches .shell_root_cmds (gone from help/completion too).
+ * Production integrations should build with -DCLI_ENABLE_DANGEROUS_CMDS=0.  The
+ * shell exe forwards the CMake option of the same name to this define; this
+ * #ifndef default is the fall-back for targets that do not (e.g. host tests). */
+#ifndef CLI_ENABLE_DANGEROUS_CMDS
+#define CLI_ENABLE_DANGEROUS_CMDS 1
+#endif
+
 /*
  * The number of registered commands is bounded only by the linker section
  * capacity (effectively unlimited; the scan is linear).  Tab-completion does
@@ -144,5 +154,7 @@ _Static_assert(CLI_TERM_WIDTH >= 20 && CLI_TERM_WIDTH <= 255,
                "CLI_TERM_WIDTH must be 20..255 (fits uint8_t term_width)");
 _Static_assert(CLI_BACKSPACE_MODE == 0 || CLI_BACKSPACE_MODE == 1,
                "CLI_BACKSPACE_MODE must be 0 or 1");
+_Static_assert(CLI_ENABLE_DANGEROUS_CMDS == 0 || CLI_ENABLE_DANGEROUS_CMDS == 1,
+               "CLI_ENABLE_DANGEROUS_CMDS must be 0 or 1");
 
 #endif /* CLI_CONFIG_H */

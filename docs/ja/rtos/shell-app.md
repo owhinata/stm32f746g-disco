@@ -9,8 +9,8 @@
 ようにしている（dummy backend はライブラリの正規 backend として残置）。
 
 ここで起動する入力は [#9 の対話的行編集](shell-editing.md)（カーソル移動 / 行中挿入・削除 /
-メタキー / VT100 escape / 端末幅折返し / 色）を備える。履歴は #10、補完は #11、`version`/`uptime`/`reboot` は
-#12、`thread` は #13、`devmem` は #14 で追加する。
+メタキー / VT100 escape / 端末幅折返し / 色）を備える。履歴は #10、補完は #11、
+[`version`/`uptime`/`reboot`](shell-builtins.md) は #12、`thread` は #13、`devmem` は #14 で追加する。
 
 ## CMake 構成
 
