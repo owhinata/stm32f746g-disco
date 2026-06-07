@@ -185,6 +185,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/src/app_shell.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_system.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_thread.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     ${TX_CORE}
     ${TX_ASM})
