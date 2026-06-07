@@ -285,7 +285,8 @@ int cli_write(struct cli_instance *sh, const void *data, size_t len)
 	return r;
 }
 
-int cli_hexdump(struct cli_instance *sh, const void *data, size_t len)
+int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
+                     unsigned long long base)
 {
 	const uint8_t *p = (const uint8_t *)data;
 	char body[20];
@@ -296,7 +297,7 @@ int cli_hexdump(struct cli_instance *sh, const void *data, size_t len)
 	}
 
 	for (size_t off = 0; off < len; off += 16) {
-		int n = utoa_rev((unsigned long long)off, 16, 0, body);
+		int n = utoa_rev(base + (unsigned long long)off, 16, 0, body);
 		emit_padded(sh, NULL, body, n, 8, 1, 0);   /* %08x offset */
 		out_str(sh, "  ");
 
@@ -322,4 +323,9 @@ int cli_hexdump(struct cli_instance *sh, const void *data, size_t len)
 	int r = sh->tx_failed ? -1 : 0;
 	cli_unlock(sh);
 	return r;
+}
+
+int cli_hexdump(struct cli_instance *sh, const void *data, size_t len)
+{
+	return cli_hexdump_base(sh, data, len, 0);
 }

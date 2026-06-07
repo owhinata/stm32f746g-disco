@@ -163,6 +163,19 @@ static void test_write_and_hexdump(void)
 	cli_hexdump(&sh, "Hi\x01!", 4);
 	assert(strstr(cli_dummy_output_str(&tr), "00000000  48 69 01 21 ") != NULL);
 	assert(strstr(cli_dummy_output_str(&tr), "Hi.!\r\n") != NULL);   /* 0x01 -> '.' */
+
+	/* cli_hexdump_base: the offset column counts from `base`, everything else is
+	 * identical -- so cli_hexdump is exactly the base == 0 case. */
+	setup();
+	cli_hexdump_base(&sh, "Hi\x01!", 4, 0x20000000ull);
+	assert(strstr(cli_dummy_output_str(&tr), "20000000  48 69 01 21 ") != NULL);
+	assert(strstr(cli_dummy_output_str(&tr), "Hi.!\r\n") != NULL);
+
+	/* base advances 16 per row; a second row shows base + 0x10. */
+	setup();
+	cli_hexdump_base(&sh, "0123456789abcdefG", 17, 0x08000000ull);
+	assert(strstr(cli_dummy_output_str(&tr), "08000000  ") != NULL);
+	assert(strstr(cli_dummy_output_str(&tr), "08000010  47 ") != NULL);  /* 'G' */
 }
 
 /* Immediate transport failure: the call returns <0, tx_failed sticks and drops

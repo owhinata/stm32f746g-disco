@@ -154,6 +154,11 @@ int cli_warn(struct cli_instance *sh, const char *fmt, ...)
 int cli_info(struct cli_instance *sh, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
 int cli_hexdump(struct cli_instance *sh, const void *data, size_t len);
+/* Like cli_hexdump, but the left-hand offset column counts from `base` instead
+ * of 0 -- pass the data's absolute address to print absolute addresses (used by
+ * the devmem dump command).  cli_hexdump() is the base == 0 case. */
+int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
+                     unsigned long long base);
 
 /** Iterate every registered root command in .shell_root_cmds order. */
 #define CLI_ROOT_CMD_FOREACH(it) \

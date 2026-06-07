@@ -80,7 +80,7 @@ rebooting...
 
 ## Dangerous-command gate `CLI_ENABLE_DANGEROUS_CMDS` (§12)
 
-`reboot` (and later #14's `devmem poke`) can be compiled out wholesale:
+`reboot` and `devmem` ([memory access](shell-devmem.md)) can be compiled out wholesale:
 
 - The default lives in `shell/include/cli_config.h` as an `#ifndef` set to **ON (=1)**
   (same style as the other knobs; a fall-back for targets that do not define it, e.g.

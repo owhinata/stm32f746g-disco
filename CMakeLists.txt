@@ -175,17 +175,22 @@ endif()
 configure_file("${CMAKE_SOURCE_DIR}/cmake/cli_version.h.in"
                "${GEN_DIR}/cli_version.h" @ONLY)
 
-# Compile-time gate for the dangerous shell commands (reboot now; #14 devmem
-# later), spec §12.  ON by default for the demo; production builds pass
-# -DCLI_ENABLE_DANGEROUS_CMDS=OFF.  A cache var alone does NOT reach the
-# compiler, so forward it explicitly to the define cli_config.h expects.
+# Compile-time gate for the dangerous shell commands (reboot, devmem), spec §12.
+# ON by default for the demo; production builds pass -DCLI_ENABLE_DANGEROUS_CMDS=OFF.
+# A cache var alone does NOT reach the compiler, so forward it explicitly to the
+# define cli_config.h expects.
 option(CLI_ENABLE_DANGEROUS_CMDS "Build the dangerous shell commands (reboot, devmem)" ON)
+
+# Upper bound (bytes) on a single `devmem dump`; overrides the cli_config.h
+# default.  STRING (not option) because it carries a number, forwarded below.
+set(CLI_DEVMEM_DUMP_MAX_LEN "256" CACHE STRING "Max bytes per devmem dump")
 
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/src/app_shell.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_system.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_thread.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     ${TX_CORE}
     ${TX_ASM})
@@ -197,7 +202,8 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
     "${CMAKE_SOURCE_DIR}/shell/backend")  # CLI_BACKEND_*_DEFINE macros
 target_compile_definitions(shell PRIVATE TX_INCLUDE_USER_DEFINE_FILE
-    CLI_ENABLE_DANGEROUS_CMDS=$<BOOL:${CLI_ENABLE_DANGEROUS_CMDS}>)
+    CLI_ENABLE_DANGEROUS_CMDS=$<BOOL:${CLI_ENABLE_DANGEROUS_CMDS}>
+    CLI_DEVMEM_DUMP_MAX_LEN=${CLI_DEVMEM_DUMP_MAX_LEN})
 target_compile_options(shell PRIVATE -O2)
 firmware_finalize(shell)
 

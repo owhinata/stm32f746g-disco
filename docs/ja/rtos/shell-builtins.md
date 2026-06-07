@@ -73,7 +73,7 @@ rebooting...
 
 ## 危険コマンドゲート `CLI_ENABLE_DANGEROUS_CMDS`（§12）
 
-`reboot`（将来は #14 の `devmem poke` も）はコンパイル時に一括無効化できる:
+`reboot` と `devmem`（[メモリアクセス](shell-devmem.md)）はコンパイル時に一括無効化できる:
 
 - 既定値は `shell/include/cli_config.h` の `#ifndef` で **ON (=1)**（他 knob と同スタイル。define
   未指定 target＝ホストテスト等の安全網）。
