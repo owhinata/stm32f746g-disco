@@ -1,11 +1,11 @@
 /*
- * CoreMark port for STM32F746G-DISCO (bare-metal).
- *  - Timing : 1 ms SysTick via HAL_GetTick() (CLOCKS_PER_SEC == 1000).
- *  - Output : printf over the ST-Link VCP (set up by bsp_init()).
+ * CoreMark port for STM32F746G-DISCO -- run as the shell `coremark` command.
+ *  - Timing : 1 ms SysTick via HAL_GetTick() (EE_TICKS_PER_SEC == 1000); the
+ *             SysTick that drives ThreadX also feeds HAL_IncTick (tx_glue.c).
+ *  - Output : printf over the ST-Link VCP, retargeted by the shell UART backend.
  * Derived from EEMBC's barebones core_portme.c (Apache-2.0).
  */
 #include "coremark.h"
-#include "bsp.h"
 #include "stm32f7xx_hal.h"
 
 #ifndef ITERATIONS
@@ -53,8 +53,9 @@ void portable_init(core_portable *p, int *argc, char *argv[])
     (void)argc;
     (void)argv;
 
-    /* Bring up clock (216 MHz), caches, and the VCP UART for printf. */
-    bsp_init();
+    /* The board (216 MHz clock, caches, VCP UART, printf) is already up: bsp_init()
+     * ran in main() before the kernel started, so this port must NOT re-init it
+     * (a second init would reset the UART mid-session and disrupt the shell). */
 
     if (sizeof(ee_ptr_int) != sizeof(ee_u8 *))
     {

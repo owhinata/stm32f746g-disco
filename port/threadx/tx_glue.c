@@ -6,8 +6,9 @@
  *    handler increments the HAL tick and, once ThreadX is initialized, calls
  *    _tx_timer_interrupt().  So HAL_GetTick()/HAL_Delay() and ThreadX both work.
  *  - PendSV (context switch) and SysTick run at the lowest interrupt priority.
- *  - ThreadX's PendSV_Handler comes from the port's tx_thread_schedule.S;
- *    src/stm32f7xx_it.c is excluded from this app to avoid a clash.
+ *  - ThreadX's PendSV_Handler comes from the port asm, so the firmware ships no
+ *    src/stm32f7xx_it.c; SVC has no user here, and every other vector falls to
+ *    the startup file's weak Default_Handler.
  */
 #include "tx_api.h"
 #include "stm32f7xx_hal.h"

@@ -1,11 +1,14 @@
 # ============================================================================
-#  STM32F746G-DISCO  bare-metal apps (blink / coremark / threadx)
+#  STM32F746G-DISCO  single firmware: interactive Eclipse ThreadX shell
+#
+#  One executable, `threadx`: the ThreadX CLI shell over the USART1 VCP.
+#  Benchmarks (CoreMark) run as shell commands, not as separate images.
 #
 #  Configure (downloads the ARM toolchain into ./tools on first run):
 #    cmake -B build -G Ninja \
 #          -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-#  Build everything:           cmake --build build
-#  Flash one app over ST-Link: cmake --build build --target flash-threadx
+#  Build:               cmake --build build
+#  Flash over ST-Link:  cmake --build build --target flash
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
@@ -70,6 +73,7 @@ target_link_libraries(common PUBLIC bsp_iface)
 target_compile_options(common PRIVATE -O2)
 
 # --- Helper: post-build artifacts + flash target ---------------------------
+# Single firmware, so the flash target is simply `flash` (not flash-<tgt>).
 function(firmware_finalize tgt)
     target_link_options(${tgt} PRIVATE -Wl,-Map=${tgt}.map,--cref)
     set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT}")
@@ -79,66 +83,56 @@ function(firmware_finalize tgt)
         COMMAND "${CMAKE_SIZE}" $<TARGET_FILE:${tgt}>
         BYPRODUCTS ${tgt}.bin ${tgt}.hex
         COMMENT "objcopy -> ${tgt}.bin / ${tgt}.hex")
-    add_custom_target(flash-${tgt}
+    add_custom_target(flash
         COMMAND st-flash --reset write ${tgt}.bin 0x08000000
         DEPENDS ${tgt}
         USES_TERMINAL
         COMMENT "Flashing ${tgt} over ST-Link")
 endfunction()
 
-# --- App: coremark (optional; kept for later, off by default) --------------
-# The lib/coremark submodule and port/coremark/ are retained on disk; enable
-# the build with: cmake -B build ... -DBUILD_COREMARK=ON
-option(BUILD_COREMARK "Build the EEMBC CoreMark benchmark app" OFF)
-if(BUILD_COREMARK)
-    set(CMK_DIR "${CMAKE_SOURCE_DIR}/lib/coremark")
-    add_executable(coremark
-        "${CMAKE_SOURCE_DIR}/src/stm32f7xx_it.c"
-        "${CMK_DIR}/core_list_join.c"
-        "${CMK_DIR}/core_main.c"
-        "${CMK_DIR}/core_matrix.c"
-        "${CMK_DIR}/core_state.c"
-        "${CMK_DIR}/core_util.c"
-        "${CMAKE_SOURCE_DIR}/port/coremark/core_portme.c")
-    target_link_libraries(coremark PRIVATE common)
-    target_include_directories(coremark PRIVATE
-        "${CMK_DIR}" "${CMAKE_SOURCE_DIR}/port/coremark")
-    target_compile_definitions(coremark PRIVATE
-        ITERATIONS=0 PERFORMANCE_RUN=1 TOTAL_DATA_SIZE=2000)
-    target_compile_options(coremark PRIVATE -O3 -funroll-loops)
-    target_link_options(coremark PRIVATE -u _printf_float)  # nano printf %f
-    firmware_finalize(coremark)
-endif()
+# --- CoreMark object library (run as the shell `coremark` command) ----------
+# Built once at -O3 and linked into the threadx firmware below; cmd_coremark.c
+# calls coremark_main().  core_main.c is compiled with -Dmain=coremark_main so
+# its main() does not clash with the firmware main() in src/main.c.  MEM_METHOD=
+# MEM_STATIC keeps the TOTAL_DATA_SIZE block in .bss (off the shell thread
+# stack) as a static array, so no malloc is pulled in.
+set(CMK_DIR "${CMAKE_SOURCE_DIR}/lib/coremark")
+add_library(coremark_obj OBJECT
+    "${CMK_DIR}/core_list_join.c"
+    "${CMK_DIR}/core_main.c"
+    "${CMK_DIR}/core_matrix.c"
+    "${CMK_DIR}/core_state.c"
+    "${CMK_DIR}/core_util.c"
+    "${CMAKE_SOURCE_DIR}/port/coremark/core_portme.c")
+target_link_libraries(coremark_obj PUBLIC bsp_iface)   # HAL_GetTick for timing
+target_include_directories(coremark_obj PRIVATE
+    "${CMK_DIR}" "${CMAKE_SOURCE_DIR}/port/coremark")
+target_compile_definitions(coremark_obj PRIVATE
+    ITERATIONS=0 PERFORMANCE_RUN=1 TOTAL_DATA_SIZE=2000
+    MEM_METHOD=MEM_STATIC MEM_LOCATION="STATIC")
+target_compile_options(coremark_obj PRIVATE -O3 -funroll-loops)
+# Rename CoreMark's main() so it does not collide with the firmware main().
+set_source_files_properties("${CMK_DIR}/core_main.c" PROPERTIES
+    COMPILE_DEFINITIONS "main=coremark_main")
 
-# --- App: threadx ----------------------------------------------------------
-# ThreadX provides its own PendSV_Handler, so src/stm32f7xx_it.c is omitted.
+# --- Eclipse ThreadX core + Cortex-M7/GNU port -----------------------------
+# Shared by the threadx firmware below.  ThreadX supplies its own PendSV_Handler
+# (there is no SVC user), so src/stm32f7xx_it.c is not part of the build; the
+# startup file's weak Default_Handler catches every other vector.
 set(TX_DIR  "${CMAKE_SOURCE_DIR}/lib/threadx")
 set(TX_PORT "${TX_DIR}/ports/cortex_m7/gnu")
 file(GLOB TX_CORE "${TX_DIR}/common/src/*.c")
 list(FILTER TX_CORE EXCLUDE REGEX "tx_misra\\.c$")
 file(GLOB TX_ASM "${TX_PORT}/src/*.S")
 list(FILTER TX_ASM EXCLUDE REGEX "tx_misra\\.S$")
-add_executable(threadx
-    "${CMAKE_SOURCE_DIR}/src/app_threadx.c"
-    "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
-    ${TX_CORE}
-    ${TX_ASM})
-target_link_libraries(threadx PRIVATE common)
-target_include_directories(threadx PRIVATE
-    "${TX_DIR}/common/inc" "${TX_PORT}/inc"
-    "${CMAKE_SOURCE_DIR}/port/threadx")
-target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE)
-target_compile_options(threadx PRIVATE -O2)
-firmware_finalize(threadx)
 
-# --- App: shell ------------------------------------------------------------
-# Interactive ThreadX CLI shell over the USART1 VCP (issue #8).  Reuses the
-# ThreadX core/port from the threadx block (TX_DIR/TX_PORT/TX_CORE/TX_ASM) and,
-# like that app, omits src/stm32f7xx_it.c because ThreadX supplies PendSV_Handler
-# (USART1_IRQHandler comes from the UART backend).
+# --- App: threadx (the interactive ThreadX CLI shell) ----------------------
+# The single firmware: the ThreadX CLI shell over the USART1 VCP.  Uses the
+# ThreadX core/port set up above and omits src/stm32f7xx_it.c because ThreadX
+# supplies PendSV_Handler (USART1_IRQHandler comes from the UART backend).
 #
 # The shell core + backends are collected into an OBJECT library named shell_obj
-# (NOT shell -- the executable below takes the target name `shell`).  Because
+# (NOT threadx -- the executable below takes the target name `threadx`).  Because
 # cli_instance.h pulls in tx_api.h, the objlib MUST be compiled with the same
 # TX_INCLUDE_USER_DEFINE_FILE + port/threadx as the ThreadX core linked into the
 # exe, or the TX_THREAD / event-flags / mutex layouts disagree (ABI mismatch).
@@ -185,123 +179,27 @@ option(CLI_ENABLE_DANGEROUS_CMDS "Build the dangerous shell commands (reboot, de
 # default.  STRING (not option) because it carries a number, forwarded below.
 set(CLI_DEVMEM_DUMP_MAX_LEN "256" CACHE STRING "Max bytes per devmem dump")
 
-add_executable(shell
-    "${CMAKE_SOURCE_DIR}/src/app_shell.c"
+add_executable(threadx
+    "${CMAKE_SOURCE_DIR}/src/main.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_system.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_thread.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_coremark.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     ${TX_CORE}
     ${TX_ASM})
-target_link_libraries(shell PRIVATE common shell_obj)
-target_include_directories(shell PRIVATE
+target_link_libraries(threadx PRIVATE common shell_obj coremark_obj)
+target_include_directories(threadx PRIVATE
     "${TX_DIR}/common/inc" "${TX_PORT}/inc"
     "${CMAKE_SOURCE_DIR}/port/threadx"
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
     "${CMAKE_SOURCE_DIR}/shell/backend")  # CLI_BACKEND_*_DEFINE macros
-target_compile_definitions(shell PRIVATE TX_INCLUDE_USER_DEFINE_FILE
+target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE
     CLI_ENABLE_DANGEROUS_CMDS=$<BOOL:${CLI_ENABLE_DANGEROUS_CMDS}>
-    CLI_DEVMEM_DUMP_MAX_LEN=${CLI_DEVMEM_DUMP_MAX_LEN})
-target_compile_options(shell PRIVATE -O2)
-firmware_finalize(shell)
-
-# --- App: thread_metric (optional Thread-Metric RTOS benchmark) -------------
-# Runs the EEMBC-style ThreadX benchmark suite. Pick the test with
-# -DTHREAD_METRIC_TEST=<name>. Reuses TX_DIR/TX_PORT/TX_CORE/TX_ASM from above.
-option(BUILD_THREAD_METRIC "Build the Thread-Metric RTOS benchmark app" OFF)
-if(BUILD_THREAD_METRIC)
-    set(THREAD_METRIC_TEST "basic" CACHE STRING
-        "Thread-Metric test: basic|cooperative|preemptive|memory|message|sync|interrupt|interrupt_preempt")
-    set(TM_DIR "${TX_DIR}/utility/benchmarks/thread_metric")
-
-    # Map the short test name to its source file; interrupt tests also need the
-    # SVC glue (TM_CAUSE_INTERRUPT == SVC #0).
-    set(TM_NEEDS_SVC FALSE)
-    if(THREAD_METRIC_TEST STREQUAL "basic")
-        set(TM_TEST_SRC "${TM_DIR}/tm_basic_processing_test.c")
-    elseif(THREAD_METRIC_TEST STREQUAL "cooperative")
-        set(TM_TEST_SRC "${TM_DIR}/tm_cooperative_scheduling_test.c")
-    elseif(THREAD_METRIC_TEST STREQUAL "preemptive")
-        set(TM_TEST_SRC "${TM_DIR}/tm_preemptive_scheduling_test.c")
-    elseif(THREAD_METRIC_TEST STREQUAL "memory")
-        set(TM_TEST_SRC "${TM_DIR}/tm_memory_allocation_test.c")
-    elseif(THREAD_METRIC_TEST STREQUAL "message")
-        set(TM_TEST_SRC "${TM_DIR}/tm_message_processing_test.c")
-    elseif(THREAD_METRIC_TEST STREQUAL "sync")
-        set(TM_TEST_SRC "${TM_DIR}/tm_synchronization_processing_test.c")
-    elseif(THREAD_METRIC_TEST STREQUAL "interrupt")
-        set(TM_TEST_SRC "${TM_DIR}/tm_interrupt_processing_test.c")
-        set(TM_NEEDS_SVC TRUE)
-    elseif(THREAD_METRIC_TEST STREQUAL "interrupt_preempt")
-        set(TM_TEST_SRC "${TM_DIR}/tm_interrupt_preemption_processing_test.c")
-        set(TM_NEEDS_SVC TRUE)
-    else()
-        message(FATAL_ERROR "Unknown THREAD_METRIC_TEST '${THREAD_METRIC_TEST}'")
-    endif()
-
-    set(TM_SRC
-        "${CMAKE_SOURCE_DIR}/src/app_thread_metric.c"
-        "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
-        "${TM_DIR}/threadx_example/tm_porting_layer_threadx.c"
-        "${TM_TEST_SRC}"
-        ${TX_CORE} ${TX_ASM})
-    if(TM_NEEDS_SVC)
-        list(APPEND TM_SRC "${CMAKE_SOURCE_DIR}/port/threadx/tm_svc.c")
-    endif()
-
-    add_executable(thread_metric ${TM_SRC})
-    target_link_libraries(thread_metric PRIVATE common)
-    target_include_directories(thread_metric PRIVATE
-        "${TX_DIR}/common/inc" "${TX_PORT}/inc"
-        "${CMAKE_SOURCE_DIR}/port/threadx"
-        "${TM_DIR}")
-    # ThreadX tick at 100 Hz to match the porting layer's
-    # TM_THREADX_TICKS_PER_SECOND (so tm_thread_sleep(seconds) is real seconds),
-    # plus the recommended Thread-Metric performance build options.
-    target_compile_definitions(thread_metric PRIVATE
-        TX_INCLUDE_USER_DEFINE_FILE
-        TX_TIMER_TICKS_PER_SECOND=100
-        TX_GLUE_TICK_DIV=10
-        TX_DISABLE_ERROR_CHECKING
-        TX_DISABLE_NOTIFY_CALLBACKS
-        TX_DISABLE_REDUNDANT_CLEARING
-        TX_DISABLE_STACK_FILLING
-        TX_NOT_INTERRUPTABLE
-        TX_TIMER_PROCESS_IN_ISR
-        TX_REACTIVATE_INLINE
-        TX_INLINE_THREAD_RESUME_SUSPEND)
-    target_compile_options(thread_metric PRIVATE -O2)
-    # The benchmark counters are plain (non-volatile) globals updated in tight
-    # infinite loops; at -O2 GCC keeps them in a register and never writes them
-    # back, so the reporting thread reads a stale value ("thread died"). Build
-    # the test source at -O0 so the counters hit memory. ThreadX itself stays
-    # at -O2, so the measured RTOS operations remain representative.
-    set_source_files_properties("${TM_TEST_SRC}" PROPERTIES COMPILE_OPTIONS "-O0")
-    firmware_finalize(thread_metric)
-endif()
-
-# --- App: exec_profile (optional Execution Profile Kit demo) ----------------
-# Per-thread / ISR / idle CPU-time profiling via the Cortex-M7 DWT cycle
-# counter. TX_EXECUTION_PROFILE_ENABLE makes the ThreadX port asm call the
-# profile hooks, so ThreadX core + port must be rebuilt with it (per-target
-# here). Reuses TX_DIR/TX_PORT/TX_CORE/TX_ASM from the threadx block.
-option(BUILD_EXEC_PROFILE "Build the ThreadX Execution Profile Kit demo" OFF)
-if(BUILD_EXEC_PROFILE)
-    add_executable(exec_profile
-        "${CMAKE_SOURCE_DIR}/src/app_exec_profile.c"
-        "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
-        "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c"
-        ${TX_CORE} ${TX_ASM})
-    target_link_libraries(exec_profile PRIVATE common)
-    target_include_directories(exec_profile PRIVATE
-        "${TX_DIR}/common/inc" "${TX_PORT}/inc"
-        "${CMAKE_SOURCE_DIR}/port/threadx"
-        "${TX_DIR}/utility/execution_profile_kit")
-    target_compile_definitions(exec_profile PRIVATE
-        TX_INCLUDE_USER_DEFINE_FILE
-        TX_EXECUTION_PROFILE_ENABLE)
-    target_compile_options(exec_profile PRIVATE -O2)
-    firmware_finalize(exec_profile)
-endif()
+    CLI_DEVMEM_DUMP_MAX_LEN=${CLI_DEVMEM_DUMP_MAX_LEN}
+    CLI_INSTANCE_STACK_SIZE=4096)         # headroom: coremark runs in this thread
+target_compile_options(threadx PRIVATE -O2)
+target_link_options(threadx PRIVATE -u _printf_float)   # CoreMark %f score line
+firmware_finalize(threadx)

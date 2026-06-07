@@ -1,15 +1,19 @@
 /**
- * @file    app_shell.c
- * @brief   ThreadX Shell (CLI) demo app for STM32F746G-DISCO (issues #8/#9).
+ * @file    main.c
+ * @brief   STM32F746G-DISCO single firmware: the interactive ThreadX CLI shell.
  *
- * Brings the shell library up on real hardware over the ST-Link VCP:
+ * This is the one and only application (CMake target `threadx`).  It brings the
+ * shell library up on real hardware over the ST-Link VCP; everything else --
+ * including the CoreMark benchmark -- runs as a shell command, not a separate
+ * image (see shell/cmds/cmd_coremark.c).
  *
  *   - vcp_sh : interactive shell on USART1 (PA9/PB7, 115200 8N1).  Connect a
- *              terminal to /dev/ttyACM0; it has the full #9 line editor (cursor
+ *              terminal to /dev/ttyACM0; it has the full line editor (cursor
  *              motion, in-line edit, meta keys, VT100, terminal-width wrap,
- *              colour).  `help` lists commands, `echo` echoes.
+ *              colour).  `help` lists commands (version/uptime/reboot/thread/
+ *              devmem/coremark/help/echo/...).
  *   - led    : LD1 (PI1) heartbeat, showing the shell coexists with other ThreadX
- *              threads.
+ *              threads (it keeps blinking even while `coremark` runs).
  *
  * The multi-instance architecture (req §10, acceptance §18.8) is exercised by the
  * host tests (two dummy instances, no crosstalk) and was demonstrated on silicon
@@ -112,8 +116,8 @@ int main(void)
 
 	/* Early banner over the polling _write fallback (the console is not enabled
 	 * until the VCP instance thread runs after tx_kernel_enter). */
-	printf("\r\nThreadX Shell demo (issues #8/#9)\r\n");
-	printf("VCP shell on USART1 @115200 8N1; type 'help'.\r\n");
+	printf("\r\nThreadX Shell -- STM32F746G-DISCO\r\n");
+	printf("VCP on USART1 @115200 8N1; type 'help' (try 'coremark').\r\n");
 
 	tx_kernel_enter();   /* does not return */
 
