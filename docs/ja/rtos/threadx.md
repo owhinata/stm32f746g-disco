@@ -21,6 +21,24 @@
 !!! note "検証方法"
     SWD で `_tx_timer_system_clock` を 1 秒間隔で読むと、正常時は約 +1000/秒。停止していれば tick 問題。`$pc` が `__tx_ts_wait`（PendSV 内アイドル）で固着していないか確認する。
 
+## アイドル省電力（WFI、`TX_ENABLE_WFI`）
+
+`tx_user.h` で `TX_ENABLE_WFI` を定義しているため、ready スレッドが無いときポート asm のアイドルループ（`__tx_ts_wait`）は busy-spin せず `DSB; WFI; ISB` で **CPU を Sleep** させ、割込みが来るまで停止する。実利用ではシェルが UART RX 待ちで suspend、`led` も `tx_thread_sleep` でほぼアイドルのため、busy-spin を WFI に置き換えると消費電力が下がる。
+
+Cortex-M7 の WFI Sleep は **CPU の命令実行だけを止め、HCLK/APB クロックは供給を継続**する（RM0385 Sleep mode）。これにより以下の起床・計時経路が成立する:
+
+- **SysTick は止まらない**: SysTick は HCLK 源で Sleep 中も計数を続け、1 ms tick が進む（HAL tick / ThreadX tick とも）。よって `tx_thread_sleep` の満了でスレッドが起床する（`led` の 250 ms 点滅は継続）。
+- **UART RX で wake**: USART1 RX は割込み駆動（[UART バックエンド](shell-backend-uart.md)、IRQ 優先度 5）。バイト到来で USART1 割込みが WFI から CPU を起こす（WFI の wake 判定は PRIMASK を無視する）。アイドルループは `CPSID i` で割込みを無効化してから WFI に入るが、pending になった割込みで wake し、`CPSIE i` 後に ISR が走って `CLI_EVT_RX` を set、シェルスレッドが復帰する。
+- **計時前提（TIM2）**: 実行プロファイル（`thread` の cpu%、[thread コマンド](shell-thread.md)）の time source は `DWT_CYCCNT` ではなく **TIM2**。DWT は core クロックがゲートされる WFI Sleep 中に凍結し得るが、TIM2 は Sleep 中もクロック供給が続く（`TIM2LPEN` リセット値 = 1）ため、WFI 有効時でも cpu%/idle 計測が正しく保たれる。
+
+!!! note "デバッグ時の注意（DBG_SLEEP）"
+    OpenOCD の `target/stm32f7x.cfg` は examine 時に `DBGMCU_CR` の `DBG_SLEEP`/`DBG_STOP`/`DBG_STANDBY` を set し得る。`DBG_SLEEP` が立つとデバッグ接続中だけ Sleep でも core クロックが維持され、WFI/tick/消費電流の観測が偽陽性になる。本 firmware は `DBG_SLEEP` を焼かない方針なので、SWD で計測する際は `DBGMCU->CR`（`0xE0042004`）bit0 が 0 であることを確認する（立っていればクリアしてから測る）。`tx_thread_sleep` 起床・UART 応答・消費電流の最終確認は SWD 非接続で行うのが確実。
+
+    逆に `DBG_SLEEP=0` の genuine WFI sleep 中は、オンボードの古い ST-Link（V2J28M16）では core を読めない（通常の `st-info --probe` / OpenOCD examine が失敗し、メモリ読みは `0x01010001` 等の garbage を返す）。attach するには connect-under-reset（`openocd ... -c "reset_config srst_only connect_assert_srst"` でリセット保持中に接続 → `reset halt`/`reset run`）するか、attach 後に `DBG_SLEEP` を立てる。この「眠っていると読めない」症状自体が genuine sleep の証拠でもある。
+
+!!! note "非対象: `TX_LOW_POWER`（tickless）"
+    SysTick を止めて深いスリープに入る tickless フレームワーク（`TX_LOW_POWER` + `tx_low_power.c`、ユーザ HW マクロ必須）は本 firmware では未採用（将来・任意）。本節は port マクロ `TX_ENABLE_WFI` 単体による浅い Sleep のみ。
+
 ## ビルド時の要点
 
 - `common/src/*.c`（コア）+ `ports/cortex_m7/gnu/src/*.S`（コンテキストスイッチ等）をビルド。`tx_misra`（`.c`/`.S` とも）は重複定義のため**除外**。

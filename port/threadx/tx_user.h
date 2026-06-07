@@ -43,4 +43,21 @@
 #define TX_EXECUTION_TIME_SOURCE \
     ((EXECUTION_TIME_SOURCE_TYPE)(*(volatile ULONG *)0x40000024UL))
 
+/* Enable WFI in the scheduler idle loop (issue #20).  When no thread is ready,
+ * the Cortex-M7 port inserts DSB; WFI; ISB instead of busy-spinning
+ * (tx_thread_schedule.S __tx_ts_wait), so the core sleeps until an interrupt.
+ *
+ * Safe here because every wake/timekeeping path survives Cortex-M7 WFI Sleep
+ * (HCLK and APB clocks keep running; only CPU instruction execution stops,
+ * RM0385 Sleep mode):
+ *   - SysTick (HCLK source, prio 14 > PendSV 15) keeps ticking -> tx_thread_sleep
+ *     wakeups and HAL tick advance; sleeping threads (LED 250 ms) resume.
+ *   - USART1 RX is interrupt-driven (HAL_UART_Receive_IT, prio 5) -> a byte wakes
+ *     the core (WFI ignores PRIMASK for wake-up) and sets CLI_EVT_RX, resuming
+ *     the shell thread.
+ *   - The exec-profile time source is TIM2 (above), not DWT_CYCCNT, so cpu%/idle
+ *     stay correct while the core sleeps (DWT would freeze with the core clock).
+ * Not TX_LOW_POWER (tickless): that is a separate, future task. */
+#define TX_ENABLE_WFI
+
 #endif /* TX_USER_H */
