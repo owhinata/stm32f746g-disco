@@ -39,7 +39,7 @@ edit updates `(line, len, cur)` and then redraws. The same struct also holds
 | `Insert` (`ESC[2~`) | toggle insert / overwrite |
 | `Ctrl+c` | cancel the input line (recovers from a half-read escape too, §9) |
 | `Enter` (`\r` / `\n`) | dispatch the line (`\r\n` once) |
-| `↑` / `↓`, `Ctrl+p` / `Ctrl+n` | history (no-op stubs in #9; the fixed ring lands in #10) |
+| `↑` / `↓`, `Ctrl+p` / `Ctrl+n` | recall older / newer history entry (#10 fixed ring) |
 
 `Tab` (`0x09`) is ignored in #9 (completion is #11). Non-ASCII (`0x80–0xFF`) and
 unsupported / malformed escapes are ignored, returning to the normal state
@@ -120,12 +120,32 @@ editing semantics, not decoration, so they are not gated by `CLI_USE_COLOR`.
 | `CLI_TERM_WIDTH` | 80 | terminal width for wrapping before/without a CPR reply |
 | `CLI_BACKSPACE_MODE` | 0 | `bs_swap` seed (0 = both erase backward / 1 = DEL deletes forward) |
 
-## History seam (#10)
+## History (#10)
 
-`↑`/`↓` and `Ctrl+p`/`Ctrl+n` call `cli_history_prev/next()`, and dispatch calls
-`cli_history_add()`, but in #9 these are **no-op stubs** in
-`shell/core/cli_history.c`. #10 only has to replace that file's body with the
-fixed ring (§8: 512 B, FIFO, consecutive-duplicate suppression).
+`↑`/`↓` and `Ctrl+p`/`Ctrl+n` call `cli_history_prev/next()`, and dispatch records
+each submitted line through `cli_history_add()` (before the parser tokenizes it in
+place). `shell/core/cli_history.c` implements a **fixed byte ring** (req §8):
+
+- **Storage** — `sh->hist[CLI_HISTORY_BUFFER_SIZE]` (default 512 B), entries packed
+  oldest→newest and each `'\0'`-terminated. Adding a line evicts the oldest entries
+  FIFO until it fits; **no dynamic allocation**, and the ring is **per-instance** so
+  histories never cross (req §10).
+- **Dedup** — a line identical to the most recent entry is dropped
+  (consecutive-duplicate suppression). Empty lines, and lines that cannot be recalled
+  safely (longer than the line buffer or the whole ring), are not recorded.
+- **Recall** — `↑`/`Ctrl+p` walks toward older entries (the first press jumps to the
+  newest; the oldest is a stop), `↓`/`Ctrl+n` walks back toward newer. Recall copies
+  the entry into the line buffer (cursor at the end) and repaints via the exported
+  `cli_edit_redraw()` wrapper (the editor's own refresh is `static`).
+- **No draft restore (MVP)** — pressing `↓` past the newest entry returns an **empty**
+  live line; the text typed before the first `↑`, and any edits made to a recalled
+  line, are not preserved.
+- **Navigation reset** — `cli_dispatch_line()` clears `hist_nav_on`/`hist_nav`
+  unconditionally (so a recalled line cleared to empty and re-submitted does not leave
+  a stale offset), and `Ctrl+c` leaves navigation too.
+
+These run only in the instance's shell thread (the RX ISR just sets an event flag),
+so the history code needs no locking of its own.
 
 ## Verification
 
@@ -133,6 +153,11 @@ Host unit test `shell/test/test_edit.c` (drives `cli_input_byte` directly and
 asserts the model): cursor moves, insert/overwrite, deletes (BS, Ctrl+d, Del,
 Ctrl+k/u/w), word moves, invalid-escape ignore, the CPR guard, wrap row counts,
 clear screen, backspace mode and the post-dispatch cursor reset.
+`shell/test/test_history.c` covers the history ring (built with a 32 B cap to force
+eviction): add + recall round-trip, dedup, non-consecutive duplicates kept, FIFO
+eviction, empty lines skipped, the arrow / Ctrl+p,n wiring, navigation reset on
+submit / Ctrl+c / blank re-submit, the MVP "no draft restore" behaviour, and
+per-instance isolation.
 
 ```bash
 sh shell/test/run_host_tests.sh   # => host tests passed

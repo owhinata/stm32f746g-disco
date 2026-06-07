@@ -106,6 +106,20 @@ gcc $CFLAGS -DCLI_USE_COLOR=0 \
     $LDFLAGS -o "$out/test_edit"
 "$out/test_edit"
 
+# #10 -- command history fixed ring: add + recall (arrows / Ctrl+p,n), consecutive-
+# duplicate suppression, non-consecutive duplicates kept, FIFO eviction at the byte
+# cap, empty lines skipped, navigation-state reset on submit / Ctrl+C / blank
+# re-submit, the MVP "no draft restore" behaviour, and per-instance isolation.
+# Drives cli_history_* + cli_input_byte directly (model assertions).  A small
+# 32 B CLI_HISTORY_BUFFER_SIZE forces eviction with a few short entries; colour OFF.
+gcc $CFLAGS -DCLI_USE_COLOR=0 -DCLI_HISTORY_BUFFER_SIZE=32 \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    "$here/test_history.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
+    "$core/cli_printf.c" "$core/cli_parse.c" \
+    $glue \
+    $LDFLAGS -o "$out/test_history"
+"$out/test_history"
+
 # #7 -- UART backend byte ring: the pure, lock-free FIFO helpers (cli_uart_ring.h)
 # that the USART1 IRQ backend layers RX/TX on.  HAL/ThreadX-free, so it builds with
 # the host gcc and needs no shim -- only the backend include dir for the header.

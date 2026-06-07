@@ -143,6 +143,14 @@ static void cli_edit_refresh(struct cli_instance *sh)
 	cli_unlock(sh);
 }
 
+/* Public thin wrapper over the static refresh: lets cli_history.c (a separate
+ * translation unit) repaint after recalling an entry into the line buffer.  The
+ * caller sets sh->line / len / cur first; this redraws prompt + line (issue #10). */
+void cli_edit_redraw(struct cli_instance *sh)
+{
+	cli_edit_refresh(sh);
+}
+
 /* Cursor-only move: reposition without repainting the line (cheaper, no flicker
  * for plain arrow / Home / End / word moves).  old_rows is unchanged. */
 static void edit_reposition(struct cli_instance *sh)
@@ -447,6 +455,7 @@ void cli_input_byte(struct cli_instance *sh, uint8_t b)
 		sh->len = 0;
 		sh->cur = 0;
 		sh->line[0] = '\0';
+		sh->hist_nav_on = 0;        /* leave history navigation (issue #10) */
 		/* The "^C\r\n" left the cursor on a fresh line; cli_prompt draws the
 		 * prompt there, so set the render baseline to that prompt (NOT 0, or a
 		 * later shortening refresh would skip the clear and leave stale text). */

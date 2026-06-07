@@ -90,6 +90,12 @@ void cli_dispatch_line(struct cli_instance *sh)
 	sh->cur = 0;
 	sh->line[0] = '\0';
 	sh->rx = CLI_RX_NORMAL;
+	/* Leave history navigation unconditionally: cli_history_add only runs for a
+	 * non-empty line, so a recalled line cleared to empty (or a blank submit)
+	 * would otherwise leave hist_nav_on set and the next ↑ would resume from a
+	 * stale offset instead of the newest entry (issue #10). */
+	sh->hist_nav_on = 0;
+	sh->hist_nav = 0;
 	{
 		unsigned w = sh->term_width ? sh->term_width : (unsigned)CLI_TERM_WIDTH;
 		sh->old_rows = (uint8_t)((unsigned)strlen(sh->prompt) / w + 1);

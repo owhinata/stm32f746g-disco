@@ -112,6 +112,15 @@ struct cli_instance {
 	uint16_t cur;                    /**< cursor index, 0..len (insert point) */
 	uint8_t  overwrite;              /**< 0=insert (default), 1=overwrite; Insert key toggles */
 
+	/* Command history: fixed byte ring (issue #10, req §8).  Entries are packed
+	 * oldest->newest in hist[0..hist_used), each '\0'-terminated.  Adding a line
+	 * evicts the oldest entries FIFO until the new one fits; no dynamic
+	 * allocation.  All state is per-instance, so histories never cross (req §10). */
+	char     hist[CLI_HISTORY_BUFFER_SIZE];
+	uint16_t hist_used;              /**< bytes used incl. terminators (0..CLI_HISTORY_BUFFER_SIZE) */
+	uint8_t  hist_nav_on;            /**< 1 = recalling a history entry; 0 = on the live line */
+	uint16_t hist_nav;               /**< offset in hist[] of the entry currently recalled */
+
 	/* Per-instance parser scratch (sized by #3's CLI_ARGV_CAP). */
 	char                  *argv[CLI_ARGV_CAP];
 	struct cli_parse_result pr;

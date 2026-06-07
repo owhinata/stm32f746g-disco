@@ -92,6 +92,9 @@ int cli_init(struct cli_instance *sh)
 	sh->esc_p[0]    = 0;
 	sh->esc_p[1]    = 0;
 	sh->overwrite   = 0;
+	sh->hist_used   = 0;        /* command history ring empty (issue #10) */
+	sh->hist_nav_on = 0;
+	sh->hist_nav    = 0;
 	sh->bs_swap     = CLI_BACKSPACE_MODE;
 	sh->term_width  = CLI_TERM_WIDTH;
 	sh->old_rows    = 0;

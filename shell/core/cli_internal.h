@@ -101,11 +101,20 @@ void cli_dispatch_line(struct cli_instance *sh);
 /** Emit the instance prompt. */
 void cli_prompt(struct cli_instance *sh);
 
+/**
+ * Repaint the prompt + current line (cursor at sh->cur).  A thin non-static
+ * wrapper over the editor's internal refresh, exported so cli_history.c can
+ * redraw after recalling an entry into the line buffer (the refresh itself is
+ * static to cli_edit.c).  Issue #10.
+ */
+void cli_edit_redraw(struct cli_instance *sh);
+
 /*
- * Command history hooks (cli_history.c).  No-op stubs in issue #9 -- they keep
- * the line editor's up/down (ESC[A/B, Ctrl+p/n) and the dispatch-time record
- * call wired to a stable seam that issue #10 fills in with the fixed ring, by
- * replacing cli_history.c's body only.
+ * Command history hooks (cli_history.c).  The line editor routes up/down
+ * (ESC[A/B, Ctrl+p/n) to prev/next and the dispatcher records each submitted
+ * line through add; issue #10 implements the fixed ring here.  The call sites in
+ * cli_edit.c / cli_session.c are unchanged -- the only addition #10 needs beyond
+ * cli_history.c's body is the cli_edit_redraw export above (recall must repaint).
  */
 void cli_history_prev(struct cli_instance *sh);  /**< recall older entry (↑ / Ctrl+p) */
 void cli_history_next(struct cli_instance *sh);   /**< recall newer entry (↓ / Ctrl+n) */

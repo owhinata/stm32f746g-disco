@@ -131,6 +131,8 @@
 _Static_assert(CLI_CMD_BUFFER_SIZE > 0,     "CLI_CMD_BUFFER_SIZE must be > 0");
 _Static_assert(CLI_MAX_ARGC >= 1,           "CLI_MAX_ARGC must be >= 1");
 _Static_assert(CLI_HISTORY_BUFFER_SIZE > 0, "CLI_HISTORY_BUFFER_SIZE must be > 0");
+_Static_assert(CLI_HISTORY_BUFFER_SIZE <= 65535,
+               "CLI_HISTORY_BUFFER_SIZE must fit uint16_t hist_used/hist_nav");
 _Static_assert(CLI_PRINTF_BUFFER_SIZE > 0,  "CLI_PRINTF_BUFFER_SIZE must be > 0");
 _Static_assert(CLI_PROMPT_BUFFER_SIZE > 0,  "CLI_PROMPT_BUFFER_SIZE must be > 0");
 _Static_assert(CLI_INSTANCE_STACK_SIZE >= 512, "CLI_INSTANCE_STACK_SIZE too small");

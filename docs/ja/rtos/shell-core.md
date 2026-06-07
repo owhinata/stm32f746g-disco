@@ -14,7 +14,7 @@
 | `shell/core/cli_core.c` | 依存 | `cli_init` / `cli_start` / スレッドループ / ISR 通知（`tx_*` を呼ぶ唯一のコア） |
 | `shell/core/cli_edit.c` | **非呼び出し** | ASCII フィルタ / RX・escape 状態機械 / 行編集 / 再描画（[行編集](shell-editing.md)・#9） |
 | `shell/core/cli_session.c` | **非呼び出し** | 行 dispatch（パーサ呼び出し / エラー写像 / プロンプト復帰） |
-| `shell/core/cli_history.c` | **非呼び出し** | 履歴フック（#9 は no-op スタブ、#10 で固定リング） |
+| `shell/core/cli_history.c` | `cli_edit_redraw` | コマンド履歴 固定リング（#10）: 追加 / 呼び出し / 重複排除 |
 
 `cli_edit.c` / `cli_session.c` は `tx_*` 関数を一切呼ばないため、ホスト gcc で
 型 shim（`shell/test/shim/tx_api.h`）と共にコンパイルし
@@ -97,8 +97,8 @@ cli_start(&vcp_shell);   /* tx_thread_create（auto-start） */
 ## スコープ（#4）と後続
 
 #4 は骨格まで。出力 API/バッファ/色（#5）、dummy backend と通し自動テスト（#6）、
-USART1 VCP backend（#7）、shell アプリ + `flash-shell`（#8）は完了。[行編集・VT100・メタキー・色](shell-editing.md)（#9）も実装済み。
-履歴（#10）/ Tab 補完（#11）は後続。
+USART1 VCP backend（#7）、shell アプリ + `flash-shell`（#8）は完了。[行編集・VT100・メタキー・色](shell-editing.md)（#9）と
+[コマンド履歴 固定リング](shell-editing.md)（#10）も実装済み。Tab 補完（#11）は後続。
 
 ## 検証（ホスト単体テスト）
 

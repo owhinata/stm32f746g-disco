@@ -15,7 +15,7 @@ only Zephyr shell's *design*, no code reused.
 | `shell/core/cli_core.c` | depends | `cli_init` / `cli_start` / thread loop / ISR notify (the only core file calling `tx_*`) |
 | `shell/core/cli_edit.c` | **calls none** | ASCII filter / RX + escape state machine / line editing / redraw ([line editing](shell-editing.md), #9) |
 | `shell/core/cli_session.c` | **calls none** | line dispatch (parser call / error mapping / prompt return) |
-| `shell/core/cli_history.c` | **calls none** | history hooks (no-op stubs in #9; the fixed ring lands in #10) |
+| `shell/core/cli_history.c` | `cli_edit_redraw` | command history fixed ring (#10): add / recall / dedup |
 
 Because `cli_edit.c` / `cli_session.c` never call a `tx_*` function, they compile
 on the host against a type shim (`shell/test/shim/tx_api.h`), so the **state
@@ -109,7 +109,8 @@ callable during system initialisation.
 #4 is the skeleton. The output API / buffering / colour (#5), the dummy backend
 and end-to-end auto tests (#6), the USART1 VCP backend (#7) and the shell app +
 `flash-shell` (#8) are done. [Line editing / VT100 / meta keys / colour](shell-editing.md)
-(#9) is implemented too; history (#10) and Tab completion (#11) come next.
+(#9) and the [command history fixed ring](shell-editing.md#history-10) (#10) are
+implemented too; Tab completion (#11) comes next.
 
 ## Verification (host unit test)
 
