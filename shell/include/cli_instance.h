@@ -202,6 +202,20 @@ int  cli_start(struct cli_instance *sh);
 void cli_transport_notify_rx(struct cli_instance *sh);
 void cli_transport_notify_tx(struct cli_instance *sh);   /* reserved for #5 */
 
+/* Thread->instance registry (#18).  Lets a backend's printf retarget (_write)
+ * resolve which shell instance owns the running thread, so printf follows the
+ * calling terminal instead of a single global console.  cli_start() registers
+ * its own instance thread before creating it; future background-job workers
+ * (#25) register their worker thread against the owning instance the same way
+ * (register BEFORE tx_thread_create so an auto-started thread is never seen
+ * unregistered).  cli_register_thread returns 0 on success, -1 when the table
+ * is full (caller must treat that as a failure, never silently continue --
+ * see CLI_THREAD_MAP_MAX).  cli_current_instance returns NULL from ISR context,
+ * before the scheduler starts, or for any unregistered thread. */
+int                  cli_register_thread(TX_THREAD *t, struct cli_instance *sh);
+void                 cli_unregister_thread(TX_THREAD *t);
+struct cli_instance *cli_current_instance(void);
+
 #ifdef __cplusplus
 }
 #endif

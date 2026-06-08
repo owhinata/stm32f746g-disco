@@ -21,6 +21,107 @@
 #include "cli_instance.h"
 #include "cli_internal.h"
 
+/* ---- thread -> instance registry (#18) ------------------------------------
+ *
+ * The backend's printf retarget (_write) asks cli_current_instance() which
+ * shell instance owns the running thread, so printf output follows the calling
+ * terminal instead of a single global console.  The table is tiny
+ * (CLI_THREAD_MAP_MAX entries) and is mutated only inside a short
+ * interrupt-disable critical section; the reader scans inside the same
+ * critical section, so no volatile / memory barrier is needed today.  (If a
+ * future caller ever scans without the lock -- e.g. lock-free fast path -- the
+ * publish-.sh-last / retract-.sh-first ordering below must be paired with the
+ * appropriate volatile/barriers.)
+ */
+static struct cli_thread_map {
+	TX_THREAD           *thread;
+	struct cli_instance *sh;
+} cli_thread_reg[CLI_THREAD_MAP_MAX];
+
+/*
+ * True when running in exception / ISR context (IPSR != 0).  tx_thread_identify()
+ * cannot tell us this: the cortex_m7/gnu port leaves _tx_thread_current_ptr
+ * pointing at the *interrupted* thread across an ISR, so without this guard a
+ * printf issued from an ISR that preempted a shell thread would be misattributed
+ * to that thread's terminal.  Read IPSR with the same MRS the ThreadX port uses
+ * so this lean (ThreadX-only, host-excluded) TU needs no CMSIS header.
+ */
+static inline unsigned int cli_in_isr(void)
+{
+	unsigned int ipsr;
+	__asm__ volatile("MRS %0, IPSR" : "=r"(ipsr));
+	return ipsr;
+}
+
+int cli_register_thread(TX_THREAD *t, struct cli_instance *sh)
+{
+	TX_INTERRUPT_SAVE_AREA
+	int i, slot = -1;
+
+	if (t == NULL || sh == NULL)
+		return -1;
+
+	TX_DISABLE
+	for (i = 0; i < CLI_THREAD_MAP_MAX; i++) {
+		if (cli_thread_reg[i].sh == NULL) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot >= 0) {
+		cli_thread_reg[slot].thread = t;
+		cli_thread_reg[slot].sh     = sh;   /* publish last */
+	}
+	TX_RESTORE
+
+	return slot >= 0 ? 0 : -1;   /* -1: table full -- caller must not continue */
+}
+
+void cli_unregister_thread(TX_THREAD *t)
+{
+	TX_INTERRUPT_SAVE_AREA
+	int i;
+
+	if (t == NULL)
+		return;
+
+	TX_DISABLE
+	for (i = 0; i < CLI_THREAD_MAP_MAX; i++) {
+		if (cli_thread_reg[i].thread == t) {
+			cli_thread_reg[i].sh     = NULL;   /* retract first */
+			cli_thread_reg[i].thread = NULL;
+			break;
+		}
+	}
+	TX_RESTORE
+}
+
+struct cli_instance *cli_current_instance(void)
+{
+	TX_INTERRUPT_SAVE_AREA
+	struct cli_instance *result = NULL;
+	TX_THREAD *t;
+	int i;
+
+	if (cli_in_isr())            /* ISR/exception: no owning terminal */
+		return NULL;
+
+	t = tx_thread_identify();    /* NULL before the scheduler starts */
+	if (t == NULL)
+		return NULL;
+
+	TX_DISABLE
+	for (i = 0; i < CLI_THREAD_MAP_MAX; i++) {
+		if (cli_thread_reg[i].thread == t && cli_thread_reg[i].sh != NULL) {
+			result = cli_thread_reg[i].sh;
+			break;
+		}
+	}
+	TX_RESTORE
+
+	return result;
+}
+
 /*
  * Instance thread.  Enable the backend, show the prompt, then loop: wait for an
  * RX (or KILL) signal, drain every available byte and run the state machine.
@@ -39,6 +140,7 @@ static void cli_thread_entry(ULONG arg)
 	if (tr->api->enable(tr) != 0) {
 		if (tr->api->uninit)
 			tr->api->uninit(tr);
+		cli_unregister_thread(&sh->thread);   /* #18: drop the thread->instance map */
 		return;
 	}
 	cli_edit_session_start(sh);   /* probe terminal width + draw the first prompt */
@@ -66,6 +168,7 @@ static void cli_thread_entry(ULONG arg)
 
 	if (tr->api->uninit)
 		tr->api->uninit(tr);
+	cli_unregister_thread(&sh->thread);   /* #18: drop the thread->instance map */
 }
 
 int cli_init(struct cli_instance *sh)
@@ -149,11 +252,21 @@ int cli_start(struct cli_instance *sh)
 	if (sh->state != CLI_INITED)
 		return -1;
 
+	/* Register the thread->instance mapping BEFORE creating the auto-started
+	 * thread (#18): &sh->thread is a stable member address valid before
+	 * tx_thread_create(), so a thread that begins running immediately always
+	 * finds itself registered (no register-after-start race).  A full registry
+	 * is a start failure -- printf must never silently misroute. */
+	if (cli_register_thread(&sh->thread, sh) != 0)
+		return -1;
+
 	if (tx_thread_create(&sh->thread, "cli", cli_thread_entry, (ULONG)sh,
 	                     sh->stack, sh->stack_size,
 	                     CLI_INSTANCE_PRIORITY, CLI_INSTANCE_PRIORITY,
-	                     TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS)
+	                     TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS) {
+		cli_unregister_thread(&sh->thread);   /* roll back the registration */
 		return -1;
+	}
 
 	sh->state = CLI_STARTED;
 	return 0;

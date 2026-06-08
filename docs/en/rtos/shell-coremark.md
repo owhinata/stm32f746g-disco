@@ -64,10 +64,13 @@ CLI_CMD_REGISTER(coremark, NULL, "run the EEMBC CoreMark benchmark (~12s)",
   `HAL_IncTick` and `_tx_timer_interrupt` ([ThreadX integration](threadx.md)), so
   it stays accurate.
 - **Output**: CoreMark's `ee_printf` → `printf` → the UART backend's strong
-  `_write` → the IRQ TX ring. It reaches the same USART1 as `cli_print`, but since
-  the benchmark runs in this single foreground thread there is no concurrent
-  output; the timed region (`start_time()`–`stop_time()`) does no I/O, so TX
-  back-pressure does not perturb the score.
+  `_write` → the IRQ TX ring. Because `_write` resolves the calling thread's owning
+  shell instance (#18, [UART backend](shell-backend-uart.md)) and the benchmark
+  runs synchronously in the shell thread, the report follows the terminal that
+  launched `coremark` — no coremark-side change is needed. It runs in this single
+  foreground thread, so there is no concurrent output, and the timed region
+  (`start_time()`–`stop_time()`) does no I/O, so TX back-pressure does not perturb
+  the score.
 
 !!! note "Line endings (LF→CRLF)"
     CoreMark's report uses `\n` per spec, but the UART backend's `_write` translates

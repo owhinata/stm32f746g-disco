@@ -262,25 +262,57 @@ static int tx_putc_spin(struct cli_uart *u, uint8_t b, uint32_t *stall)
 }
 
 /*
+ * Resolve a shell instance to its UART TX backend, but only when this backend
+ * owns it (api identity) and the console is live (enabled).  Used by _write to
+ * route printf to the *calling* instance's UART; a non-UART transport (e.g. the
+ * dummy backend), an un-enabled instance or a NULL instance returns NULL so the
+ * caller falls back to the global console (#18).
+ */
+static struct cli_uart *uart_ctx_from_instance(struct cli_instance *sh)
+{
+	struct cli_uart *u;
+
+	if (sh == NULL || sh->tr == NULL || sh->tr->api != &cli_uart_api)
+		return NULL;
+	u = (struct cli_uart *)sh->tr->ctx;
+	return (u != NULL && u->enabled) ? u : NULL;
+}
+
+/*
  * Strong _write that overrides the weak polling one in bsp.c when this backend is
- * linked.  Once the console is enabled, route printf through the same TX ring as
- * the shell so USART1 has exactly one owner; before that (early boot logs, or no
- * console bound yet) fall back to blocking polling, which is safe because no IT TX
- * has been armed.  printf is best-effort: a wedged TX drops the remainder.
+ * linked.  Once a console is enabled, route printf through the same TX ring as
+ * the shell so each USART has exactly one owner; before that (early boot logs, or
+ * no console bound yet) fall back to blocking polling, which is safe because no
+ * IT TX has been armed.  printf is best-effort: a wedged TX drops the remainder.
+ *
+ * Per-thread routing (#18): the target is the UART of the shell instance that
+ * owns the running thread (cli_current_instance), so printf -- including the
+ * CoreMark report (ee_printf == printf), which runs in the calling shell thread
+ * -- follows the calling terminal.  From an ISR, before the scheduler starts
+ * (boot banner) or from a non-shell thread, cli_current_instance() returns NULL
+ * and we fall back to g_uart_console, i.e. exactly the previous behaviour (the
+ * single VCP is unchanged byte-for-byte).
  *
  * Bare LF is translated to CR+LF so a raw terminal (without picocom's --imap
  * lfcrlf) shows printf output -- notably the CoreMark report, whose lines end in
  * '\n' -- without staircasing; an existing CR before the LF is left as-is (no
  * double CR).  Only C-library printf flows through _write: the shell's own
  * cli_print emits CRLF through the transport write() path and is unaffected.
+ * Note printf bypasses the per-instance TX mutex (it must be callable pre-kernel
+ * and from any thread), so a printf and a cross-thread cli_print to the *same*
+ * instance are not line-atomic with each other; the TX ring itself stays intact
+ * (PRIMASK-guarded dual producer).
  */
 int _write(int file, char *ptr, int len)
 {
-	struct cli_uart *u = g_uart_console;
+	struct cli_uart *u = uart_ctx_from_instance(cli_current_instance());
 	(void)file;
 
 	if (len <= 0)
 		return len;
+
+	if (u == NULL)
+		u = g_uart_console;   /* ISR / pre-kernel / non-shell thread / non-UART */
 
 	if (u != NULL && u->enabled) {
 		const uint8_t *d = (const uint8_t *)ptr;

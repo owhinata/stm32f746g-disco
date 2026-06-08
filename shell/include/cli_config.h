@@ -59,6 +59,18 @@
 #define CLI_MAX_INSTANCES 4
 #endif
 
+/* Size of the thread->instance registry that backs cli_current_instance()
+ * (#18): printf/_write resolves the owning shell instance of the running
+ * thread from this table.  In #18 only the per-instance shell threads register
+ * (one slot each), so the default tracks CLI_MAX_INSTANCES.  When background
+ * jobs land (#25), each worker thread also registers -> bump this by the
+ * concurrent bg-job budget (e.g. + CLI_MAX_BG_JOBS) or split into a separate
+ * worker table; a full table makes cli_register_thread() fail (-1) rather than
+ * silently misroute printf. */
+#ifndef CLI_THREAD_MAP_MAX
+#define CLI_THREAD_MAP_MAX CLI_MAX_INSTANCES
+#endif
+
 /* Maximum static subcommand tree nesting depth.
  * Over limit: show an error and do not execute the command (impl. #3). */
 #ifndef CLI_MAX_SUBCMD_DEPTH

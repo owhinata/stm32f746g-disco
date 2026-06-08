@@ -59,8 +59,10 @@ CLI_CMD_REGISTER(coremark, NULL, "run the EEMBC CoreMark benchmark (~12s)",
 - **計時**: `HAL_GetTick()`（1 ms）。ThreadX 下でも SysTick が `HAL_IncTick` と
   `_tx_timer_interrupt` の両方を駆動する（[ThreadX 統合](threadx.md)）ため正確。
 - **出力**: CoreMark の `ee_printf` → `printf` → UART backend の strong `_write` → IRQ TX ring。
-  shell の `cli_print` と同じ USART1 へ出るが、単一スレッドの前景実行なので並行出力は起きない。
-  計測区間（`start_time()`〜`stop_time()`）内には出力が無いので、TX の背圧はスコアに影響しない。
+  `_write` は呼び出しスレッドの所有 shell インスタンスを解決する（#18、[UART backend](shell-backend-uart.md)）。
+  ベンチマークは shell スレッドで同期実行されるため、レポートは `coremark` を起動した端末に追従する
+  （coremark 側の変更は不要）。単一スレッドの前景実行なので並行出力は起きず、計測区間
+  （`start_time()`〜`stop_time()`）内には出力が無いので TX の背圧はスコアに影響しない。
 
 !!! note "改行 (LF→CRLF)"
     CoreMark のレポートは仕様どおり `\n` 改行だが、UART backend の `_write` が printf 出力中の

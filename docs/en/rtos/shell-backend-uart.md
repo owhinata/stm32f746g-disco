@@ -73,15 +73,48 @@ section nests safely inside ThreadX's `TX_DISABLE/RESTORE`.
 `src/bsp.c`'s `_write` (blocking polling) is made **weak**, and this backend
 supplies a **strong** `_write` that overrides it (only in builds linking the shell).
 
-- Console enabled (`g_uart_console && enabled`): route printf through the **same TX
-  ring** as the shell (bounded spin when full; the TX ISR drains in the
-  background), giving USART1 a single TX owner.
+- Console enabled: route printf through the **same TX ring** as the shell
+  (bounded spin when full; the TX ISR drains in the background), giving each USART
+  a single TX owner.
 - Before enable (early boot logs, `g_uart_console==NULL` / `!enabled`): poll
   `huart1` with `HAL_UART_Transmit`. No IT TX is armed yet, so there is no clash.
 - **LF→CRLF**: once enabled, `_write` translates a bare `\n` in printf output to
   `\r\n` (no double CR if a `\r` already precedes it), so the `coremark` report's
   `\n`-terminated lines render cleanly without a terminal-side map (`--imap lfcrlf`).
   The shell's `cli_print` goes through `write()`, not `_write`, so it is unaffected.
+
+### Routing printf to the calling terminal (#18)
+
+`_write` resolves the **shell instance that owns the running thread** via
+`cli_current_instance()` (the thread→instance registry in
+`shell/core/cli_core.c`) and writes to that instance's UART TX ring. This makes
+printf output — notably the `coremark` report (`ee_printf` == `printf`, which
+runs synchronously in the calling shell thread) — **follow the terminal you are
+typing on**. When there is no owning instance — in an **ISR** (detected via
+IPSR≠0), **before the scheduler starts** (the boot banner), from a **non-shell
+thread**, or for a **non-UART transport** — it returns `NULL` and `_write` falls
+back to `g_uart_console` (the last backend to init), exactly as before. The
+registry is populated by `cli_start()` **before** it creates the thread (so an
+auto-started thread is never seen unregistered) and cleared on every
+`cli_thread_entry` exit. Its size is `CLI_THREAD_MAP_MAX` (default =
+`CLI_MAX_INSTANCES`).
+
+!!! note "Single USART1 today"
+    The backend's `uart_enable`/`USART1_IRQHandler`/HAL callbacks are still tied
+    to `g_uart_console`, so the TxComplete ISR cannot advance another instance's
+    ring — **no second UART instance is wired up yet** (adding one requires
+    per-instance IRQ/callback dispatch and a duplicate-`huart` bind guard). This
+    routing mechanism and the `_write` retarget are the groundwork for future
+    multi-UART and background jobs (#25); on the single USART1 the behaviour is
+    byte-for-byte unchanged.
+
+!!! warning "printf line atomicity"
+    `_write` does **not** take the per-instance TX mutex (`tx_lock`) — it must be
+    callable from an ISR, before the kernel starts, and from any thread. So a
+    printf and a cross-thread `cli_print` to the **same** instance may interleave
+    at sub-line granularity (the TX ring itself stays intact under PRIMASK). This
+    does not occur for `coremark` (printf and shell are the same thread, serial)
+    or on a single instance.
 
 ## Known limitation
 
