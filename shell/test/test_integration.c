@@ -37,6 +37,13 @@
 
 static int ran;
 
+/* issue #16 cooperative-cancel test commands.  inject_at lets h_loop drop a 0x03
+ * into its own RX mid-run, modelling a Ctrl+C arriving while the handler runs
+ * (single-threaded host: the byte must enter the ring DURING the handler). */
+static int inject_at = -1;
+static int hook_fired;        /* one-shot guard for inject_ctrl_c_hook (below) */
+static unsigned sleep_ticks = 100;   /* delay h_sleep passes to cli_sleep() */
+
 static int h_ok(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc; (void)argv;
@@ -58,6 +65,47 @@ CLI_CMD_REGISTER(echo2, NULL,      "echo arg",     h_args, 1, 1);
 CLI_CMD_REGISTER(thing, sub_thing, "parent only",  NULL,   1, 0);
 CLI_CMD_REGISTER(need2, NULL,      "needs 2 args", h_args, 2, 0);
 
+/* issue #16: a compute loop that polls cli_cancel_requested(); optionally drops a
+ * 0x03 into its own RX at iteration inject_at (async-arrival model). */
+static int h_loop(struct cli_instance *sh, int argc, char **argv)
+{
+	(void)argc; (void)argv;
+	for (int i = 0; i < 1000; i++) {
+		if (i == inject_at)
+			cli_dummy_inject(sh->tr, "\x03", 1);
+		if (cli_cancel_requested(sh)) {
+			cli_print(sh, "stopped\r\n");   /* suppressed (dispatching+cancel) */
+			return 1;
+		}
+	}
+	cli_print(sh, "done\r\n");
+	return 0;
+}
+
+/* issue #16: floods output -- with a tiny TX cap and no wait hook this would
+ * TX-timeout, but a buffered 0x03 cancels it via the wait-path poll. */
+static int h_txwait(struct cli_instance *sh, int argc, char **argv)
+{
+	(void)argc; (void)argv;
+	for (int i = 0; i < 100; i++)
+		cli_print(sh, "line........................\r\n");
+	cli_print(sh, "done\r\n");
+	return 0;
+}
+
+/* issue #16: cancellable delay via cli_sleep() (host mirror in host_glue.c). */
+static int h_sleep(struct cli_instance *sh, int argc, char **argv)
+{
+	(void)argc; (void)argv;
+	int r = cli_sleep(sh, sleep_ticks);
+	cli_print(sh, r ? "cancelled\r\n" : "elapsed\r\n");
+	return r ? 1 : 0;
+}
+
+CLI_CMD_REGISTER(loopc,   NULL, "cancel loop test",  h_loop,   1, 0);
+CLI_CMD_REGISTER(txwaitc, NULL, "cancel tx test",    h_txwait, 1, 0);
+CLI_CMD_REGISTER(sleepc,  NULL, "cancel sleep test", h_sleep,  1, 0);
+
 /* ---- harness ----------------------------------------------------------- */
 
 CLI_BACKEND_DUMMY_DEFINE(tr0);
@@ -77,6 +125,10 @@ static void reset(struct cli_instance *s, struct cli_transport *t)
 	cli_dummy_set_tx_fail(t, 0);
 	cli_dummy_set_tx_cap(t, 0);          /* unlimited */
 	cli_test_set_tx_wait_hook(NULL, NULL);
+	cli_test_set_sleep_hook(NULL, NULL);
+	inject_at = -1;
+	hook_fired = 0;
+	sleep_ticks = 100;
 	ran = 0;
 }
 
@@ -270,6 +322,112 @@ static void test_ctrl_c(void)
 	assert(n >= 2 && strcmp(o + n - 2, "> ") == 0);   /* fresh prompt */
 }
 
+/* ---- issue #16: cooperative command cancellation ----------------------- */
+
+/* Inject a Ctrl+C when the send blocks / the sleep waits (async-arrival model).
+ * One-shot: it models a SINGLE keypress.  Without this guard, a bounded-TX test
+ * keeps blocking through the post-cancel cleanup, the hook re-injects 0x03 each
+ * time, and every 0x03 redraws a prompt that blocks again -- an endless loop. */
+static void inject_ctrl_c_hook(struct cli_instance *sh, void *arg)
+{
+	(void)arg;
+	if (hook_fired)
+		return;
+	hook_fired = 1;
+	cli_dummy_inject(sh->tr, "\x03", 1);
+}
+
+/* BLOCKING1 regression: a 0x03 arriving in the SAME inject as the command line
+ * must still cancel the running handler -- proves the 1-byte RX pump leaves it in
+ * the ring for cli_cancel_poll() instead of prefetching it past the dispatch. */
+static void test_cancel_prefetch(void)
+{
+	reset(&sh0, &tr0);
+	run_line(&sh0, "loopc\r\x03");
+	assert(has(&tr0, "^C"));
+	assert(!has(&tr0, "done"));            /* loop did not finish */
+	assert(!has(&tr0, "stopped"));         /* post-cancel print is suppressed */
+	assert(sh0.last_result == CLI_DISPATCH_CANCELLED);
+}
+
+/* Compute-loop poll: a Ctrl+C arriving mid-run cancels at the next poll. */
+static void test_cancel_compute_loop(void)
+{
+	reset(&sh0, &tr0);
+	inject_at = 5;                         /* h_loop drops a 0x03 at iteration 5 */
+	run_line(&sh0, "loopc\r");
+	assert(has(&tr0, "^C"));
+	assert(!has(&tr0, "done"));
+	assert(sh0.last_result == CLI_DISPATCH_CANCELLED);
+}
+
+/* TX-blocked early-exit via a 0x03 already buffered before the wait (BLOCKING3):
+ * the wait-path poll must see the ring byte and abort before the TX timeout.
+ * (The bounded TX is exhausted, so the post-cancel "^C" cannot be captured here;
+ * last_result == CANCELLED is the definitive signal that the cancel path ran.) */
+static void test_cancel_tx_buffered(void)
+{
+	reset(&sh0, &tr0);
+	cli_dummy_set_tx_cap(&tr0, 16);        /* room for echo + "\r\n", then blocks */
+	run_line(&sh0, "txwaitc\r\x03");
+	assert(sh0.last_result == CLI_DISPATCH_CANCELLED);
+	assert(!has(&tr0, "done"));            /* flood did not complete */
+}
+
+/* TX-blocked early-exit via an async 0x03 delivered on the TX-wait wake. */
+static void test_cancel_tx_async(void)
+{
+	reset(&sh0, &tr0);
+	cli_dummy_set_tx_cap(&tr0, 16);
+	cli_test_set_tx_wait_hook(inject_ctrl_c_hook, NULL);
+	run_line(&sh0, "txwaitc\r");
+	assert(sh0.last_result == CLI_DISPATCH_CANCELLED);
+	assert(!has(&tr0, "done"));
+}
+
+/* cli_sleep: buffered 0x03 cancels (poll-before-wait); a plain sleep elapses; an
+ * async 0x03 delivered during the wait cancels (BLOCKING3 + CONCERN coverage). */
+static void test_cancel_sleep(void)
+{
+	reset(&sh0, &tr0);
+	run_line(&sh0, "sleepc\r\x03");        /* buffered -> cancel */
+	assert(has(&tr0, "^C"));
+	assert(sh0.last_result == CLI_DISPATCH_CANCELLED);
+
+	reset(&sh0, &tr0);
+	run_line(&sh0, "sleepc\r");            /* no 0x03 -> elapsed */
+	assert(has(&tr0, "elapsed"));
+	assert(!has(&tr0, "^C"));
+	assert(sh0.last_result == 0);
+
+	reset(&sh0, &tr0);
+	cli_test_set_sleep_hook(inject_ctrl_c_hook, NULL);
+	run_line(&sh0, "sleepc\r");            /* async -> cancel */
+	assert(has(&tr0, "^C"));
+	assert(sh0.last_result == CLI_DISPATCH_CANCELLED);
+
+	/* Contract: ticks==0 elapses at once even with a 0x03 already buffered (the
+	 * ticks==0 check precedes the cancel poll).  cli_sleep returns 0 -> "elapsed",
+	 * never "cancelled" (the leftover 0x03 is later handled as an input-line ^C). */
+	reset(&sh0, &tr0);
+	sleep_ticks = 0;
+	run_line(&sh0, "sleepc\r\x03");
+	assert(has(&tr0, "elapsed"));
+	assert(!has(&tr0, "cancelled"));
+}
+
+/* Type-ahead typed during a running command is discarded, not auto-run. */
+static void test_cancel_typeahead_discard(void)
+{
+	reset(&sh0, &tr0);
+	/* "loopc" + Ctrl+C + "hello" + Enter in one burst: the 0x03 cancels loopc;
+	 * the trailing "hello\r" must be discarded, not executed (issue #16). */
+	run_line(&sh0, "loopc\r\x03hello\r");
+	assert(has(&tr0, "^C"));
+	assert(ran == 0);                      /* hello (h_ok) never ran */
+	assert(!has(&tr0, "OK"));
+}
+
 static void test_line_overflow_bel(void)
 {
 	/* CLI_CMD_BUFFER_SIZE=16 -> at most 15 chars; further chars ring the bell. */
@@ -326,6 +484,12 @@ int main(void)
 	test_unknown_command();
 	test_arg_errors();
 	test_ctrl_c();
+	test_cancel_prefetch();
+	test_cancel_compute_loop();
+	test_cancel_tx_buffered();
+	test_cancel_tx_async();
+	test_cancel_sleep();
+	test_cancel_typeahead_discard();
 	test_line_overflow_bel();
 	test_rx_overflow_drops();
 	test_multi_instance_isolation();

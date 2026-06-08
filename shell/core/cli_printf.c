@@ -297,6 +297,14 @@ int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
 	}
 
 	for (size_t off = 0; off < len; off += 16) {
+		/* Ctrl+C between rows: stop before emitting the next 16-byte line
+		 * (issue #16).  Drop the staged tail and release the lock; the
+		 * dispatcher detects cancel_req and prints "^C". */
+		if (cli_cancel_requested(sh)) {
+			cli_unlock(sh);
+			return -1;
+		}
+
 		int n = utoa_rev(base + (unsigned long long)off, 16, 0, body);
 		emit_padded(sh, NULL, body, n, 8, 1, 0);   /* %08x offset */
 		out_str(sh, "  ");

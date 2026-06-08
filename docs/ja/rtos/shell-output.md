@@ -59,6 +59,11 @@ newlib / Zephyr の printf コードは流用しない。
 
 `tx_failed` はコマンド毎（dispatch 冒頭）にリセットされ、一度立つと当該コマンドの残出力は drop される。
 
+協調キャンセル（#16）との連携: 実行中（`dispatching`）の `cli_tx_send_blocking` は待ち集合に
+`CLI_EVT_RX` も加え、TX 律速でブロック中に `Ctrl+c`（`0x03`）が届くと wait 前後の `cli_cancel_poll`
+で検出して早期に `<0` を返す（＝大量出力コマンドが即座に止まる）。詳細は
+[コマンド登録](shell-registration.md)の「協調的キャンセル」。
+
 ## 構成パラメータ
 
 | ノブ | 既定 | 意味 |

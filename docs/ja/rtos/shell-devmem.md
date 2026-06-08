@@ -126,3 +126,5 @@ arm-none-eabi-nm build-safe/threadx.elf | grep -i devmem   # 何も出ない
       `devmem dump 0x40020000`（32-bit 専用域の dump）/ `devmem dump 0x20000000 99999`（cap 超過）。
     - `devmem peek 0x40020000 32` で GPIOA（peripheral, 32-bit）read。
     - Tab 補完: `devmem ` + Tab → `peek poke dump`。
+    - 大きめの `devmem dump` 出力中に `Ctrl+c`: 16 バイト行ごとに `cli_cancel_requested()` を覗くので
+      中断でき、`^C` でプロンプト復帰（協調キャンセル #16、[コマンド登録](shell-registration.md)）。

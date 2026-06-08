@@ -62,6 +62,10 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 	int    stalls = 0;
 
 	while (sent < len) {
+		/* Cooperative Ctrl+C fast-fail, mirroring cli_core.c (issue #16). */
+		if (sh->dispatching && sh->cancel_req)
+			return -1;
+
 		int n = tr->api->write(tr, data + sent, len - sent);
 		if (n < 0) {
 			sh->tx_failed = 1;
@@ -75,9 +79,17 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 			continue;
 		}
 
-		/* TX full: wait for space (real core suspends on CLI_EVT_TX). */
+		/* TX full: wait for space (real core suspends on CLI_EVT_TX, and on
+		 * CLI_EVT_RX while a command runs).  Mirror cli_core.c's cancel handling:
+		 * poll the ring for a buffered 0x03 before "waiting", treat the wait hook
+		 * (the host analogue of an RX/TX wake) as a chance for the test to inject
+		 * a 0x03, then poll again (issue #16). */
+		if (sh->dispatching && cli_cancel_poll(sh))
+			return -1;
 		if (g_tx_wait_fn)
 			g_tx_wait_fn(sh, g_tx_wait_arg);
+		if (sh->dispatching && cli_cancel_poll(sh))
+			return -1;
 		if (++stalls >= CLI_TEST_TX_MAX_STALLS) {
 			sh->tx_dropped += (uint32_t)(len - sent);   /* timeout drop */
 			return -1;
@@ -86,15 +98,43 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 	return 0;
 }
 
+/* ---- cancellable sleep (host analogue of cli_core.c:cli_sleep) ---------- *
+ * No ThreadX timer on the host: poll the ring for an already-buffered 0x03, then
+ * (if a sleep hook is installed) let the test inject a 0x03 to model an async
+ * Ctrl+C arriving during the wait, then poll again.  Returns 1 if cancelled, 0
+ * if the "delay" elapsed -- enough to exercise both cli_cancel_poll seams. */
+static cli_test_tx_wait_fn g_sleep_fn;
+static void               *g_sleep_arg;
+
+void cli_test_set_sleep_hook(cli_test_tx_wait_fn fn, void *arg)
+{
+	g_sleep_fn  = fn;
+	g_sleep_arg = arg;
+}
+
+int cli_sleep(struct cli_instance *sh, unsigned ticks)
+{
+	if (ticks == 0)                    /* contract: ticks==0 elapses at once */
+		return 0;
+	if (cli_cancel_poll(sh))            /* a 0x03 already buffered in the ring */
+		return 1;
+	if (g_sleep_fn)                     /* test may inject a 0x03 (async wake) */
+		g_sleep_fn(sh, g_sleep_arg);
+	if (cli_cancel_poll(sh))
+		return 1;
+	return 0;                           /* delay elapsed */
+}
+
 /* ---- RX pump (mirrors cli_core.c's thread loop) ------------------------- */
 
 void cli_test_pump(struct cli_instance *sh)
 {
 	struct cli_transport *tr = sh->tr;
-	uint8_t buf[CLI_RX_DRAIN_CHUNK];
-	int n;
+	uint8_t b;
 
-	while ((n = tr->api->read(tr, buf, sizeof buf)) > 0)
-		for (int i = 0; i < n; i++)
-			cli_input_byte(sh, buf[i]);
+	/* One byte at a time, mirroring cli_core.c: a '\r' dispatches synchronously,
+	 * so bulk-reading would hide following type-ahead (e.g. Ctrl+C) from
+	 * cli_cancel_poll() during the handler (issue #16). */
+	while (tr->api->read(tr, &b, 1) > 0)
+		cli_input_byte(sh, b);
 }

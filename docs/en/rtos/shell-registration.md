@@ -96,6 +96,47 @@ The handler type is `int (*)(struct cli_instance *sh, int argc, char **argv)`;
 If argc/argv validation (mandatory/optional) fails the handler is not called
 (the validation itself is implemented in the parser).
 
+## Cooperative cancellation (Ctrl+C, #16)
+
+One instance = one thread runs the handler **synchronously**, so while a command
+runs that thread does not drain RX. To let `Ctrl+c` (`0x03`) interrupt a running
+command the handler must **provide its own check-in points** (cooperative cancel):
+the core never force-kills the handler thread (forced interruption is out of the
+standard scope per req §9, to avoid corrupting a mutex / driver state).
+
+Public API (`cli.h`):
+
+- `bool cli_cancel_requested(struct cli_instance *sh)` — `true` once `Ctrl+c` was
+  pressed during this command (sticky). Poll it at loop / unit boundaries in long
+  or large-output commands and return promptly (non-zero) when it is true. It
+  drains RX to look for `0x03`, so it is **thread-context only** (never from an ISR).
+- `int cli_sleep(struct cli_instance *sh, unsigned ticks)` — a cancellable delay
+  (**ThreadX ticks**, not ms). Returns 0 when the delay elapsed, non-zero on
+  `Ctrl+c` / stop. Unlike `tx_thread_sleep` it waits on the event flags, so an RX
+  byte can wake it. The building block for `watch` / `sleep` (#21).
+
+```c
+static int cmd_long(struct cli_instance *sh, int argc, char **argv)
+{
+    for (int i = 0; i < n; i++) {
+        if (cli_cancel_requested(sh))   /* check at each unit / row boundary */
+            return 1;                   /* core prints ^C and restores the prompt */
+        /* ... one unit of work / output ... */
+    }
+    return 0;
+}
+```
+
+Mechanism: the wake source is unified on the existing `CLI_EVT_RX`, and the `0x03`
+is found by the core (thread context) draining the rx_ring -- the backend stays a
+dumb byte pipe and no new event flag is added. If large output blocks on TX flow
+control, `cli_tx_send_blocking` wakes on RX and bails out early. Type-ahead typed
+during the command is discarded; on cancel the core prints `^C`, returns to the
+prompt, and sets `last_result` to `CLI_DISPATCH_CANCELLED`. Among the standard
+commands `thread` and `devmem dump` honour it; `coremark` is a single blocking
+call (read-only submodule, output via `printf`) with no check-in point and **cannot**
+be cancelled.
+
 ## Iteration
 
 ```c

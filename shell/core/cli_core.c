@@ -52,12 +52,16 @@ static void cli_thread_entry(ULONG arg)
 		if (flags & CLI_EVT_KILL)
 			break;                  /* full stop/uninit lifecycle is future (§14) */
 
-		uint8_t buf[CLI_RX_DRAIN_CHUNK];
-		int n;
-		while ((n = tr->api->read(tr, buf, sizeof buf)) > 0) {
-			for (int i = 0; i < n; i++)
-				cli_input_byte(sh, buf[i]);
-		}
+		/* Read ONE byte at a time and feed it immediately.  A command line ends
+		 * with '\r', which dispatches the handler synchronously from inside
+		 * cli_input_byte(); bulk-reading the ring first would pull any following
+		 * type-ahead (e.g. a Ctrl+C) out of the ring into a local buffer, hiding
+		 * it from cli_cancel_poll() while the handler runs (issue #16).  Feeding
+		 * one byte at a time keeps every not-yet-consumed byte in the ring, so a
+		 * running command can still see a 0x03 that arrived right after its line. */
+		uint8_t b;
+		while (tr->api->read(tr, &b, 1) > 0)
+			cli_input_byte(sh, b);
 	}
 
 	if (tr->api->uninit)
@@ -204,6 +208,13 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 	size_t sent = 0;
 
 	while (sent < len) {
+		/* Cooperative Ctrl+C (issue #16): once cancel is latched, stop emitting
+		 * at once so a handler that keeps printing finishes fast.  Gated by
+		 * dispatching so the post-cancel "^C"/prompt cleanup (dispatching == 0)
+		 * is never suppressed. */
+		if (sh->dispatching && sh->cancel_req)
+			return -1;
+
 		int n = tr->api->write(tr, data + sent, len - sent);
 		if (n < 0) {
 			sh->tx_failed = 1;
@@ -216,11 +227,20 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 			continue;
 		}
 
-		/* TX full: wait for space (or a kill request). */
+		/* TX full: wait for space (or a kill request).  While a command runs we
+		 * also wake on RX so a Ctrl+C arriving mid-output aborts the blocked
+		 * send.  The main loop's TX_OR_CLEAR may already have consumed the RX
+		 * flag for a 0x03 still sitting in the ring, so poll the ring BEFORE
+		 * waiting (issue #16 invariant 2). */
 		ULONG flags;
-		if (tx_event_flags_get(&sh->events, CLI_EVT_TX | CLI_EVT_KILL,
-		                       TX_OR_CLEAR, &flags, cli_wait(CLI_TX_TIMEOUT))
-		    != TX_SUCCESS) {
+		ULONG mask = CLI_EVT_TX | CLI_EVT_KILL |
+		             (sh->dispatching ? CLI_EVT_RX : 0u);
+
+		if (sh->dispatching && cli_cancel_poll(sh))
+			return -1;
+
+		if (tx_event_flags_get(&sh->events, mask, TX_OR_CLEAR, &flags,
+		                       cli_wait(CLI_TX_TIMEOUT)) != TX_SUCCESS) {
 			sh->tx_dropped += (uint32_t)(len - sent);   /* timeout */
 			return -1;
 		}
@@ -229,7 +249,50 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 			sh->tx_dropped += (uint32_t)(len - sent);
 			return -1;
 		}
-		/* else CLI_EVT_TX: space freed, retry write */
+		if ((flags & CLI_EVT_RX) && cli_cancel_poll(sh))
+			return -1;
+		/* else CLI_EVT_TX (space freed) or a non-cancel RX byte: retry write */
 	}
 	return 0;
+}
+
+/*
+ * Cancellable delay (issue #16): wait up to @p ticks ThreadX ticks, returning
+ * early (non-zero) if Ctrl+C is seen or a stop is requested; 0 when the full
+ * delay elapsed.  Unlike tx_thread_sleep() the wait is on the instance event
+ * flags, so an RX byte (the ISR sets CLI_EVT_RX) wakes it and we drain the ring
+ * for a 0x03.  Deadline-based with a wrap-safe elapsed so a non-cancel RX wake
+ * neither shortens nor extends the delay.  Building block for watch/sleep (#21).
+ */
+int cli_sleep(struct cli_instance *sh, unsigned ticks)
+{
+	if (ticks == 0)
+		return 0;                           /* contract: ticks==0 elapses at once */
+
+	ULONG start = tx_time_get();
+
+	for (;;) {
+		ULONG elapsed, remaining, flags;
+		UINT  st;
+
+		if (cli_cancel_poll(sh))            /* a 0x03 already buffered in the ring */
+			return 1;
+
+		elapsed = (ULONG)(tx_time_get() - start);   /* wrap-safe */
+		if (elapsed >= (ULONG)ticks)
+			return 0;                       /* full delay elapsed */
+		remaining = (ULONG)ticks - elapsed;
+
+		st = tx_event_flags_get(&sh->events, CLI_EVT_RX | CLI_EVT_KILL,
+		                        TX_OR_CLEAR, &flags, remaining);
+		if (st != TX_SUCCESS)
+			return 0;                       /* TX_NO_EVENTS (timed out) == elapsed */
+		if (flags & CLI_EVT_KILL) {
+			tx_event_flags_set(&sh->events, CLI_EVT_KILL, TX_OR); /* re-post */
+			return 1;
+		}
+		if ((flags & CLI_EVT_RX) && cli_cancel_poll(sh))
+			return 1;
+		/* non-cancel RX: type-ahead drained, loop and re-wait the remainder */
+	}
 }

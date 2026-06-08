@@ -68,6 +68,13 @@ CLI_CMD_REGISTER(coremark, NULL, "run the EEMBC CoreMark benchmark (~12s)",
     `picocom --imap lfcrlf` のような端末側変換が無くても段つきにならない。shell の `cli_print` は
     元々 `\r\n` 出力で `_write` を通らないため影響しない。
 
+## キャンセル不可（#16）
+
+`coremark` は実行中に `Ctrl+c` で**中断できない**。`coremark_main()` は read-only submodule への
+単一ブロッキング呼び出しで応答ポイントが無く、出力も shell の `cli_tx_send_blocking` ではなく
+`printf`/`_write` 経由のため、協調キャンセル（`cli_cancel_requested` / TX 律速の RX 起床）が効かない。
+実行前メッセージにも `not interruptible` と明示する。Ctrl+c は次のプロンプト用に queue されるだけ。
+
 ## ライセンス
 
 `lib/coremark`（EEMBC、Apache-2.0）と `port/coremark`（barebones port 由来）はそのまま流用。

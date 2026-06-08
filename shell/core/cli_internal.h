@@ -80,6 +80,20 @@ enum cli_parse_status cli_parse(char *line, char **argv, int argv_cap,
 /** last_result value stored for any non-OK dispatch outcome (req §9: non-zero). */
 #define CLI_DISPATCH_ERR (-1)
 
+/** last_result when a running command was cancelled by Ctrl+C (issue #16). */
+#define CLI_DISPATCH_CANCELLED (-2)
+
+/*
+ * Cooperative-cancel detection (issue #16, cli_session.c, ThreadX-free): drain
+ * the transport's RX looking for 0x03 (Ctrl+C).  On a 0x03 it latches
+ * sh->cancel_req and returns non-zero (sticky for the rest of the command);
+ * non-0x03 bytes are discarded (type-ahead during a running command is dropped).
+ * Called by cli_cancel_requested() and -- before each blocking wait -- by
+ * cli_tx_send_blocking() / cli_sleep() (cli_core.c) so a 0x03 already buffered in
+ * the ring (its CLI_EVT_RX flag possibly already consumed) is still seen.
+ */
+int cli_cancel_poll(struct cli_instance *sh);
+
 /** Feed one received byte through the ASCII filter + RX/edit state machine (cli_edit.c). */
 void cli_input_byte(struct cli_instance *sh, uint8_t b);
 

@@ -41,4 +41,11 @@ typedef void (*cli_test_tx_wait_fn)(struct cli_instance *sh, void *arg);
 /** Install (or clear, with NULL) the TX-wait hook.  Reset it between tests. */
 void cli_test_set_tx_wait_hook(cli_test_tx_wait_fn fn, void *arg);
 
+/**
+ * Sleep hook (issue #16).  The host cli_sleep() calls it once between its two
+ * cancel polls, so a test can inject a 0x03 to model a Ctrl+C arriving during
+ * the delay (a NULL hook means the delay simply elapses).  Reset between tests.
+ */
+void cli_test_set_sleep_hook(cli_test_tx_wait_fn fn, void *arg);
+
 #endif /* HOST_GLUE_H */

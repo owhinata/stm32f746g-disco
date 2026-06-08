@@ -145,3 +145,6 @@ arm-none-eabi-nm build-safe/threadx.elf | grep -i devmem   # prints nothing
       (dump on a 32-bit-only region), `devmem dump 0x20000000 99999` (over cap).
     - `devmem peek 0x40020000 32` reads GPIOA (peripheral, 32-bit).
     - Tab completion: `devmem ` + Tab → `peek poke dump`.
+    - `Ctrl+c` during a large `devmem dump`: it polls `cli_cancel_requested()` per 16-byte
+      row, so the dump stops and returns to the prompt with `^C` (cooperative cancel #16,
+      see [command registration](shell-registration.md)).

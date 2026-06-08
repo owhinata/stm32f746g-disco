@@ -76,6 +76,15 @@ CLI_CMD_REGISTER(coremark, NULL, "run the EEMBC CoreMark benchmark (~12s)",
     `cli_print` already emits `\r\n` and does not go through `_write`, so it is
     unaffected.
 
+## Not cancellable (#16)
+
+`coremark` **cannot** be interrupted with `Ctrl+c` while running. `coremark_main()`
+is a single blocking call into the read-only submodule with no check-in point, and
+it prints via `printf`/`_write` rather than the shell's `cli_tx_send_blocking`, so
+neither the cooperative `cli_cancel_requested()` check nor the TX-blocked RX wake
+applies. The run banner says `not interruptible`; a `Ctrl+c` just queues for the
+next prompt.
+
 ## License
 
 `lib/coremark` (EEMBC, Apache-2.0) and `port/coremark` (derived from the barebones

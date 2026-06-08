@@ -41,6 +41,13 @@ extern "C" {
 #define CLI_EVT_TX    0x2u   /**< reserved for #5 flow control; unused in #4 */
 #define CLI_EVT_KILL  0x4u   /**< request the thread to stop (full stop is future) */
 
+/* Cooperative Ctrl+C cancel (issue #16) deliberately adds NO new event-flag bit:
+ * the wake source for an in-flight command is the existing CLI_EVT_RX (the ISR
+ * already sets it on every received byte).  The cancel STATE lives in
+ * struct cli_instance::cancel_req; the 0x03 is detected in thread context by
+ * draining the rx_ring (cli_cancel_poll), which keeps the backend a dumb byte
+ * pipe (no 0x03 semantics in the ISR/backend). */
+
 /* RX byte state machine (cli_edit.c, issue #9).  ESC begins an escape sequence;
  * '[' enters CSI (parameter-accumulating: arrows / Home / End / Del / Insert /
  * the CPR width report), 'O' enters SS3 (application-mode arrows), and a bare
@@ -148,6 +155,11 @@ struct cli_instance {
 	char     out_buf[CLI_PRINTF_BUFFER_SIZE]; /**< staging buffer; flushed when full */
 	uint16_t out_len;
 	uint8_t  tx_failed;              /**< output dropped this command (TX timeout); reset each dispatch */
+	uint8_t  dispatching;            /**< 1 while a command handler runs (issue #16): gates the
+	                                  *   cooperative Ctrl+C cancel paths (TX-blocked RX wake, fast-fail)
+	                                  *   so the post-cancel ^C/prompt cleanup is never suppressed */
+	volatile uint8_t cancel_req;     /**< sticky: a 0x03 (Ctrl+C) was seen during the running command
+	                                  *   (issue #16); set by cli_cancel_poll, cleared each dispatch */
 
 	enum cli_state state;
 	int            last_result;      /**< return value of the most recent command */

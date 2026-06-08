@@ -137,3 +137,5 @@ head+count を `TX_DISABLE`/`TX_RESTORE` で短くスナップショットして
   - `thread` を 2 回叩く: 初回の cpu% は `--`、2 回目は差分窓で現実的な値。アイドル時は `(idle)` が支配的
     （~99%）、スレッド cpu% は小さく、cpu% 列の合計（スレッド＋`(idle)`＋`(isr)`）は ~100%。
   - Tab 補完で `thr` → `thread`。`thread x` は usage/arg エラー。
+  - 出力中に `Ctrl+c`: 行ごとに `cli_cancel_requested()` を覗くので中断でき、`^C` を表示してプロンプト
+    復帰（協調キャンセル #16、[コマンド登録](shell-registration.md)）。

@@ -27,6 +27,28 @@ void cli_prompt(struct cli_instance *sh)
 	cli_write(sh, sh->prompt, strlen(sh->prompt));
 }
 
+int cli_cancel_poll(struct cli_instance *sh)
+{
+	struct cli_transport *tr = sh->tr;
+	uint8_t buf[CLI_RX_DRAIN_CHUNK];
+	int n;
+
+	/* Drain everything currently buffered; a 0x03 anywhere latches the cancel.
+	 * Non-0x03 bytes are discarded -- type-ahead typed during a running command
+	 * is dropped by design (issue #16). */
+	while ((n = tr->api->read(tr, buf, sizeof buf)) > 0)
+		for (int i = 0; i < n; i++)
+			if (buf[i] == 0x03)
+				sh->cancel_req = 1;
+
+	return sh->cancel_req;
+}
+
+bool cli_cancel_requested(struct cli_instance *sh)
+{
+	return cli_cancel_poll(sh) != 0;
+}
+
 void cli_dispatch_line(struct cli_instance *sh)
 {
 	sh->tx_failed = 0;                  /* fresh flow-control state per command */
@@ -43,8 +65,13 @@ void cli_dispatch_line(struct cli_instance *sh)
 
 	switch (st) {
 	case CLI_PARSE_OK: {
-		/* Pass the handler-relative argv/argc (argv[0] = leaf name). */
+		/* Pass the handler-relative argv/argc (argv[0] = leaf name).  Mark the
+		 * window in which a Ctrl+C cancels the command (issue #16): cancel_req is
+		 * cleared first, dispatching gates the cooperative-cancel paths. */
+		sh->cancel_req  = 0;
+		sh->dispatching = 1;
 		int ret = sh->pr.cmd->handler(sh, sh->pr.argc, sh->pr.argv);
+		sh->dispatching = 0;
 		/* Force a non-zero result when output was dropped (TX timeout),
 		 * even if the handler ignored cli_print's return value (req §11). */
 		sh->last_result = (ret == 0 && sh->tx_failed) ? CLI_DISPATCH_ERR : ret;
@@ -79,6 +106,23 @@ void cli_dispatch_line(struct cli_instance *sh)
 	default:
 		sh->last_result = CLI_DISPATCH_ERR;
 		break;
+	}
+
+	/* Cooperative Ctrl+C (issue #16): if the command observed a cancel, echo the
+	 * editor-style "^C" feedback.  Clear cancel_req + tx_failed + the staging
+	 * buffer FIRST (mirrors cli_edit.c's 0x03 path) so the feedback is not eaten
+	 * by the cancel fast-fail or the tx_failed output-drop; drop any residual RX
+	 * with a raw drain (NOT cli_cancel_poll, which would re-latch on the 0x03) so
+	 * queued type-ahead does not auto-run. */
+	if (sh->cancel_req) {
+		uint8_t b;
+		sh->cancel_req = 0;
+		sh->tx_failed  = 0;
+		sh->out_len    = 0;
+		while (sh->tr->api->read(sh->tr, &b, 1) > 0)
+			;                          /* discard residual RX */
+		cli_write(sh, "^C\r\n", 4);
+		sh->last_result = CLI_DISPATCH_CANCELLED;
 	}
 
 	/* Always return to the prompt; a bad command or a non-zero handler return

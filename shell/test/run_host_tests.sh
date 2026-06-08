@@ -70,9 +70,12 @@ gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
 # control lives in cli_core.c), so it builds against the shim and routes staged
 # output through the shared dummy backend + glue.  Colour ON (default) and the
 # real 32 B CLI_PRINTF_BUFFER_SIZE so the SGR escapes and autoflush are exercised.
+# cli_session.c is linked for the ThreadX-free cancel helpers (cli_cancel_poll /
+# cli_cancel_requested, issue #16) that cli_hexdump_base + host_glue.c call; its
+# unused dispatch/prompt code is dropped by --gc-sections.
 gcc $CFLAGS \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
-    "$here/test_output.c" "$core/cli_printf.c" \
+    "$here/test_output.c" "$core/cli_printf.c" "$core/cli_session.c" \
     $glue \
     $LDFLAGS -o "$out/test_output"
 "$out/test_output"

@@ -37,13 +37,21 @@ edit updates `(line, len, cur)` and then redraws. The same struct also holds
 | `Ctrl+w` | delete the previous word (whitespace boundary) |
 | `Ctrl+l` | clear screen + redraw prompt/line |
 | `Insert` (`ESC[2~`) | toggle insert / overwrite |
-| `Ctrl+c` | cancel the input line (recovers from a half-read escape too, §9) |
+| `Ctrl+c` | cancel the input line (recovers from a half-read escape too, §9); cancelling a *running* command is cooperative, see below (#16) |
 | `Enter` (`\r` / `\n`) | dispatch the line (`\r\n` once) |
 | `↑` / `↓`, `Ctrl+p` / `Ctrl+n` | recall older / newer history entry (#10 fixed ring) |
 
 `Tab` (`0x09`) is ignored in #9 (completion is #11). Non-ASCII (`0x80–0xFF`) and
 unsupported / malformed escapes are ignored, returning to the normal state
 (req §13).
+
+Cancelling a running command (#16): a long-running / large-output command can also
+be interrupted with `Ctrl+c`. This is **cooperative** -- it works while the command
+polls `cli_cancel_requested()` or waits in `cli_sleep()`; the core never force-kills
+the handler thread. On cancel it prints `^C` and returns to the prompt just like the
+input-line cancel, and type-ahead typed during the command is discarded. See
+"Cooperative cancellation" in [command registration](shell-registration.md) for how
+to write one. `coremark` is a single blocking call and **cannot** be interrupted.
 
 ## Escape state machine
 

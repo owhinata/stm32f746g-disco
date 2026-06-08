@@ -72,6 +72,41 @@ root コマンドとサブコマンドは同一型。
 
 ハンドラ型は `int (*)(struct cli_instance *sh, int argc, char **argv)`。`argv[0]` はコマンド名。戻り値 0 が成功、非 0 がエラー。argc/argv 検証（mandatory/optional）に失敗するとハンドラは呼ばれない（検証本体はパーサ側で実装）。
 
+## 協調的キャンセル（Ctrl+C、#16）
+
+1 インスタンス = 1 スレッドでハンドラを**同期実行**するため、走行中はそのスレッドが RX を drain
+しない。`Ctrl+c`（`0x03`）で実行中コマンドを止めるには、ハンドラが**自分で応答ポイントを持つ**
+（協調的キャンセル）。コアはハンドラスレッドを強制終了しない（mutex/ドライバ状態の破壊を避けるため、
+要件 §9 で強制中断は標準スコープ外）。
+
+公開 API（`cli.h`）:
+
+- `bool cli_cancel_requested(struct cli_instance *sh)` — 実行中に `Ctrl+c` が押されたら `true`
+  （sticky）。長ループ / 大量出力の境界で定期的に覗き、`true` なら速やかに非 0 で戻る。内部で RX を
+  drain して `0x03` を探すので**スレッド文脈専用**（ISR から呼ばない）。
+- `int cli_sleep(struct cli_instance *sh, unsigned ticks)` — キャンセル可能な遅延（**ThreadX tick**
+  単位、ms ではない）。遅延満了で 0、`Ctrl+c` / 停止要求で非 0。`tx_thread_sleep` と違いイベントフラグ
+  待ちなので RX で起床できる。`watch` / `sleep`（#21）の土台。
+
+```c
+static int cmd_long(struct cli_instance *sh, int argc, char **argv)
+{
+    for (int i = 0; i < n; i++) {
+        if (cli_cancel_requested(sh))   /* 行 / 単位の境界で覗く */
+            return 1;                   /* コアが ^C を表示しプロンプト復帰 */
+        /* … 1 単位の処理 / 出力 … */
+    }
+    return 0;
+}
+```
+
+メカニズム: 検出は既存の `CLI_EVT_RX` を wake 源に統一し、`0x03` はコア（スレッド文脈）で rx_ring を
+drain して見つける（backend は dumb なバイトパイプのまま、新 event flag は追加しない）。大量出力が
+TX 律速でブロックした場合は `cli_tx_send_blocking` が RX 起床して早期離脱する。実行中の type-ahead は
+破棄。中断後は `^C` を表示してプロンプトへ復帰し、`last_result` は `CLI_DISPATCH_CANCELLED`。
+標準コマンドでは `thread` / `devmem dump` が対応。`coremark` は単一ブロッキング呼び出し（read-only
+submodule、出力も `printf` 経由）で応答ポイントが無く**キャンセル不可**。
+
 ## 走査
 
 ```c

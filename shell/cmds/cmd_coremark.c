@@ -41,7 +41,12 @@ static int cmd_coremark(struct cli_instance *sh, int argc, char **argv)
 	(void)argc;
 	(void)argv;
 
-	cli_info(sh, "Running CoreMark (auto-calibrated, ~12s)...\r\n");
+	/* Not cooperatively cancellable (issue #16): coremark_main() is a single
+	 * blocking call into the read-only EEMBC submodule with no poll point, and it
+	 * prints via ee_printf -> printf (not the shell's cli_tx_send_blocking), so
+	 * neither a cli_cancel_requested() check nor the TX-blocked RX wake applies.
+	 * Ctrl+C during the run is ignored; it just queues for the next prompt. */
+	cli_info(sh, "Running CoreMark (auto-calibrated, ~12s; not interruptible)...\r\n");
 	coremark_main();   /* prints the canonical CoreMark report via printf -> VCP */
 	return 0;
 }

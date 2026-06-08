@@ -159,3 +159,6 @@ waits on a mutex and must not run inside a critical section).
     differential window. When idle, `(idle)` dominates (~99%), thread cpu% is small, and the
     cpu% column (threads + `(idle)` + `(isr)`) sums to ~100%.
   - Tab completion: `thr` → `thread`. `thread x` is a usage/arg error.
+  - `Ctrl+c` during output: it polls `cli_cancel_requested()` per row, so the listing
+    stops and returns to the prompt with `^C` (cooperative cancel #16, see
+    [command registration](shell-registration.md)).

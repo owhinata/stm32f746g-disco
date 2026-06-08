@@ -181,6 +181,13 @@ static int cmd_thread(struct cli_instance *sh, int argc, char **argv)
 	}
 
 	for (i = 0; i < count; i++, t = t->tx_thread_created_next) {
+		/* Ctrl+C between rows: stop before emitting the next one (issue #16).
+		 * Outside the TX_DISABLE region below -- cli_cancel_requested() drains the
+		 * transport and must not run with interrupts disabled.  The dispatcher
+		 * detects cancel_req and prints "^C", so just return. */
+		if (cli_cancel_requested(sh))
+			return 0;
+
 		ULONG size  = t->tx_thread_stack_size;
 		ULONG peak  = stack_peak_used(t);
 		ULONG pct   = size ? (peak * 100u) / size : 0u;

@@ -72,6 +72,12 @@ Zephyr printf code is reused.
 `tx_failed` is reset per command (start of dispatch); once set, the rest of that
 command's output is dropped.
 
+Cooperative-cancel interaction (#16): while a command runs (`dispatching`),
+`cli_tx_send_blocking` also waits on `CLI_EVT_RX`, so a `Ctrl+c` (`0x03`) arriving
+while the send is blocked on TX flow control is caught by the `cli_cancel_poll`
+calls around the wait and returns `<0` early (a large-output command stops at
+once). See "Cooperative cancellation" in [command registration](shell-registration.md).
+
 ## Configuration
 
 | Knob | Default | Meaning |

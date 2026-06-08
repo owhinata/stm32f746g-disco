@@ -25,6 +25,7 @@
 #ifndef CLI_H
 #define CLI_H
 
+#include <stdbool.h>  /* bool (cli_cancel_requested) */
 #include <stddef.h>   /* size_t */
 #include <stdint.h>   /* uint8_t */
 
@@ -42,6 +43,10 @@ struct cli_instance;
  * vector (argv[0] is the command name).  Returns 0 on success; non-zero marks
  * an error.  argc/argv validation (mandatory/optional) runs before the handler;
  * if it fails the handler is not called.
+ *
+ * A long-running or large-output handler should poll cli_cancel_requested()
+ * (and use cli_sleep() for any delay) so Ctrl+C can interrupt it -- cancellation
+ * is cooperative; the core never force-kills the handler thread (issue #16).
  */
 typedef int (*cli_cmd_handler_t)(struct cli_instance *sh, int argc, char **argv);
 
@@ -159,6 +164,24 @@ int cli_hexdump(struct cli_instance *sh, const void *data, size_t len);
  * the devmem dump command).  cli_hexdump() is the base == 0 case. */
 int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
                      unsigned long long base);
+
+/*
+ * Cooperative cancellation (issue #16).  A running command is interrupted only
+ * if it checks in -- the core never force-kills the handler thread (req §9).
+ *
+ * cli_cancel_requested(): true once the user pressed Ctrl+C (0x03) during THIS
+ * command.  Long loops / large output should poll it and return promptly (any
+ * non-zero result); the core then prints "^C" and restores the prompt.  Sticky
+ * for the rest of the command.  Thread-context only (it drains the transport) --
+ * never call it from an ISR.
+ *
+ * cli_sleep(): a cancellable delay of @p ticks ThreadX ticks (NOT milliseconds).
+ * Returns 0 when the full delay elapsed, non-zero if it was cancelled (Ctrl+C)
+ * or the instance is stopping; a handler should propagate the non-zero result.
+ * ticks == 0 returns 0 immediately.  Building block for watch/sleep (#21).
+ */
+bool cli_cancel_requested(struct cli_instance *sh);
+int  cli_sleep(struct cli_instance *sh, unsigned ticks);
 
 /** Iterate every registered root command in .shell_root_cmds order. */
 #define CLI_ROOT_CMD_FOREACH(it) \
