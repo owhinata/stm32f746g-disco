@@ -24,7 +24,10 @@ shell and the **only firmware**; CoreMark is not a separate image but the shell'
 cmake --build build --target flash     # write over ST-Link
 ```
 
-`flash` runs `st-flash --reset write threadx.bin 0x08000000`.
+`flash` runs `st-flash --connect-under-reset --reset write threadx.bin 0x08000000`.
+`--connect-under-reset` is required since #20 (`TX_ENABLE_WFI`): the running firmware sleeps
+in WFI when idle, and the old onboard ST-Link cannot attach to a sleeping core without holding
+it in reset (#24).
 
 ## Build structure
 

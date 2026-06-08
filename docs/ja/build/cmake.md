@@ -21,7 +21,9 @@ cmake --build build            # 唯一のターゲット threadx をビルド
 cmake --build build --target flash     # ST-Link で書き込み
 ```
 
-`flash` は `st-flash --reset write threadx.bin 0x08000000` を実行。
+`flash` は `st-flash --connect-under-reset --reset write threadx.bin 0x08000000` を実行。
+`--connect-under-reset` は #20(`TX_ENABLE_WFI`) 以降必須: 走行中 firmware が idle で WFI sleep に
+入るため、旧オンボード ST-Link は reset 保持なしでは sleep 中の core に接続できない（#24）。
 
 ## 構成のポイント
 

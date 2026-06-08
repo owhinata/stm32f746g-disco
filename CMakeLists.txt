@@ -83,8 +83,13 @@ function(firmware_finalize tgt)
         COMMAND "${CMAKE_SIZE}" $<TARGET_FILE:${tgt}>
         BYPRODUCTS ${tgt}.bin ${tgt}.hex
         COMMENT "objcopy -> ${tgt}.bin / ${tgt}.hex")
+    # --connect-under-reset: hold the MCU in reset while attaching.  Required
+    # since #20 (TX_ENABLE_WFI) -- the running firmware sleeps in WFI when idle,
+    # and the old onboard ST-Link (V2J28x) cannot connect to a sleeping core
+    # without reset (st-flash otherwise fails with "Can not connect to target /
+    # unknown chip id").  Harmless for non-sleeping firmware (issue #24).
     add_custom_target(flash
-        COMMAND st-flash --reset write ${tgt}.bin 0x08000000
+        COMMAND st-flash --connect-under-reset --reset write ${tgt}.bin 0x08000000
         DEPENDS ${tgt}
         USES_TERMINAL
         COMMENT "Flashing ${tgt} over ST-Link")
