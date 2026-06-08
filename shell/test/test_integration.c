@@ -106,6 +106,29 @@ CLI_CMD_REGISTER(loopc,   NULL, "cancel loop test",  h_loop,   1, 0);
 CLI_CMD_REGISTER(txwaitc, NULL, "cancel tx test",    h_txwait, 1, 0);
 CLI_CMD_REGISTER(sleepc,  NULL, "cancel sleep test", h_sleep,  1, 0);
 
+/* issue #21: exercises the `watch` re-dispatch recipe -- parse redisp_cmd into
+ * LOCAL scratch and call the resolved handler, never touching sh->pr/argv/line.
+ * Prints the parser-normalised root token so the test can assert quote/escape
+ * normalisation (the basis of watch's denylist). */
+static char redisp_cmd[64];
+static int h_redisp(struct cli_instance *sh, int argc, char **argv)
+{
+	char  buf[CLI_CMD_BUFFER_SIZE];
+	char *largv[CLI_ARGV_CAP];
+	struct cli_parse_result lpr;
+
+	(void)argc; (void)argv;
+	strncpy(buf, redisp_cmd, sizeof buf - 1);
+	buf[sizeof buf - 1] = '\0';
+	if (cli_parse(buf, largv, CLI_ARGV_CAP, &lpr) != CLI_PARSE_OK) {
+		cli_print(sh, "PARSEFAIL\r\n");
+		return 1;
+	}
+	cli_print(sh, "root=%s\r\n", largv[0]);   /* normalised root token */
+	return lpr.cmd->handler(sh, lpr.argc, lpr.argv);
+}
+CLI_CMD_REGISTER(redisp, NULL, "re-dispatch recipe test", h_redisp, 1, 0);
+
 /* ---- harness ----------------------------------------------------------- */
 
 CLI_BACKEND_DUMMY_DEFINE(tr0);
@@ -129,6 +152,7 @@ static void reset(struct cli_instance *s, struct cli_transport *t)
 	inject_at = -1;
 	hook_fired = 0;
 	sleep_ticks = 100;
+	redisp_cmd[0] = '\0';
 	ran = 0;
 }
 
@@ -416,6 +440,36 @@ static void test_cancel_sleep(void)
 	assert(!has(&tr0, "cancelled"));
 }
 
+/* issue #21: the watch re-dispatch recipe runs an inner command via LOCAL
+ * scratch, resolves subcommands, normalises the root token (quotes stripped),
+ * and does not corrupt the outer dispatch state. */
+static void test_redispatch_recipe(void)
+{
+	reset(&sh0, &tr0);
+	strcpy(redisp_cmd, "hello");
+	run_line(&sh0, "redisp\r");
+	assert(has(&tr0, "root=hello"));
+	assert(has(&tr0, "OK"));               /* inner hello (h_ok) ran */
+	assert(ran == 1);
+	/* outer dispatch state intact: a normal command still works afterwards */
+	run_line(&sh0, "hello\r");
+	assert(ran == 2);
+
+	/* subcommand resolves through the recipe */
+	reset(&sh0, &tr0);
+	strcpy(redisp_cmd, "thing list");
+	run_line(&sh0, "redisp\r");
+	assert(has(&tr0, "root=thing"));
+	assert(has(&tr0, "OK"));
+
+	/* quote/escape normalised by the tokenizer -> denylist-safe root token */
+	reset(&sh0, &tr0);
+	strcpy(redisp_cmd, "\"hello\"");
+	run_line(&sh0, "redisp\r");
+	assert(has(&tr0, "root=hello"));       /* quotes removed by cli_parse */
+	assert(has(&tr0, "OK"));
+}
+
 /* Type-ahead typed during a running command is discarded, not auto-run. */
 static void test_cancel_typeahead_discard(void)
 {
@@ -490,6 +544,7 @@ int main(void)
 	test_cancel_tx_async();
 	test_cancel_sleep();
 	test_cancel_typeahead_discard();
+	test_redispatch_recipe();
 	test_line_overflow_bel();
 	test_rx_overflow_drops();
 	test_multi_instance_isolation();

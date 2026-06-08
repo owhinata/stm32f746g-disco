@@ -138,6 +138,25 @@
 #define CLI_DEVMEM_DUMP_MAX_LEN 256
 #endif
 
+/* sleep / usleep / watch bounds (issue #21). */
+/* `sleep N` upper bound in seconds.  cli_sleep() is cancellable, so a long sleep
+ * is fine, but cap to keep N*1000 within a 32-bit ThreadX tick and reject typos. */
+#ifndef CLI_SLEEP_MAX_SEC
+#define CLI_SLEEP_MAX_SEC 86400u          /* 1 day */
+#endif
+/* `usleep N` upper bound in microseconds.  It busy-waits (no yield, not
+ * cancellable), so keep it small; use `sleep` for long delays. */
+#ifndef CLI_USLEEP_MAX_US
+#define CLI_USLEEP_MAX_US 10000u          /* 10 ms */
+#endif
+/* `watch` default and maximum refresh interval in seconds. */
+#ifndef CLI_WATCH_DEFAULT_SEC
+#define CLI_WATCH_DEFAULT_SEC 2u
+#endif
+#ifndef CLI_WATCH_MAX_SEC
+#define CLI_WATCH_MAX_SEC 3600u           /* 1 hour */
+#endif
+
 /*
  * The number of registered commands is bounded only by the linker section
  * capacity (effectively unlimited; the scan is linear).  Tab-completion does
@@ -165,5 +184,14 @@ _Static_assert(CLI_BACKSPACE_MODE == 0 || CLI_BACKSPACE_MODE == 1,
 _Static_assert(CLI_ENABLE_DANGEROUS_CMDS == 0 || CLI_ENABLE_DANGEROUS_CMDS == 1,
                "CLI_ENABLE_DANGEROUS_CMDS must be 0 or 1");
 _Static_assert(CLI_DEVMEM_DUMP_MAX_LEN > 0, "CLI_DEVMEM_DUMP_MAX_LEN must be > 0");
+_Static_assert(CLI_SLEEP_MAX_SEC > 0 && CLI_SLEEP_MAX_SEC <= 0xFFFFFFFFu / 1000u,
+               "CLI_SLEEP_MAX_SEC*1000 must fit a 32-bit ThreadX tick");
+/* usleep busy-wait multiplies us by 108 (TIM2 counts/us); keep it in uint32. */
+_Static_assert(CLI_USLEEP_MAX_US > 0 && CLI_USLEEP_MAX_US <= 0xFFFFFFFFu / 108u,
+               "CLI_USLEEP_MAX_US*108 must fit uint32 (TIM2 counts)");
+_Static_assert(CLI_WATCH_DEFAULT_SEC <= CLI_WATCH_MAX_SEC,
+               "CLI_WATCH_DEFAULT_SEC must be <= CLI_WATCH_MAX_SEC");
+_Static_assert(CLI_WATCH_MAX_SEC <= 0xFFFFFFFFu / 1000u,
+               "CLI_WATCH_MAX_SEC*1000 must fit a 32-bit ThreadX tick");
 
 #endif /* CLI_CONFIG_H */

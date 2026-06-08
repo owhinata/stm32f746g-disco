@@ -59,6 +59,25 @@ static void exec_timebase_init(void)
 }
 
 /**
+ * @brief  Busy-wait @p us microseconds on the free-running TIM2 counter.
+ *
+ * TIM2 runs at 108 MHz (set up in exec_timebase_init for the ThreadX execution
+ * profile, issue #19), so 108 counts == 1 us.  Unsigned 32-bit subtraction makes
+ * the wait wrap-safe as long as the delay is shorter than TIM2's wrap period
+ * (~39.77 s); the `usleep` command caps @p us far below that.  Pure busy loop --
+ * it does NOT yield, so keep delays short (issue #21).  Interrupts (SysTick,
+ * UART) still run, so the ThreadX tick and higher-priority threads are unaffected.
+ */
+void bsp_udelay(uint32_t us)
+{
+    uint32_t start = TIM2->CNT;
+    uint32_t ticks = us * 108u;            /* 108 TIM2 counts per microsecond */
+
+    while ((TIM2->CNT - start) < ticks)
+        ;
+}
+
+/**
  * @brief  System clock: 216 MHz from a 25 MHz HSE crystal (F746 max).
  *
  *   VCO in  = HSE / PLLM = 25 MHz / 25 = 1 MHz

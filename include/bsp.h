@@ -16,6 +16,13 @@ extern UART_HandleTypeDef huart1;   /* ST-Link Virtual COM Port (USART1) */
  */
 void bsp_init(void);
 
+/**
+ * Busy-wait @p us microseconds on the free-running TIM2 counter (108 MHz, set up
+ * for the ThreadX execution profile in issue #19).  Does NOT yield -- short
+ * delays only; the `usleep` command caps it (issue #21).
+ */
+void bsp_udelay(uint32_t us);
+
 void Error_Handler(void);
 
 #endif /* BSP_H */
