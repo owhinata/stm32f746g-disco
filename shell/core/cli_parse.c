@@ -111,6 +111,69 @@ static int next_token(char **rdp, char **wrp, char **tok_out)
 	return 1;
 }
 
+/*
+ * Split a line on top-level ';' (command sequencing, issue #23).
+ *
+ * Returns the next ';'-separated segment starting at *cursor, NUL-terminating it
+ * in place (the delimiting ';' is overwritten with '\0') and advancing *cursor
+ * past it.  A ';' counts as a separator only OUTSIDE quotes and not escaped, so
+ * `echo "a;b"` / `echo 'a;b'` / `echo a\;b` stay a single segment.  The quote /
+ * escape state machine below MUST stay byte-for-byte in lockstep with
+ * next_token() above -- it tracks the SAME states but, unlike the tokenizer,
+ * preserves every byte (no compaction, no quote stripping) so each returned
+ * segment can be handed to cli_parse() and re-tokenized normally.  An unbalanced
+ * quote (or trailing '\') just ends the segment at EOL; cli_parse() then reports
+ * UNTERMINATED_QUOTE on it, exactly as for a single malformed line.
+ *
+ * Contract: returns NULL once exhausted (*cursor == NULL).  A trailing ';'
+ * yields one final empty segment before exhaustion, so "a;" -> {"a",""}, "a;;b"
+ * -> {"a","","b"}, ";a" -> {"","a"}; empty/whitespace-only segments are handled
+ * by cli_parse() as CLI_PARSE_EMPTY (a no-op).
+ */
+char *cli_next_segment(char **cursor)
+{
+	char *p = *cursor;
+
+	if (p == NULL)
+		return NULL;
+
+	char *start = p;
+	char quote = 0;             /* 0 = none, otherwise '"' or '\'' */
+
+	for (; *p != '\0'; p++) {
+		char c = *p;
+
+		if (quote == 0) {
+			if (c == ';') {             /* top-level separator */
+				*p = '\0';
+				*cursor = p + 1;    /* may point at the final '\0' */
+				return start;
+			}
+			if (c == '"' || c == '\'') {
+				quote = c;
+			} else if (c == '\\') {
+				if (p[1] == '\0')
+					break;      /* trailing backslash: literal, EOL */
+				p++;                /* skip the escaped char */
+			}
+		} else if (quote == '"') {
+			if (c == '"') {
+				quote = 0;
+			} else if (c == '\\') {
+				if (p[1] == '\0')
+					break;      /* unterminated; ends at EOL */
+				p++;                /* skip the escaped char */
+			}
+		} else { /* single quote: fully literal, only '\'' closes */
+			if (c == '\'')
+				quote = 0;
+		}
+	}
+
+	*cursor = NULL;                     /* end of line: last segment */
+	return start;
+}
+
 int cli_tokenize(char *line, char **argv, int max_argc)
 {
 	char *rd = line;

@@ -49,19 +49,20 @@ bool cli_cancel_requested(struct cli_instance *sh)
 	return cli_cancel_poll(sh) != 0;
 }
 
-void cli_dispatch_line(struct cli_instance *sh)
+/*
+ * Parse and run ONE command segment (issue #23): a single ';'-separated piece of
+ * the input line.  Mirrors the original single-command body of cli_dispatch_line
+ * -- it resets the per-command flow-control flag, parses @p seg in place and
+ * dispatches the resolved handler / prints the parse outcome.  Cross-segment
+ * concerns (the line's "\r\n" echo, history, the cooperative-cancel feedback and
+ * the prompt) stay in cli_dispatch_line; this runs once per segment.
+ */
+static void cli_dispatch_one(struct cli_instance *sh, char *seg)
 {
 	sh->tx_failed = 0;                  /* fresh flow-control state per command */
-	cli_write(sh, "\r\n", 2);           /* echo the newline before any output */
-	sh->line[sh->len] = '\0';
-
-	/* Record the submitted line for history (seam for #10; no-op in #9).  Done
-	 * BEFORE cli_parse, which tokenizes sh->line in place. */
-	if (sh->len > 0)
-		cli_history_add(sh, sh->line);
 
 	enum cli_parse_status st =
-		cli_parse(sh->line, sh->argv, CLI_ARGV_CAP, &sh->pr);
+		cli_parse(seg, sh->argv, CLI_ARGV_CAP, &sh->pr);
 
 	switch (st) {
 	case CLI_PARSE_OK: {
@@ -78,7 +79,7 @@ void cli_dispatch_line(struct cli_instance *sh)
 		break;
 	}
 	case CLI_PARSE_EMPTY:
-		break;                          /* blank line: just reprompt */
+		break;                          /* blank segment: skip (req §23) */
 	case CLI_PARSE_NOT_FOUND:
 		cli_error(sh, "%s: command not found\r\n", sh->pr.argv[0]);
 		sh->last_result = CLI_DISPATCH_ERR;
@@ -106,6 +107,31 @@ void cli_dispatch_line(struct cli_instance *sh)
 	default:
 		sh->last_result = CLI_DISPATCH_ERR;
 		break;
+	}
+}
+
+void cli_dispatch_line(struct cli_instance *sh)
+{
+	sh->tx_failed = 0;                  /* clean state for the leading "\r\n" echo */
+	cli_write(sh, "\r\n", 2);           /* echo the newline before any output */
+	sh->line[sh->len] = '\0';
+
+	/* Record the submitted line for history (issue #10).  Done BEFORE the split
+	 * loop, which (via cli_next_segment + cli_parse) rewrites sh->line in place:
+	 * the WHOLE line -- ';' separators included -- is one history entry. */
+	if (sh->len > 0)
+		cli_history_add(sh, sh->line);
+
+	/* Run each ';'-separated segment in order (issue #23).  Errors do NOT stop
+	 * the sequence (bash ';' semantics: continue on failure), but a cooperative
+	 * Ctrl+C aborts the remaining segments -- the running handler latches
+	 * sh->cancel_req, which the unchanged cancel block below then reports once. */
+	char *cursor = sh->line;
+	char *seg;
+	while ((seg = cli_next_segment(&cursor)) != NULL) {
+		cli_dispatch_one(sh, seg);
+		if (sh->cancel_req)
+			break;
 	}
 
 	/* Cooperative Ctrl+C (issue #16): if the command observed a cancel, echo the

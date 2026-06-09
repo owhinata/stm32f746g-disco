@@ -74,6 +74,21 @@ static int run_tok(const char *s)
 	return cli_tokenize(buf, targv, CLI_MAX_ARGC);
 }
 
+/* Collect every ';'-separated segment of a mutable copy of @p s into @p segv
+ * (issue #23).  Returns the segment count; segments are NUL-terminated in place
+ * and kept verbatim (only the ';' delimiters are overwritten). */
+static char seg_buf[CLI_CMD_BUFFER_SIZE];
+static int split_all(const char *s, char **segv, int cap)
+{
+	strncpy(seg_buf, s, sizeof(seg_buf) - 1);
+	seg_buf[sizeof(seg_buf) - 1] = '\0';
+	char *cur = seg_buf, *seg;
+	int n = 0;
+	while ((seg = cli_next_segment(&cur)) != NULL && n < cap)
+		segv[n++] = seg;
+	return n;
+}
+
 static void test_tokenizer(void)
 {
 	assert(run_tok("a b c") == 3);
@@ -187,12 +202,72 @@ static void test_raw(void)
 	assert(strcmp(res.argv[1], "hello there") == 0);
 }
 
+/* issue #23: top-level ';' splitter -- quote/escape-aware, verbatim segments. */
+static void test_segment(void)
+{
+	char *sv[8];
+
+	/* no delimiter -> one verbatim segment */
+	assert(split_all("thread", sv, 8) == 1);
+	assert(strcmp(sv[0], "thread") == 0);
+
+	/* basic split; surrounding spaces are preserved per segment (cli_parse
+	 * later skips them) */
+	assert(split_all("a;b", sv, 8) == 2);
+	assert(strcmp(sv[0], "a") == 0 && strcmp(sv[1], "b") == 0);
+	assert(split_all("a ; b", sv, 8) == 2);
+	assert(strcmp(sv[0], "a ") == 0 && strcmp(sv[1], " b") == 0);
+
+	/* a ';' inside quotes is NOT a delimiter (double and single) */
+	assert(split_all("echo \"a;b\"", sv, 8) == 1);
+	assert(strcmp(sv[0], "echo \"a;b\"") == 0);
+	assert(split_all("echo 'a;b'", sv, 8) == 1);
+	assert(strcmp(sv[0], "echo 'a;b'") == 0);
+
+	/* an escaped ';' is NOT a delimiter (kept verbatim) */
+	assert(split_all("echo a\\;b", sv, 8) == 1);
+	assert(strcmp(sv[0], "echo a\\;b") == 0);
+
+	/* leading / trailing / doubled ';' -> empty segments (parsed as EMPTY) */
+	assert(split_all(";a", sv, 8) == 2);
+	assert(sv[0][0] == '\0' && strcmp(sv[1], "a") == 0);
+	assert(split_all("a;", sv, 8) == 2);
+	assert(strcmp(sv[0], "a") == 0 && sv[1][0] == '\0');
+	assert(split_all("a;;b", sv, 8) == 3);
+	assert(strcmp(sv[0], "a") == 0 && sv[1][0] == '\0' &&
+	       strcmp(sv[2], "b") == 0);
+
+	/* unterminated quote -> whole remainder stays ONE segment (no inner split);
+	 * cli_parse later reports UNTERMINATED_QUOTE on it */
+	assert(split_all("echo \"a ; b", sv, 8) == 1);
+	assert(strcmp(sv[0], "echo \"a ; b") == 0);
+	assert(split_all("x ; 'a ; b", sv, 8) == 2);   /* split only before the open quote */
+	assert(strcmp(sv[0], "x ") == 0 && strcmp(sv[1], " 'a ; b") == 0);
+
+	/* trailing backslash at EOL is literal -> one segment */
+	assert(split_all("echo a\\", sv, 8) == 1);
+	assert(strcmp(sv[0], "echo a\\") == 0);
+
+	/* escape-boundary agreement with next_token (codex NIT): an escaped
+	 * backslash pair leaves the following ';' live */
+	assert(split_all("a\\\\;b", sv, 8) == 2);
+	assert(strcmp(sv[0], "a\\\\") == 0 && strcmp(sv[1], "b") == 0);
+	/* a backslash inside single quotes is literal and does NOT escape the
+	 * closing quote, so the ';' after the close is live */
+	assert(split_all("'a\\';b", sv, 8) == 2);
+	assert(strcmp(sv[0], "'a\\'") == 0 && strcmp(sv[1], "b") == 0);
+
+	/* empty input -> a single empty segment */
+	assert(split_all("", sv, 8) == 1 && sv[0][0] == '\0');
+}
+
 int main(void)
 {
 	test_tokenizer();
 	test_search();
 	test_validate();
 	test_raw();
-	printf("OK: tokenizer / tree search / validation / RAW all pass\n");
+	test_segment();
+	printf("OK: tokenizer / tree search / validation / RAW / segment all pass\n");
 	return 0;
 }

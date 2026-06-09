@@ -33,6 +33,37 @@ the still-unread tail stays pristine (RAW relies on this).
 - More than `CLI_MAX_ARGC` (=20) tokens yields **`TOO_MANY_TOKENS`** (§8; no
   silent truncation).
 
+## Command separator `;` (sequential execution)
+
+A single input line is split on `;` into multiple commands run **left to right**
+(e.g. `thread ; coremark ; thread`). The split is done before dispatch by
+`cli_next_segment()` (`cli_parse.c`), which scans with the **same quote/escape
+state machine** as the tokenizer (each segment is kept verbatim — only the
+separating `;` is overwritten with `NUL`).
+
+- **Quotes respected**: a `;` inside quotes or escaped is not a separator
+  (`echo "a;b"` / `echo 'a;b'` / `echo a\;b` stay one command). A remainder with
+  an unterminated quote stays one segment and `cli_parse` reports
+  `UNTERMINATED_QUOTE` (same as for a single line).
+- **Continue on error**: a not-found / arg error / non-zero handler in one
+  segment does not stop the rest (bash `;` semantics).
+- **Ctrl+C aborts**: if a running command observes the cooperative cancel (#16),
+  the remaining segments do **not** run (one `^C`).
+- **Empty segments**: leading/trailing/doubled `;` (`;a`, `a;`, `a;;b`) whose
+  segment is blank are skipped (an `EMPTY` no-op).
+- **One history entry per line**: the whole `;` line is recorded as one entry; ↑
+  recalls it and re-runs the sequence after a re-parse.
+- **Prompt once at end of line**; each command's output is identical to running
+  it alone (no extra newline between segments).
+- **Scope**: only sequential `;`. `&&` / `||` / pipe `|` / redirection are not
+  supported (future work). Tab-completion of the word after `;` is also
+  unsupported (the completer treats `;` as an ordinary char). For RAW commands a
+  space before `;` stays in the preceding segment (consistent with the verbatim
+  tail contract).
+
+The segment loop itself lives in `cli_session.c`: `cli_dispatch_line()` (scans
+`;`) → `cli_dispatch_one()` (parses + runs one command).
+
 ## Subcommand-tree search
 
 - Token 0 is matched against root commands (`.shell_root_cmds`). Duplicate root
@@ -83,8 +114,12 @@ caller's argv array has capacity `CLI_ARGV_CAP = CLI_MAX_ARGC + 2`).
 can be exercised with a compact tree). It asserts splitting
 (quotes/escapes/empty quote/trailing `\`/unterminated/NULL sentinel), search
 (multi-level/parent-path stripping/pure parent/non-match-becomes-arg/depth),
-validation (in/out of range/too many), and RAW (handler-relative index for a
-multi-level leaf/verbatim tail/empty tail/too few).
+validation (in/out of range/too many), RAW (handler-relative index for a
+multi-level leaf/verbatim tail/empty tail/too few), and `;` splitting
+(`cli_next_segment`: no split inside quotes/escapes, empty/leading/trailing
+segments, unterminated quote stays one segment, escape boundaries). The
+end-to-end `;` sequencing (continue-on-error, Ctrl+C abort, one prompt at the end
+of the line) is in `shell/test/test_integration.c`.
 
 ```bash
 bash shell/test/run_host_tests.sh   # => host tests passed

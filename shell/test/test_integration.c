@@ -482,6 +482,56 @@ static void test_cancel_typeahead_discard(void)
 	assert(!has(&tr0, "OK"));
 }
 
+/* issue #23: ';'-separated sequential execution end-to-end through the backend.
+ * Lines stay <= 15 chars (CLI_CMD_BUFFER_SIZE=16 in this harness). */
+static void test_sequence(void)
+{
+	/* two commands run in order; both handlers fire; ONE prompt at the end */
+	reset(&sh0, &tr0);
+	run_line(&sh0, "hello;hello\r");
+	assert(ran == 2);
+	assert(count(&tr0, "OK") == 2);
+	{
+		size_t n;
+		const char *o = cli_dummy_output(&tr0, &n);
+		assert(n >= 2 && strcmp(o + n - 2, "> ") == 0);  /* final prompt */
+	}
+	assert(count(&tr0, "> ") == 1);                          /* prompt only once */
+
+	/* a bad first command does NOT stop the second (continue-on-error) */
+	reset(&sh0, &tr0);
+	run_line(&sh0, "nope;hello\r");
+	assert(has(&tr0, "nope: command not found"));
+	assert(ran == 1 && has(&tr0, "OK"));
+	assert(sh0.last_result == 0);                            /* last seg (hello) won */
+
+	/* an error in the SECOND command: first runs, last_result = ERR */
+	reset(&sh0, &tr0);
+	run_line(&sh0, "hello;nope\r");
+	assert(ran == 1);
+	assert(has(&tr0, "nope: command not found"));
+	assert(sh0.last_result == CLI_DISPATCH_ERR);
+
+	/* empty segments (doubled ';') are skipped, no extra output / crash */
+	reset(&sh0, &tr0);
+	run_line(&sh0, "hello;;hello\r");
+	assert(ran == 2 && count(&tr0, "OK") == 2);
+
+	/* a quoted ';' keeps the command whole: echo2 gets the literal arg */
+	reset(&sh0, &tr0);
+	run_line(&sh0, "echo2 \"a;b\"\r");
+	assert(has(&tr0, "argc=2 a1=a;b"));
+	assert(!has(&tr0, "command not found"));
+
+	/* Ctrl+C in the first command aborts the rest of the sequence */
+	reset(&sh0, &tr0);
+	inject_at = 5;                          /* loopc self-injects 0x03 at iter 5 */
+	run_line(&sh0, "loopc;hello\r");
+	assert(has(&tr0, "^C") && count(&tr0, "^C") == 1);
+	assert(ran == 0 && !has(&tr0, "OK"));   /* hello after ';' did NOT run */
+	assert(sh0.last_result == CLI_DISPATCH_CANCELLED);
+}
+
 static void test_line_overflow_bel(void)
 {
 	/* CLI_CMD_BUFFER_SIZE=16 -> at most 15 chars; further chars ring the bell. */
@@ -545,6 +595,7 @@ int main(void)
 	test_cancel_sleep();
 	test_cancel_typeahead_discard();
 	test_redispatch_recipe();
+	test_sequence();
 	test_line_overflow_bel();
 	test_rx_overflow_drops();
 	test_multi_instance_isolation();

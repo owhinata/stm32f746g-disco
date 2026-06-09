@@ -62,6 +62,19 @@ struct cli_parse_result {
 int cli_tokenize(char *line, char **argv, int max_argc);
 
 /**
+ * Split @p line on top-level ';' for command sequencing (issue #23).  Returns
+ * the next ';'-separated segment starting at *@p cursor, NUL-terminating it in
+ * place (the ';' is overwritten with '\0') and advancing *@p cursor past it; a
+ * ';' separates only OUTSIDE quotes and not escaped, using the SAME quote/escape
+ * rules as the tokenizer (so `echo "a;b"` / `echo a\;b` stay one segment).  The
+ * segment bytes are preserved verbatim (no compaction / quote stripping) so each
+ * is parseable by cli_parse().  Returns NULL once exhausted (*@p cursor == NULL);
+ * a trailing ';' yields one final empty segment first ("a;" -> "a","").  Empty /
+ * whitespace-only segments parse as CLI_PARSE_EMPTY (a no-op) at dispatch.
+ */
+char *cli_next_segment(char **cursor);
+
+/**
  * Parse @p line: tokenize, walk the static command tree, handle RAW, and
  * validate the argument count.  @p argv is caller-provided scratch of capacity
  * @p argv_cap (must be >= CLI_ARGV_CAP).  @p out is zero-initialised first; on
