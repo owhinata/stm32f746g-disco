@@ -59,16 +59,57 @@
 #define CLI_MAX_INSTANCES 4
 #endif
 
+/* Maximum number of concurrent background jobs (issue #25): `cmd &` runs a
+ * command in a worker thread drawn from a fixed static pool of this size.  Over
+ * limit: the launch is rejected with an error (no dynamic allocation -- the pool
+ * is statically sized).  Each slot costs one struct cli_instance + one worker
+ * stack (CLI_BG_JOB_STACK_SIZE), so keep it small. */
+#ifndef CLI_MAX_BG_JOBS
+#define CLI_MAX_BG_JOBS 2
+#endif
+
+/* Per-job worker thread stack size in bytes (issue #25).  Defaults to the shell
+ * instance stack; the threadx exe overrides both to 4096 so any command --
+ * including coremark -- can run in the background.  A bg job runs an arbitrary
+ * registered handler, so it needs the same headroom as the interactive thread. */
+#ifndef CLI_BG_JOB_STACK_SIZE
+#define CLI_BG_JOB_STACK_SIZE CLI_INSTANCE_STACK_SIZE
+#endif
+
+/* ThreadX priority of each background-job worker thread (issue #25).  One step
+ * BELOW (numerically above) the interactive shell so a CPU-bound bg job (e.g.
+ * `coremark &`, which never blocks) can never starve the interactive prompt --
+ * any keystroke preempts it.  Plain integer (cli_config.h stays ThreadX-free). */
+#ifndef CLI_BG_JOB_PRIORITY
+#define CLI_BG_JOB_PRIORITY (CLI_INSTANCE_PRIORITY + 1)
+#endif
+
+/* TX-backpressure poll slice for a bg job in ThreadX ticks (issue #25).  When a
+ * bg job's output finds the TX ring full it cannot wait on the foreground's
+ * CLI_EVT_TX (a different event group), so it waits this long on its OWN events
+ * for a kill, then retries the write -- while still honouring the overall
+ * CLI_TX_TIMEOUT deadline so a wedged TX never pins the shared output lock. */
+#ifndef CLI_BG_TX_POLL_TICKS
+#define CLI_BG_TX_POLL_TICKS 2u
+#endif
+
+/* Overall no-progress deadline for a bg job's TX-full wait when CLI_TX_TIMEOUT is
+ * 0 (== "never drop") (issue #25).  A bg job holds the SHARED fg->tx_lock while
+ * sending, so -- unlike the interactive path -- it must NOT honour an infinite
+ * timeout: a wedged TX would pin the lock and freeze the foreground.  So a bg job
+ * always uses a finite deadline: CLI_TX_TIMEOUT when non-zero, else this value. */
+#ifndef CLI_BG_TX_WEDGE_TICKS
+#define CLI_BG_TX_WEDGE_TICKS 1000u
+#endif
+
 /* Size of the thread->instance registry that backs cli_current_instance()
  * (#18): printf/_write resolves the owning shell instance of the running
- * thread from this table.  In #18 only the per-instance shell threads register
- * (one slot each), so the default tracks CLI_MAX_INSTANCES.  When background
- * jobs land (#25), each worker thread also registers -> bump this by the
- * concurrent bg-job budget (e.g. + CLI_MAX_BG_JOBS) or split into a separate
- * worker table; a full table makes cli_register_thread() fail (-1) rather than
- * silently misroute printf. */
+ * thread from this table.  Per-instance shell threads register one slot each;
+ * each background-job worker (#25) also registers while it runs -> size for both
+ * so a launch never fails to register (a full table makes cli_register_thread()
+ * return -1, which the caller must treat as an error rather than misroute). */
 #ifndef CLI_THREAD_MAP_MAX
-#define CLI_THREAD_MAP_MAX CLI_MAX_INSTANCES
+#define CLI_THREAD_MAP_MAX (CLI_MAX_INSTANCES + CLI_MAX_BG_JOBS)
 #endif
 
 /* Maximum static subcommand tree nesting depth.
@@ -188,6 +229,10 @@ _Static_assert(CLI_INSTANCE_STACK_SIZE >= 512, "CLI_INSTANCE_STACK_SIZE too smal
 _Static_assert(CLI_MAX_INSTANCES >= 1,      "CLI_MAX_INSTANCES must be >= 1");
 _Static_assert(CLI_MAX_SUBCMD_DEPTH >= 1,   "CLI_MAX_SUBCMD_DEPTH must be >= 1");
 _Static_assert(CLI_INSTANCE_PRIORITY <= 31, "CLI_INSTANCE_PRIORITY must be 0..31 (ThreadX)");
+_Static_assert(CLI_MAX_BG_JOBS >= 1,        "CLI_MAX_BG_JOBS must be >= 1");
+_Static_assert(CLI_BG_JOB_STACK_SIZE >= 512, "CLI_BG_JOB_STACK_SIZE too small");
+_Static_assert(CLI_BG_JOB_PRIORITY <= 31,   "CLI_BG_JOB_PRIORITY must be 0..31 (ThreadX)");
+_Static_assert(CLI_BG_TX_POLL_TICKS >= 1,   "CLI_BG_TX_POLL_TICKS must be >= 1");
 _Static_assert(CLI_RX_DRAIN_CHUNK >= 1,     "CLI_RX_DRAIN_CHUNK must be >= 1");
 _Static_assert(CLI_TERM_WIDTH >= 20 && CLI_TERM_WIDTH <= 255,
                "CLI_TERM_WIDTH must be 20..255 (fits uint8_t term_width)");

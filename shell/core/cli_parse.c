@@ -174,6 +174,82 @@ char *cli_next_segment(char **cursor)
 	return start;
 }
 
+/*
+ * Detect (and strip) a trailing background '&' on a command segment (issue #25).
+ *
+ * Scans @p seg with the SAME quote/escape rules as cli_next_segment() /
+ * next_token(): a '&' is the background operator only when it is the last
+ * non-whitespace character of the segment AND lies OUTSIDE quotes, is not
+ * backslash-escaped, and is not the tail of a "&&" pair.  On a match the '&' and
+ * any whitespace before it are overwritten with '\0' in place (so the remaining
+ * command re-tokenizes normally) and 1 is returned; otherwise @p seg is left
+ * untouched and 0 is returned.  Only a TRAILING '&' backgrounds -- a '&' inside
+ * a token (e.g. "a&b") stays a literal byte, matching the tokenizer.
+ *
+ *   "cmd &" / "cmd&" / "cmd & "  -> background, leaves "cmd"
+ *   'echo "a&"' / "echo a\&"     -> NOT background (quoted / escaped '&')
+ *   "cmd && x" / "cmd &&"        -> NOT background ('&&' is not the bg operator)
+ *   "&"                          -> background an empty command (a dispatch no-op)
+ */
+int cli_segment_is_background(char *seg)
+{
+	char quote = 0;             /* 0 = none, otherwise '"' or '\'' */
+	int  amp = -1;              /* index of the candidate trailing '&', or -1 */
+	int  amp_after_amp = 0;     /* candidate '&' was immediately preceded by '&' */
+	int  prev_sig_amp = 0;      /* previous significant char was a top-level '&' */
+
+	for (int i = 0; seg[i] != '\0'; i++) {
+		char c = seg[i];
+
+		if (quote == 0) {
+			if (c == ' ' || c == '\t')
+				continue;               /* whitespace: not significant */
+			if (c == '\\') {
+				if (seg[i + 1] == '\0')
+					break;          /* trailing backslash: literal, EOL */
+				i++;                    /* escaped char: literal, not an operator */
+				amp = -1;
+				prev_sig_amp = 0;
+				continue;
+			}
+			if (c == '"' || c == '\'') {
+				quote = c;
+				amp = -1;
+				prev_sig_amp = 0;
+				continue;
+			}
+			if (c == '&') {
+				amp = i;
+				amp_after_amp = prev_sig_amp;
+				prev_sig_amp = 1;
+			} else {
+				amp = -1;
+				prev_sig_amp = 0;
+			}
+		} else if (quote == '"') {
+			if (c == '\\' && seg[i + 1] != '\0')
+				i++;                    /* escaped char inside "..." */
+			else if (c == '"')
+				quote = 0;
+			amp = -1;                       /* any quoted content resets the trailing '&' */
+			prev_sig_amp = 0;
+		} else { /* single quote: fully literal, only '\'' closes */
+			if (c == '\'')
+				quote = 0;
+			amp = -1;
+			prev_sig_amp = 0;
+		}
+	}
+
+	if (amp < 0 || amp_after_amp)
+		return 0;                           /* no trailing '&' (or it was '&&') */
+
+	seg[amp] = '\0';                            /* drop the '&' ... */
+	for (int j = amp - 1; j >= 0 && (seg[j] == ' ' || seg[j] == '\t'); j--)
+		seg[j] = '\0';                      /* ... and the whitespace before it */
+	return 1;
+}
+
 int cli_tokenize(char *line, char **argv, int max_argc)
 {
 	char *rd = line;

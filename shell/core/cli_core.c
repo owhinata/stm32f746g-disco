@@ -294,16 +294,27 @@ static ULONG cli_wait(unsigned ticks)
  * (format + stage + flush) so concurrent writers to one instance never corrupt
  * out_buf/out_len.  TX_INHERIT (set in cli_init) bounds priority inversion while
  * the lock is held across a TX-space wait.
+ *
+ * Background jobs (issue #25): a bg-job worker instance (sh->fg != NULL) has no
+ * tx_lock of its own; it locks its FOREGROUND's tx_lock so its output serialises
+ * against the fg line editor (which also outputs under that mutex).  The mutex
+ * is owner-reentrant, so a fg call that nests another lock is harmless.
  */
+static struct cli_instance *cli_out_target(struct cli_instance *sh)
+{
+	return sh->fg ? sh->fg : sh;
+}
+
 int cli_lock(struct cli_instance *sh)
 {
-	return tx_mutex_get(&sh->tx_lock, cli_wait(CLI_TX_MUTEX_WAIT)) == TX_SUCCESS
+	struct cli_instance *o = cli_out_target(sh);
+	return tx_mutex_get(&o->tx_lock, cli_wait(CLI_TX_MUTEX_WAIT)) == TX_SUCCESS
 	       ? 0 : -1;
 }
 
 void cli_unlock(struct cli_instance *sh)
 {
-	tx_mutex_put(&sh->tx_lock);
+	tx_mutex_put(&cli_out_target(sh)->tx_lock);
 }
 
 /*
@@ -319,12 +330,16 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 {
 	struct cli_transport *tr = sh->tr;
 	size_t sent = 0;
+	int    is_job = (sh->fg != NULL);
+	/* bg job: base of the no-progress deadline that bounds a wedged TX so a job
+	 * never pins the shared fg->tx_lock forever (issue #25); reset on progress. */
+	ULONG  stall_start = is_job ? tx_time_get() : 0u;
 
 	while (sent < len) {
 		/* Cooperative Ctrl+C (issue #16): once cancel is latched, stop emitting
 		 * at once so a handler that keeps printing finishes fast.  Gated by
 		 * dispatching so the post-cancel "^C"/prompt cleanup (dispatching == 0)
-		 * is never suppressed. */
+		 * is never suppressed.  For a bg job cancel_req is set by `kill` (#25). */
 		if (sh->dispatching && sh->cancel_req)
 			return -1;
 
@@ -337,14 +352,44 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 			if ((size_t)n > len - sent)     /* defensive clamp */
 				n = (int)(len - sent);
 			sent += (size_t)n;
+			if (is_job)
+				stall_start = tx_time_get();    /* progress: reset deadline */
 			continue;
 		}
 
-		/* TX full: wait for space (or a kill request).  While a command runs we
-		 * also wake on RX so a Ctrl+C arriving mid-output aborts the blocked
-		 * send.  The main loop's TX_OR_CLEAR may already have consumed the RX
-		 * flag for a 0x03 still sitting in the ring, so poll the ring BEFORE
-		 * waiting (issue #16 invariant 2). */
+		if (is_job) {
+			/* bg job, TX full: NEVER drain the shared RX (it belongs to the
+			 * interactive consumer; cancel is kill-driven).  TX-space is signalled
+			 * on the FOREGROUND's event group (the ISR notifies u->sh == fg), so a
+			 * job cannot wait for it on its own group -- instead wait a short slice
+			 * on its OWN events for a kill, then retry the write.  Bound the
+			 * no-progress time by CLI_TX_TIMEOUT so a wedged TX drops rather than
+			 * pinning fg->tx_lock (issue #25). */
+			ULONG flags;
+			/* Always FINITE for a bg job (issue #25): it holds the shared
+			 * fg->tx_lock while sending, so it must not honour CLI_TX_TIMEOUT==0
+			 * (never-drop) -- a wedged TX would pin the lock and freeze the
+			 * foreground.  Use the configured timeout, or CLI_BG_TX_WEDGE_TICKS. */
+			ULONG budget = CLI_TX_TIMEOUT ? (ULONG)CLI_TX_TIMEOUT
+			                              : (ULONG)CLI_BG_TX_WEDGE_TICKS;
+
+			if ((ULONG)(tx_time_get() - stall_start) >= budget) {
+				sh->tx_dropped += (uint32_t)(len - sent);   /* wedged: drop */
+				return -1;
+			}
+			/* Wake promptly on `kill` (its own group); otherwise time-slice and
+			 * retry.  Clearing CLI_EVT_KILL is harmless: cancel_req (sticky) is the
+			 * source of truth, caught by the loop top on the next iteration. */
+			tx_event_flags_get(&sh->events, CLI_EVT_KILL, TX_OR_CLEAR,
+			                   &flags, CLI_BG_TX_POLL_TICKS);
+			continue;
+		}
+
+		/* Interactive TX full: wait for space (or a kill request).  While a
+		 * command runs we also wake on RX so a Ctrl+C arriving mid-output aborts
+		 * the blocked send.  The main loop's TX_OR_CLEAR may already have consumed
+		 * the RX flag for a 0x03 still sitting in the ring, so poll the ring
+		 * BEFORE waiting (issue #16 invariant 2). */
 		ULONG flags;
 		ULONG mask = CLI_EVT_TX | CLI_EVT_KILL |
 		             (sh->dispatching ? CLI_EVT_RX : 0u);
@@ -382,13 +427,19 @@ int cli_sleep(struct cli_instance *sh, unsigned ticks)
 	if (ticks == 0)
 		return 0;                           /* contract: ticks==0 elapses at once */
 
-	ULONG start = tx_time_get();
+	/* bg job (issue #25): cancel is kill-driven, so wait ONLY on its own
+	 * CLI_EVT_KILL (set by `kill`); never wake on / drain the shared RX, which
+	 * belongs to the interactive consumer.  Interactive: the existing RX-wake
+	 * path so a buffered 0x03 (Ctrl+C) cancels the delay. */
+	int   is_job = (sh->fg != NULL);
+	ULONG mask   = is_job ? CLI_EVT_KILL : (CLI_EVT_RX | CLI_EVT_KILL);
+	ULONG start  = tx_time_get();
 
 	for (;;) {
 		ULONG elapsed, remaining, flags;
 		UINT  st;
 
-		if (cli_cancel_poll(sh))            /* a 0x03 already buffered in the ring */
+		if (cli_cancel_poll(sh))            /* job-aware: a job returns cancel_req */
 			return 1;
 
 		elapsed = (ULONG)(tx_time_get() - start);   /* wrap-safe */
@@ -396,13 +447,13 @@ int cli_sleep(struct cli_instance *sh, unsigned ticks)
 			return 0;                       /* full delay elapsed */
 		remaining = (ULONG)ticks - elapsed;
 
-		st = tx_event_flags_get(&sh->events, CLI_EVT_RX | CLI_EVT_KILL,
-		                        TX_OR_CLEAR, &flags, remaining);
+		st = tx_event_flags_get(&sh->events, mask, TX_OR_CLEAR, &flags, remaining);
 		if (st != TX_SUCCESS)
 			return 0;                       /* TX_NO_EVENTS (timed out) == elapsed */
 		if (flags & CLI_EVT_KILL) {
-			tx_event_flags_set(&sh->events, CLI_EVT_KILL, TX_OR); /* re-post */
-			return 1;
+			if (!is_job)
+				tx_event_flags_set(&sh->events, CLI_EVT_KILL, TX_OR); /* re-post (thread stop) */
+			return 1;                       /* job: `kill`; interactive: stop */
 		}
 		if ((flags & CLI_EVT_RX) && cli_cancel_poll(sh))
 			return 1;

@@ -42,6 +42,15 @@ void cli_unlock(struct cli_instance *sh) { (void)sh; }
 void cli_transport_notify_rx(struct cli_instance *sh) { (void)sh; }
 void cli_transport_notify_tx(struct cli_instance *sh) { (void)sh; }
 
+/* ---- background jobs: stubbed (ThreadX worker pool is target-only, #25) --- *
+ * cli_session.c (ThreadX-free, host-built) calls these from cli_dispatch_line;
+ * the real pool lives in cli_job.c (ThreadX), which the host harness does not
+ * link.  Launch fails (no worker on the host) and reap is a no-op, so a host
+ * test that submits "cmd &" simply runs nothing in the background -- the trailing
+ * '&' strip itself is covered by test_parse.c's cli_segment_is_background tests. */
+int  cli_job_launch(struct cli_instance *fg, char *seg) { (void)fg; (void)seg; return -1; }
+void cli_jobs_reap(struct cli_instance *fg)             { (void)fg; }
+
 /* ---- TX-wait hook ------------------------------------------------------- */
 
 static cli_test_tx_wait_fn g_tx_wait_fn;

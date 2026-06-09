@@ -29,6 +29,14 @@ void cli_prompt(struct cli_instance *sh)
 
 int cli_cancel_poll(struct cli_instance *sh)
 {
+	/* A bg-job worker (issue #25) does NOT own the transport RX: that ring is a
+	 * strict SPSC pipe whose single consumer is the interactive shell thread.
+	 * Draining it here would steal the user's keystrokes and corrupt the ring, so
+	 * a job never reads RX -- its cancel is kill-driven (`kill %N` sets cancel_req
+	 * directly), and this just reports that sticky flag. */
+	if (sh->fg)
+		return sh->cancel_req;
+
 	struct cli_transport *tr = sh->tr;
 	uint8_t buf[CLI_RX_DRAIN_CHUNK];
 	int n;
@@ -55,9 +63,11 @@ bool cli_cancel_requested(struct cli_instance *sh)
  * -- it resets the per-command flow-control flag, parses @p seg in place and
  * dispatches the resolved handler / prints the parse outcome.  Cross-segment
  * concerns (the line's "\r\n" echo, history, the cooperative-cancel feedback and
- * the prompt) stay in cli_dispatch_line; this runs once per segment.
+ * the prompt) stay in cli_dispatch_line; this runs once per segment.  Exposed
+ * (issue #25) so a background-job worker can run its single segment through the
+ * exact same parse/dispatch path as the interactive shell.
  */
-static void cli_dispatch_one(struct cli_instance *sh, char *seg)
+void cli_dispatch_segment(struct cli_instance *sh, char *seg)
 {
 	sh->tx_failed = 0;                  /* fresh flow-control state per command */
 
@@ -68,8 +78,13 @@ static void cli_dispatch_one(struct cli_instance *sh, char *seg)
 	case CLI_PARSE_OK: {
 		/* Pass the handler-relative argv/argc (argv[0] = leaf name).  Mark the
 		 * window in which a Ctrl+C cancels the command (issue #16): cancel_req is
-		 * cleared first, dispatching gates the cooperative-cancel paths. */
-		sh->cancel_req  = 0;
+		 * cleared first, dispatching gates the cooperative-cancel paths.  For a bg
+		 * job (#25) do NOT clear it: cancel_req was already reset at launch, and a
+		 * `kill` may have landed BEFORE the worker reached here (the fg, at higher
+		 * priority, can process `kill %N` from type-ahead before the worker runs) --
+		 * clearing it would drop that kill. */
+		if (!sh->fg)
+			sh->cancel_req = 0;
 		sh->dispatching = 1;
 		int ret = sh->pr.cmd->handler(sh, sh->pr.argc, sh->pr.argv);
 		sh->dispatching = 0;
@@ -116,6 +131,12 @@ void cli_dispatch_line(struct cli_instance *sh)
 	cli_write(sh, "\r\n", 2);           /* echo the newline before any output */
 	sh->line[sh->len] = '\0';
 
+	/* Reap any background jobs that finished since the last line (issue #25):
+	 * delete their completed worker threads and print "[id] Done/Killed cmd" here
+	 * on the foreground thread (so the notice serialises with the prompt), on the
+	 * fresh line the "\r\n" echo just opened. */
+	cli_jobs_reap(sh);
+
 	/* Record the submitted line for history (issue #10).  Done BEFORE the split
 	 * loop, which (via cli_next_segment + cli_parse) rewrites sh->line in place:
 	 * the WHOLE line -- ';' separators included -- is one history entry. */
@@ -129,7 +150,14 @@ void cli_dispatch_line(struct cli_instance *sh)
 	char *cursor = sh->line;
 	char *seg;
 	while ((seg = cli_next_segment(&cursor)) != NULL) {
-		cli_dispatch_one(sh, seg);
+		/* Trailing '&' (issue #25): launch this segment as a background job and
+		 * return to the prompt at once instead of running it inline.  cancel_req
+		 * is the foreground line's, so it never gates a bg launch. */
+		if (cli_segment_is_background(seg)) {
+			cli_job_launch(sh, seg);
+			continue;
+		}
+		cli_dispatch_segment(sh, seg);
 		if (sh->cancel_req)
 			break;
 	}

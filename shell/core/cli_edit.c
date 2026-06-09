@@ -441,6 +441,19 @@ static void edit_submit(struct cli_instance *sh)
 
 void cli_input_byte(struct cli_instance *sh, uint8_t b)
 {
+	/* Background-job output landed since the last keystroke (issue #25): a bg
+	 * worker printed under this instance's tx_lock, broke to a fresh line and
+	 * reset old_rows/draw_row/render_dirty.  Repaint the prompt + current input
+	 * line here -- BEFORE any byte handling, including the fast-append path that
+	 * would otherwise echo onto the bg-output line -- so the live line follows the
+	 * bg output cleanly.  cli_edit_refresh() with old_rows == 0 just draws at the
+	 * cursor (no erase).  A bg job runs below this instance's priority, so it only
+	 * emits while this thread is idle: render_dirty/old_rows are settled here. */
+	if (sh->render_dirty) {
+		sh->render_dirty = 0;
+		cli_edit_refresh(sh);
+	}
+
 	/* ASCII filter (req §13): non-ASCII bytes never reach the line buffer. */
 	if (b & 0x80u)
 		return;

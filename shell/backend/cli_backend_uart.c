@@ -17,6 +17,7 @@
  * A future multi-UART backend would switch on huart->Instance instead.
  */
 #include "cli_backend_uart.h"
+#include "cli_internal.h" /* cli_out_begin/cli_out_end: lock printf with cli_print (#25) */
 #include "bsp.h"   /* extern huart1: the pre-enable polling fallback for _write */
 #include "tx_api.h" /* execution-profile ISR hooks (auto-pulls tx_execution_profile.h) */
 
@@ -298,14 +299,21 @@ static struct cli_uart *uart_ctx_from_instance(struct cli_instance *sh)
  * '\n' -- without staircasing; an existing CR before the LF is left as-is (no
  * double CR).  Only C-library printf flows through _write: the shell's own
  * cli_print emits CRLF through the transport write() path and is unaffected.
- * Note printf bypasses the per-instance TX mutex (it must be callable pre-kernel
- * and from any thread), so a printf and a cross-thread cli_print to the *same*
- * instance are not line-atomic with each other; the TX ring itself stays intact
- * (PRIMASK-guarded dual producer).
+ * Line-atomicity (issue #25): when the running thread is a registered shell/job
+ * thread on THIS UART (uart_ctx_from_instance() != NULL), the byte drain is
+ * bracketed by cli_out_begin/cli_out_end -- the same output lock cli_print and
+ * the line editor take (the FOREGROUND's lock for a bg-job worker) -- so a bg
+ * printf (e.g. CoreMark in the background) is serialised with cli_print and the
+ * editor and inherits the bg line-break.  From an ISR, before the scheduler, or
+ * from a non-shell / non-UART thread the instance resolves to NULL, no lock is
+ * taken and we fall back to g_uart_console exactly as before (byte-for-byte).
+ * The TX ring itself is always intact regardless (PRIMASK-guarded dual producer).
  */
 int _write(int file, char *ptr, int len)
 {
-	struct cli_uart *u = uart_ctx_from_instance(cli_current_instance());
+	struct cli_instance *sh = cli_current_instance();
+	struct cli_uart     *u  = uart_ctx_from_instance(sh);
+	int locked = 0;
 	(void)file;
 
 	if (len <= 0)
@@ -313,6 +321,8 @@ int _write(int file, char *ptr, int len)
 
 	if (u == NULL)
 		u = g_uart_console;   /* ISR / pre-kernel / non-shell thread / non-UART */
+	else
+		locked = (cli_out_begin(sh) == 0);   /* serialise with cli_print + editor (#25) */
 
 	if (u != NULL && u->enabled) {
 		const uint8_t *d = (const uint8_t *)ptr;
@@ -325,21 +335,27 @@ int _write(int file, char *ptr, int len)
 
 			if (b == (uint8_t)'\n' && prev != (uint8_t)'\r') {
 				if (!tx_putc_spin(u, (uint8_t)'\r', &stall))
-					return len;     /* wedged: drop the rest */
+					break;          /* wedged: drop the rest */
 			}
 			if (!tx_putc_spin(u, b, &stall))
-				return len;             /* wedged: drop the rest */
+				break;                  /* wedged: drop the rest */
 			prev = b;
 		}
+		if (locked)
+			cli_out_end(sh);
 		return len;
 	}
 
 	/* Pre-enable path: poll the bound handle, or the VCP huart1 if no console
-	 * has been bound yet (the earliest boot printf, before cli_init()). */
+	 * has been bound yet (the earliest boot printf, before cli_init()).  (Only
+	 * reached with locked == 0: a resolved enabled instance takes the branch
+	 * above.) */
 	{
 		UART_HandleTypeDef *h = (u != NULL && u->huart != NULL) ? u->huart
 		                                                        : &huart1;
 		HAL_UART_Transmit(h, (uint8_t *)ptr, (uint16_t)len, HAL_MAX_DELAY);
 	}
+	if (locked)
+		cli_out_end(sh);
 	return len;
 }

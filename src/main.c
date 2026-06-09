@@ -109,6 +109,11 @@ void tx_application_define(void *first_unused_memory)
 			printf("shell: instance %u start failed (skipped)\r\n", (unsigned)i);
 	}
 
+	/* Background-job worker pool (issue #25): create the per-worker event groups
+	 * once, now that the interactive instances exist.  Workers are spawned on
+	 * demand by `cmd &`. */
+	cli_job_pool_init();
+
 	tx_thread_create(&led_thread, "led", led_entry, 0,
 	                 led_stack, sizeof led_stack,
 	                 LED_PRIORITY, LED_PRIORITY, TX_NO_TIME_SLICE, TX_AUTO_START);

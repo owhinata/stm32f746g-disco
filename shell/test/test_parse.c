@@ -261,6 +261,65 @@ static void test_segment(void)
 	assert(split_all("", sv, 8) == 1 && sv[0][0] == '\0');
 }
 
+/* Run cli_segment_is_background() on a mutable copy of @p s: returns the bg flag
+ * and leaves the (possibly '&'-stripped) segment in bg_buf for the caller to
+ * compare (issue #25). */
+static char bg_buf[CLI_CMD_BUFFER_SIZE];
+static int is_bg(const char *s)
+{
+	strncpy(bg_buf, s, sizeof(bg_buf) - 1);
+	bg_buf[sizeof(bg_buf) - 1] = '\0';
+	return cli_segment_is_background(bg_buf);
+}
+
+static void test_background(void)
+{
+	/* trailing '&', with and without surrounding whitespace -> background; the
+	 * '&' and the whitespace before it are stripped. */
+	assert(is_bg("cmd &") == 1 && strcmp(bg_buf, "cmd") == 0);
+	assert(is_bg("cmd&") == 1 && strcmp(bg_buf, "cmd") == 0);
+	assert(is_bg("cmd & ") == 1 && strcmp(bg_buf, "cmd") == 0);
+	assert(is_bg("sleep 30 &") == 1 && strcmp(bg_buf, "sleep 30") == 0);
+
+	/* a lone '&' backgrounds an empty command (a dispatch no-op) */
+	assert(is_bg("&") == 1 && bg_buf[0] == '\0');
+
+	/* quoted / escaped '&' is a literal, NOT the operator */
+	assert(is_bg("echo \"x&\"") == 0 && strcmp(bg_buf, "echo \"x&\"") == 0);
+	assert(is_bg("echo 'a&'") == 0 && strcmp(bg_buf, "echo 'a&'") == 0);
+	assert(is_bg("echo a\\&") == 0 && strcmp(bg_buf, "echo a\\&") == 0);
+	assert(is_bg("cmd \\&") == 0);
+
+	/* '&&' is not the background operator (logical-and is a non-goal) */
+	assert(is_bg("cmd && x") == 0 && strcmp(bg_buf, "cmd && x") == 0);
+	assert(is_bg("cmd &&") == 0);
+
+	/* '&' inside a token (not trailing) stays a literal byte */
+	assert(is_bg("a&b") == 0 && strcmp(bg_buf, "a&b") == 0);
+
+	/* a '&' that ends the segment after an earlier '&&' still backgrounds */
+	assert(is_bg("a && b &") == 1 && strcmp(bg_buf, "a && b") == 0);
+
+	/* the segment splitter feeds one segment at a time: "cmd & ; next" splits on
+	 * ';' first, so the bg check sees "cmd & " (-> bg "cmd") and " next" (-> not). */
+	{
+		char line[] = "cmd & ; next";
+		char *cur = line, *seg;
+		int n = 0;
+		int bg0 = -1, bg1 = -1;
+		char seg0[CLI_CMD_BUFFER_SIZE] = "", seg1[CLI_CMD_BUFFER_SIZE] = "";
+		while ((seg = cli_next_segment(&cur)) != NULL) {
+			int b = cli_segment_is_background(seg);
+			if (n == 0) { bg0 = b; strcpy(seg0, seg); }
+			else if (n == 1) { bg1 = b; strcpy(seg1, seg); }
+			n++;
+		}
+		assert(n == 2);
+		assert(bg0 == 1 && strcmp(seg0, "cmd") == 0);
+		assert(bg1 == 0 && strcmp(seg1, " next") == 0);
+	}
+}
+
 int main(void)
 {
 	test_tokenizer();
@@ -268,6 +327,7 @@ int main(void)
 	test_validate();
 	test_raw();
 	test_segment();
-	printf("OK: tokenizer / tree search / validation / RAW / segment all pass\n");
+	test_background();
+	printf("OK: tokenizer / tree search / validation / RAW / segment / background all pass\n");
 	return 0;
 }

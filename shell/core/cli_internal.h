@@ -74,6 +74,16 @@ int cli_tokenize(char *line, char **argv, int max_argc);
  */
 char *cli_next_segment(char **cursor);
 
+/*
+ * Detect a trailing background '&' on a single command segment (issue #25) and,
+ * if present, strip it (and any whitespace before it) in place so the remaining
+ * command re-tokenizes normally; returns 1 when @p seg was backgrounded, 0 when
+ * left untouched.  Uses the same quote/escape rules as cli_next_segment(): a '&'
+ * backgrounds only as the last non-whitespace char, outside quotes, unescaped,
+ * and not as the tail of "&&".  Pure (no instance), so the host tests exercise it.
+ */
+int cli_segment_is_background(char *seg);
+
 /**
  * Parse @p line: tokenize, walk the static command tree, handle RAW, and
  * validate the argument count.  @p argv is caller-provided scratch of capacity
@@ -125,6 +135,10 @@ void cli_set_backspace_mode(struct cli_instance *sh, int mode);
 /** Parse and run the accumulated line, print the outcome, return to the prompt. */
 void cli_dispatch_line(struct cli_instance *sh);
 
+/** Parse and run ONE command segment in place (issue #23/#25): used per-segment
+ *  by cli_dispatch_line and by a background-job worker for its single segment. */
+void cli_dispatch_segment(struct cli_instance *sh, char *seg);
+
 /** Emit the instance prompt. */
 void cli_prompt(struct cli_instance *sh);
 
@@ -169,6 +183,19 @@ void cli_history_add(struct cli_instance *sh, const char *line); /**< record a s
 int  cli_lock(struct cli_instance *sh);
 void cli_unlock(struct cli_instance *sh);
 int  cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t len);
+
+/*
+ * Output bracket (issue #5 lock + issue #25 bg line-break).  cli_out_begin takes
+ * the output lock (the FOREGROUND's for a bg-job worker, so its output serialises
+ * against the fg line editor) and, for a job's FIRST output since the prompt was
+ * drawn, emits a "\r\n" break and marks the fg's render dirty so the next
+ * keystroke repaints prompt+line below the bg output.  Returns 0 locked, <0 if
+ * the lock could not be taken (tx_failed set).  cli_out_end releases the lock.
+ * The public output API (cli_print/cli_write/...) and the UART _write retarget
+ * bracket every output call with this pair instead of raw cli_lock/cli_unlock.
+ */
+int  cli_out_begin(struct cli_instance *sh);
+void cli_out_end(struct cli_instance *sh);
 
 /* Staging primitives (cli_printf.c): append one byte (autoflush when full) and
  * flush the staging buffer through cli_tx_send_blocking. */

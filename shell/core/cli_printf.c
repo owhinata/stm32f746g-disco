@@ -218,6 +218,34 @@ static void cli_vprintf(struct cli_instance *sh, const char *fmt, va_list ap)
 	}
 }
 
+/* ---- output bracket (lock + bg line-break, issues #5/#25) --------------- */
+
+int cli_out_begin(struct cli_instance *sh)
+{
+	if (cli_lock(sh) != 0) {
+		sh->tx_failed = 1;      /* so the command result is forced non-zero */
+		return -1;
+	}
+	/* Background job (issue #25): on the FIRST output since the foreground prompt
+	 * was last (re)drawn, break to a fresh line so this output does not splice
+	 * into the user's half-typed line, and invalidate the fg's render bookkeeping
+	 * (old_rows/draw_row = 0 -> "draw at the cursor, do not erase") so the fg
+	 * repaints prompt+line below this output on its next keystroke.  Best-effort:
+	 * a dropped break just leaves the staged output to set tx_failed as usual. */
+	if (sh->fg != NULL && sh->fg->render_dirty == 0) {
+		cli_tx_send_blocking(sh, (const uint8_t *)"\r\n", 2);
+		sh->fg->old_rows     = 0;
+		sh->fg->draw_row     = 0;
+		sh->fg->render_dirty = 1;
+	}
+	return 0;
+}
+
+void cli_out_end(struct cli_instance *sh)
+{
+	cli_unlock(sh);
+}
+
 /* ---- public API -------------------------------------------------------- */
 
 /* Bracket a formatted call with lock + autoflush; @p color is "" for cli_print
@@ -225,16 +253,14 @@ static void cli_vprintf(struct cli_instance *sh, const char *fmt, va_list ap)
 static int vemit(struct cli_instance *sh, const char *color,
                  const char *fmt, va_list ap)
 {
-	if (cli_lock(sh) != 0) {
-		sh->tx_failed = 1;      /* so the command result is forced non-zero */
+	if (cli_out_begin(sh) != 0)
 		return -1;
-	}
 	if (color[0]) out_str(sh, color);
 	cli_vprintf(sh, fmt, ap);
 	if (color[0]) out_str(sh, CLI_VT100_RESET);
 	cli_out_flush(sh);
 	int r = sh->tx_failed ? -1 : 0;
-	cli_unlock(sh);
+	cli_out_end(sh);
 	return r;
 }
 
@@ -273,15 +299,13 @@ int cli_info(struct cli_instance *sh, const char *fmt, ...)
 int cli_write(struct cli_instance *sh, const void *data, size_t len)
 {
 	const uint8_t *p = (const uint8_t *)data;
-	if (cli_lock(sh) != 0) {
-		sh->tx_failed = 1;
+	if (cli_out_begin(sh) != 0)
 		return -1;
-	}
 	for (size_t i = 0; i < len; i++)
 		cli_out_putc(sh, (char)p[i]);
 	cli_out_flush(sh);
 	int r = sh->tx_failed ? -1 : 0;
-	cli_unlock(sh);
+	cli_out_end(sh);
 	return r;
 }
 
@@ -291,17 +315,15 @@ int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
 	const uint8_t *p = (const uint8_t *)data;
 	char body[20];
 
-	if (cli_lock(sh) != 0) {
-		sh->tx_failed = 1;
+	if (cli_out_begin(sh) != 0)
 		return -1;
-	}
 
 	for (size_t off = 0; off < len; off += 16) {
 		/* Ctrl+C between rows: stop before emitting the next 16-byte line
 		 * (issue #16).  Drop the staged tail and release the lock; the
 		 * dispatcher detects cancel_req and prints "^C". */
 		if (cli_cancel_requested(sh)) {
-			cli_unlock(sh);
+			cli_out_end(sh);
 			return -1;
 		}
 
@@ -329,7 +351,7 @@ int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
 
 	cli_out_flush(sh);
 	int r = sh->tx_failed ? -1 : 0;
-	cli_unlock(sh);
+	cli_out_end(sh);
 	return r;
 }
 

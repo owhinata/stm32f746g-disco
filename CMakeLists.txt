@@ -146,6 +146,7 @@ add_library(shell_obj OBJECT
     "${CMAKE_SOURCE_DIR}/shell/core/cli_complete.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_edit.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_history.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_job.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_parse.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_printf.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_session.c"
@@ -194,6 +195,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_coremark.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sleep.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_watch.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c"  # EPK (issue #19 cpu%)
     ${TX_CORE}
@@ -209,7 +211,8 @@ target_include_directories(threadx PRIVATE
 target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE
     CLI_ENABLE_DANGEROUS_CMDS=$<BOOL:${CLI_ENABLE_DANGEROUS_CMDS}>
     CLI_DEVMEM_DUMP_MAX_LEN=${CLI_DEVMEM_DUMP_MAX_LEN}
-    CLI_INSTANCE_STACK_SIZE=4096)         # headroom: coremark runs in this thread
+    CLI_INSTANCE_STACK_SIZE=4096          # headroom: coremark runs in this thread
+    CLI_BG_JOB_STACK_SIZE=4096)           # ... and in a bg worker: coremark & (issue #25)
 target_compile_options(threadx PRIVATE -O2)
 target_link_options(threadx PRIVATE -u _printf_float)   # CoreMark %f score line
 firmware_finalize(threadx)

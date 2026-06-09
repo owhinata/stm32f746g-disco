@@ -69,6 +69,7 @@ nav:
       - rtos/shell-devmem.md
       - rtos/shell-coremark.md
       - rtos/shell-sleep-watch.md
+      - rtos/shell-jobs.md
 
 markdown_extensions:
   - admonition

@@ -113,6 +113,13 @@ struct cli_instance {
 
 	struct cli_transport *tr;
 
+	/* Background job link (issue #25).  NULL for an interactive instance; for a
+	 * bg-job worker instance it points at the launching foreground shell.  When
+	 * set, the output path (cli_lock / cli_tx_send_blocking TX-wait) targets the
+	 * FOREGROUND's tx_lock + transport so bg output serialises against the fg
+	 * line editor; cancel is kill-driven (the worker never drains the shared RX). */
+	struct cli_instance *fg;
+
 	/* Line input + cursor (issue #9: cur is split out from len for in-line edit). */
 	char     line[CLI_CMD_BUFFER_SIZE];
 	uint16_t len;                    /**< chars in line[]; line[len] kept NUL */
@@ -148,6 +155,10 @@ struct cli_instance {
 	uint8_t  tab_list_armed;         /**< Tab completion (issue #11): 1 = next Tab lists candidates;
 	                                  *   set after an LCP-only extend or a no-extend first Tab,
 	                                  *   reset by any non-Tab byte (bash-style two-stage). */
+	volatile uint8_t render_dirty;   /**< issue #25: bg output broke this instance's input-line
+	                                  *   render (old_rows/draw_row reset to 0 under tx_lock); the
+	                                  *   fg thread repaints prompt+line in cli_input_byte() BEFORE
+	                                  *   the next byte (incl. the fast-append path) and clears it. */
 
 	char prompt[CLI_PROMPT_BUFFER_SIZE];
 
@@ -215,6 +226,23 @@ void cli_transport_notify_tx(struct cli_instance *sh);   /* reserved for #5 */
 int                  cli_register_thread(TX_THREAD *t, struct cli_instance *sh);
 void                 cli_unregister_thread(TX_THREAD *t);
 struct cli_instance *cli_current_instance(void);
+
+/* Background jobs (#25, cli_job.c).  `cmd &` runs the command in a worker thread
+ * drawn from a fixed static pool.  cli_job_pool_init() creates the pool's event
+ * groups once at boot (call after the interactive instances start).  The other
+ * entry points run on the foreground thread: cli_job_launch() spawns a worker
+ * for an already-`&`-stripped segment (returns 0 on success, <0 if the pool /
+ * thread registry is full -- it prints its own error); cli_jobs_reap() deletes
+ * any completed workers (TX_COMPLETED) and prints their done/killed notice;
+ * cli_jobs_print() is the `jobs` listing; cli_job_kill() requests a cooperative
+ * stop of the running job with id @p id (returns 0 if found+signalled, <0 if no
+ * such running job).  cli_job_launch / cli_jobs_reap are also referenced by the
+ * ThreadX-free cli_session.c, so the host test harness stubs them. */
+void cli_job_pool_init(void);
+int  cli_job_launch(struct cli_instance *fg, char *seg);
+void cli_jobs_reap(struct cli_instance *fg);
+void cli_jobs_print(struct cli_instance *sh);
+int  cli_job_kill(struct cli_instance *sh, unsigned long id);
 
 #ifdef __cplusplus
 }
