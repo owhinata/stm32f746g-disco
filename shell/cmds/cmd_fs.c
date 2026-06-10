@@ -403,6 +403,7 @@ static int do_fs_mkdir(struct cli_instance *sh, int argc, char **argv)
 static int do_fs_info(struct cli_instance *sh, int argc, char **argv)
 {
 	FX_MEDIA *media;
+	LX_NOR_FLASH *lx;
 	ULONG avail = 0, total_bytes, clusters;
 	UINT status;
 
@@ -433,6 +434,15 @@ static int do_fs_info(struct cli_instance *sh, int argc, char **argv)
 	                          media->fx_media_bytes_per_sector));
 	cli_print(sh, "total    : %lu KiB\r\n", (unsigned long)(total_bytes / 1024u));
 	cli_print(sh, "free     : %lu KiB\r\n", (unsigned long)(avail / 1024u));
+
+	/* Wear-leveling visibility (issue #31): LevelX keeps per-block erase
+	 * counts in the block headers and tracks min/max live (updated at open
+	 * and on every reclaim), so the spread shows leveling at work. */
+	lx = fx_lx_nor_flash();
+	if (lx != NULL)
+		cli_print(sh, "wear     : erase count min %lu / max %lu\r\n",
+		          (unsigned long)lx->lx_nor_flash_minimum_erase_count,
+		          (unsigned long)lx->lx_nor_flash_maximum_erase_count);
 	return 0;
 }
 

@@ -4,7 +4,7 @@
  */
 /**
  * @file    qspi_flash.c
- * @brief   QSPI NOR flash driver (N25Q128A / MT25QL128) -- indirect mode, 1-1-1.
+ * @brief   QSPI NOR flash driver (N25Q128A / MT25QL128) -- indirect mode.
  *
  * See qspi_flash.h for the API contract (thread-context only, per-operation
  * mutex, no memory-mapped access).  Hardware setup:
@@ -31,9 +31,11 @@
 #define LOG_TAG "qspi"
 #include "log.h"
 
-/* N25Q128A command set (datasheet/ST component values; 1-1-1 only). */
+/* N25Q128A command set (datasheet/ST component values).  All 1-1-1 except
+ * 0x6B, which returns data on 4 lines (instruction/address stay 1-line). */
 #define CMD_READ_ID        0x9Fu
-#define CMD_FAST_READ      0x0Bu   /* 8 dummy cycles @ <=108 MHz */
+#define CMD_FAST_READ      0x0Bu   /* 1-1-1, 8 dummy cycles @ <=108 MHz */
+#define CMD_QUAD_READ      0x6Bu   /* FAST READ QUAD OUTPUT, 1-1-4      */
 #define CMD_WRITE_ENABLE   0x06u
 #define CMD_PAGE_PROGRAM   0x02u
 #define CMD_ERASE_SUB      0x20u   /*  4 KB */
@@ -42,6 +44,8 @@
 #define CMD_READ_SR        0x05u
 #define CMD_READ_FSR       0x70u
 #define CMD_CLEAR_FSR      0x50u
+#define CMD_READ_VCR       0x85u   /* volatile configuration register */
+#define CMD_WRITE_VCR      0x81u
 
 #define SR_WIP             0x01u
 #define FSR_PROT_ERR       0x02u
@@ -50,7 +54,13 @@
 #define FSR_ERASE_ERR      0x20u
 #define FSR_ANY_ERR        (FSR_PROT_ERR | FSR_VPP_ERR | FSR_PGM_ERR | FSR_ERASE_ERR)
 
-#define DUMMY_CYCLES_READ  8u
+#define DUMMY_CYCLES_READ   8u    /* device default for 0x0B (VCR[7:4]=0xF) */
+#define DUMMY_CYCLES_QUAD   10u   /* 0x6B needs 10 -> programmed into VCR   */
+
+/* VCR targets: [7:4] dummy cycles, bit3 XIP disable, [1:0] wrap (default).
+ * Power-on default is 0xFB (dummy = per-command default). */
+#define VCR_QUAD_TARGET    ((uint8_t)((DUMMY_CYCLES_QUAD << 4) | 0x0Bu))  /* 0xAB */
+#define VCR_DEFAULT        0xFBu
 
 /* WIP-wait ceilings (datasheet max + margin). */
 #define TIMEOUT_PAGE_MS       20u      /* page program max 5 ms      */
@@ -61,6 +71,8 @@
 static QSPI_HandleTypeDef hqspi;
 static TX_MUTEX qspi_lock;
 static int qspi_ready;   /* set once by qspi_flash_init() */
+static int quad_mode;    /* reads use 0x6B / 4 data lines       */
+static uint8_t read_dummy = DUMMY_CYCLES_READ;   /* tracks the VCR setting */
 
 static const struct qspi_flash_info flash_info = {
 	.size           = QSPI_FLASH_SIZE,
@@ -199,6 +211,64 @@ static int write_enable(void)
 	return (sr & 0x02u) ? 0 : QSPI_FLASH_ERR_FLASH;
 }
 
+/* Verified register write (1 data byte): WREN (WEL checked) -> instruction +
+ * byte -> WIP wait -> read @p readback_cmd and require @p value came back. */
+static int write_reg_verified(uint8_t instruction, uint8_t readback_cmd,
+                              uint8_t value)
+{
+	QSPI_CommandTypeDef c;
+	uint8_t check = 0;
+	int rc;
+
+	rc = write_enable();
+	if (rc != 0)
+		return rc;
+	cmd_init(&c, instruction);
+	c.DataMode = QSPI_DATA_1_LINE;
+	c.NbData   = 1;
+	if (HAL_QSPI_Command(&hqspi, &c, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK)
+		return QSPI_FLASH_ERR_HAL;
+	if (HAL_QSPI_Transmit(&hqspi, &value, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK)
+		return QSPI_FLASH_ERR_HAL;
+	rc = wait_ready(TIMEOUT_PAGE_MS, 0);
+	if (rc != 0)
+		return rc;
+	rc = read_reg(readback_cmd, &check, 1);
+	if (rc != 0)
+		return rc;
+	return (check == value) ? 0 : QSPI_FLASH_ERR_FLASH;
+}
+
+/*
+ * Move the volatile configuration register to dummy = 10 so FAST READ QUAD
+ * OUTPUT (0x6B) is usable, verified by read-back.  The VCR is volatile: a
+ * power cycle restores the default, a warm reset (SYSRESETREQ) does not reset
+ * the flash, so this runs idempotently every boot.  If the quad value cannot
+ * be verified, the default is written back -- also verified -- and reads stay
+ * on the 1-line / 8-dummy path.  Returns nonzero only when the VCR cannot be
+ * brought into either known state (driver/flash dummy timing would diverge);
+ * init then fails rather than publish a driver with unknown read timing.
+ * Called from init before qspi_ready is published (no locking needed).
+ */
+static int quad_setup(void)
+{
+	if (write_reg_verified(CMD_WRITE_VCR, CMD_READ_VCR, VCR_QUAD_TARGET) == 0) {
+		quad_mode  = 1;
+		read_dummy = DUMMY_CYCLES_QUAD;
+		return 0;
+	}
+
+	LOG_WRN("VCR quad setup failed; falling back to 1-line read");
+	if (write_reg_verified(CMD_WRITE_VCR, CMD_READ_VCR, VCR_DEFAULT) == 0) {
+		quad_mode  = 0;
+		read_dummy = DUMMY_CYCLES_READ;
+		return 0;
+	}
+
+	LOG_ERR("VCR in unknown state; QSPI disabled");
+	return QSPI_FLASH_ERR_FLASH;
+}
+
 /* Common erase path: WREN -> erase cmd -> WIP wait (yielding) -> FSR check. */
 static int erase_common(uint8_t instruction, int has_addr, uint32_t addr,
                         uint32_t timeout_ms)
@@ -287,9 +357,24 @@ int qspi_flash_init(void)
 		return QSPI_FLASH_ERR_HAL;
 	}
 
+	/* Quad-read bring-up (issue #31) -- register traffic only, still before
+	 * qspi_ready so no other caller can interleave.  Fails the whole init if
+	 * the VCR cannot reach a known state (read timing would be undefined). */
+	if (quad_setup() != 0) {
+		HAL_QSPI_DeInit(&hqspi);
+		tx_mutex_delete(&qspi_lock);
+		return QSPI_FLASH_ERR_FLASH;
+	}
+
 	qspi_ready = 1;
-	LOG_INF("QUADSPI up: 54 MHz, 1-line, indirect mode");
+	LOG_INF("QUADSPI up: 54 MHz, %s read, indirect mode",
+	        quad_mode ? "quad (0x6B)" : "1-line (0x0B)");
 	return 0;
+}
+
+int qspi_flash_quad_enabled(void)
+{
+	return quad_mode;
 }
 
 int qspi_flash_read_id(uint8_t id[3])
@@ -330,12 +415,12 @@ int qspi_flash_read(uint32_t addr, void *buf, uint32_t len)
 	if (rc != 0)
 		return rc;
 
-	cmd_init(&c, CMD_FAST_READ);
+	cmd_init(&c, quad_mode ? CMD_QUAD_READ : CMD_FAST_READ);
 	c.Address     = addr;
 	c.AddressMode = QSPI_ADDRESS_1_LINE;
-	c.DataMode    = QSPI_DATA_1_LINE;
+	c.DataMode    = quad_mode ? QSPI_DATA_4_LINES : QSPI_DATA_1_LINE;
 	c.NbData      = len;
-	c.DummyCycles = DUMMY_CYCLES_READ;
+	c.DummyCycles = read_dummy;
 	if (HAL_QSPI_Command(&hqspi, &c, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK)
 		rc = QSPI_FLASH_ERR_HAL;
 	else if (HAL_QSPI_Receive(&hqspi, buf, HAL_QSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK)

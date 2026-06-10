@@ -28,18 +28,18 @@ This is Phase A (#29) of the QSPI NOR + LevelX + FileX filesystem foundation (Ep
 | Sampling | half-cycle shift | same as the ST BSP |
 | CS high time | 6 cycles (≥50 ns) | device requirement |
 
-## Command set (all 1-1-1)
+## Command set
 
 | Operation | opcode | Notes |
 |-----------|--------|-------|
 | JEDEC ID | 0x9F | expect `20 BA 18` |
-| Read | 0x0B FAST_READ | 8 dummy cycles (power-on default; no config-register write needed) |
+| **Read** | **0x6B FAST READ QUAD OUTPUT (1-1-4)** | **10 dummy cycles (init programs VCR[7:4] and verifies by read-back, #31); falls back to 0x0B (1-1-1, dummy 8) on failure** |
 | Write enable | 0x06 | before every program/erase; WEL latch verified by read-back |
-| Page program | 0x02 | 256 B unit; the driver splits at page boundaries automatically |
+| Page program | 0x02 | 256 B unit, 1-1-1; the driver splits at page boundaries automatically |
 | Erase | 0x20 (4 KB) / 0xD8 (64 KB) / 0xC7 (chip) | typ 0.25 s / 0.7 s / minutes |
 | Status | 0x05 (WIP poll), 0x70 Flag Status (P_ERR/E_ERR check, cleared via 0x50) | failures are invisible in WIP alone, so the FSR is checked after every program/erase |
 
-Quad read (0x6B) is planned as Epic #27 Phase C.
+The VCR (volatile configuration register) reverts to its default on a power cycle, so init programs it every boot (a warm reset leaves the flash untouched; the rewrite is idempotent). The VCR dummy setting applies to the whole fast-read family, so the 0x0B fallback also issues a dummy count consistent with the VCR. The active mode shows in `qspi info` (`read` line). 0xEB (1-4-4, the ST BSP's choice) is not used — its address phase runs on 4 lines too.
 
 ## Locking and thread context
 

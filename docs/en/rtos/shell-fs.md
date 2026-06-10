@@ -34,6 +34,7 @@ fat      : FAT16 (32104 clusters)
 cluster  : 512 B
 total    : 16052 KiB
 free     : 16051 KiB
+wear     : erase count min 1 / max 2
 sh> reboot
 ...
 sh> fs cat /config/app.ini    # still readable after reboot (persistence)
@@ -51,3 +52,4 @@ hello world
 - **Ownership model**: normal fs commands hold a shared slot; `fs format` / `fs umount` / `qspi erase/test` take exclusive ownership. While an fs command is running, format/umount fail with `busy` (and vice versa), so the media can never be yanked away mid-command
 - **Interaction with `qspi erase/test`**: refused while mounted; run `fs umount` first
 - File names are FAT 8.3 + long names; `fs ls` prints the name stored in the FAT
+- **The `wear` line in `fs info`** (#31): min/max of the per-block erase counts LevelX keeps in the block headers. They grow as LevelX reclaims blocks during operation (e.g. repeated updates of the same file), with wear leveling keeping the spread small. **`fs format full` is a raw chip erase, so it wipes the history too** (counts restart at 1); a quick format (without `full`) preserves it

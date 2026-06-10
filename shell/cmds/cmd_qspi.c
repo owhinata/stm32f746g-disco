@@ -27,6 +27,8 @@
 #include "fs_glue.h"
 #include "qspi_flash.h"
 
+#include "stm32f7xx_hal.h"   /* HAL_GetTick for the self-test timing */
+
 #include <stdint.h>
 #include <string.h>
 
@@ -115,8 +117,12 @@ static int cmd_qspi_info(struct cli_instance *sh, int argc, char **argv)
 	          (unsigned long)(fi->subsector_size / 1024u));
 	cli_print(sh, "page      : %lu B (program 0x02)\r\n",
 	          (unsigned long)fi->page_size);
-	cli_print(sh, "sclk      : %lu MHz, 1-line, indirect mode\r\n",
+	cli_print(sh, "sclk      : %lu MHz, indirect mode\r\n",
 	          (unsigned long)(fi->sclk_hz / 1000000u));
+	cli_print(sh, "read      : %s\r\n",
+	          qspi_flash_quad_enabled()
+	                  ? "quad output 0x6B (1-1-4, dummy 10)"
+	                  : "fast read 0x0B (1-1-1, dummy 8)");
 
 	rc = qspi_flash_read_status(&sr);
 	if (rc != 0) {
@@ -219,7 +225,7 @@ static int cmd_qspi_erase(struct cli_instance *sh, int argc, char **argv)
 static int qspi_test_run(struct cli_instance *sh, uint32_t addr)
 {
 	uint8_t buf[QSPI_FLASH_PAGE_SIZE];
-	uint32_t off, i;
+	uint32_t off, i, t0;
 	int rc;
 
 	cli_print(sh, "erase 4 KB at 0x%08lx...\r\n", (unsigned long)addr);
@@ -260,6 +266,7 @@ static int qspi_test_run(struct cli_instance *sh, uint32_t addr)
 		}
 	}
 
+	t0 = HAL_GetTick();
 	for (off = 0; off < QSPI_FLASH_SUBSECTOR_SIZE; off += sizeof buf) {
 		if (cli_cancel_requested(sh))
 			return 1;
@@ -278,6 +285,9 @@ static int qspi_test_run(struct cli_instance *sh, uint32_t addr)
 			}
 		}
 	}
+	cli_print(sh, "read+verify 4 KB in %lu ms (%s)\r\n",
+	          (unsigned long)(HAL_GetTick() - t0),
+	          qspi_flash_quad_enabled() ? "quad 0x6B" : "1-line 0x0B");
 
 	cli_print(sh, "PASS: erase/program/verify 4 KB at 0x%08lx\r\n",
 	          (unsigned long)addr);

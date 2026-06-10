@@ -10,8 +10,9 @@
  * QUADSPI controller, in *indirect* mode only (polled HAL transfers through the
  * controller FIFO; no DMA, no memory-mapped window at 0x90000000).  Because no
  * CPU access ever touches the memory-mapped region, the D-cache needs no
- * maintenance here.  Every command runs 1-1-1 (single line); quad read is a
- * planned follow-up (#27 Phase C).
+ * maintenance here.  Reads run 1-1-4 (FAST READ QUAD OUTPUT 0x6B, issue #31)
+ * once init verifies the VCR dummy-cycle setup, with a 1-1-1 (0x0B) fallback;
+ * all other commands (id/status/program/erase) stay 1-1-1.
  *
  * Concurrency: every public call serializes on an internal ThreadX mutex for the
  * whole flash operation (write-enable -> command -> busy-wait -> error check), so
@@ -63,8 +64,15 @@ int qspi_flash_init(void);
 /** Read the 3-byte JEDEC ID (0x9F); expect 20 BA 18. */
 int qspi_flash_read_id(uint8_t id[3]);
 
-/** Read @p len bytes from @p addr (FAST_READ 0x0B, 8 dummy cycles). */
+/**
+ * Read @p len bytes from @p addr.  Uses FAST READ QUAD OUTPUT (0x6B, 1-1-4,
+ * 10 dummy cycles via the VCR -- configured and verified by init) when quad
+ * mode came up, falling back to FAST_READ (0x0B, 1-1-1, 8 dummy) otherwise.
+ */
 int qspi_flash_read(uint32_t addr, void *buf, uint32_t len);
+
+/** Nonzero when reads run on 4 data lines (0x6B); 0 = 1-line fallback. */
+int qspi_flash_quad_enabled(void);
 
 /**
  * Program @p len bytes at @p addr.  Split internally at 256 B page boundaries;

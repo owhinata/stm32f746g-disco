@@ -34,6 +34,7 @@ fat      : FAT16 (32104 clusters)
 cluster  : 512 B
 total    : 16052 KiB
 free     : 16051 KiB
+wear     : erase count min 1 / max 2
 sh> reboot
 ...
 sh> fs cat /config/app.ini    # reboot 後も読める（永続性）
@@ -51,3 +52,4 @@ hello world
 - **排他モデル**: 通常の fs コマンドは shared、`fs format` / `fs umount` / `qspi erase/test` は exclusive。実行中の fs コマンドがあると format/umount は `busy` エラーになり（逆も同様）、媒体をコマンド途中で奪われることはない
 - **`qspi erase/test` との関係**: mounted 中は拒否される。`fs umount` してから実行する
 - ファイル名は FAT の 8.3 + long name。`fs ls` の表示は FAT に保存された名前
+- **`fs info` の `wear` 行**（#31）: LevelX がブロックヘッダに保持する消去回数の min/max。運用中（同一ファイルの繰返し更新等）に LevelX の reclaim がブロックを消去するたびに増え、wear leveling により分散は小さく保たれる。**`fs format full` は raw 全消去のため履歴ごとリセット**（min/max=1 から再開）。`full` なしの quick format は履歴を保全する

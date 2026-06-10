@@ -53,7 +53,7 @@ media cache は 4 KB（512 B × 8 セクタ）static。LevelX の sector buffer 
 ## 制約・注意
 
 - `fs format full` は 256 ブロックを順に消去（typ ~3 分 / max ~13 分）。進捗表示あり、ブロック間で Ctrl+C 可。**キャンセルすると未フォーマットのまま残る**（再実行が必要）
-- `full` なしの `fs format` は LevelX 構造が健全なら消去をスキップ（数秒、消去回数の履歴も保全）
+- `full` なしの `fs format` は LevelX 構造が健全なら消去をスキップ（数秒、消去回数の履歴も保全）。`full` は raw 全消去のため消去回数の履歴もリセットされる
 - mounted 中は `qspi erase` / `qspi test` が拒否される。`fs umount` が正規の退避経路
 - 電源断（書込み中断）耐性は **MVP スコープ外**
 

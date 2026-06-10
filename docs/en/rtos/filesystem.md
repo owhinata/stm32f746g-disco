@@ -53,7 +53,7 @@ The media cache is a static 4 KB (8 × 512 B sectors); the LevelX sector/verify 
 ## Constraints / notes
 
 - `fs format full` erases the 256 blocks in sequence (typ ~3 min / max ~13 min), with progress output and Ctrl+C honored between blocks. **A cancelled format leaves the device unformatted** (rerun it)
-- `fs format` without `full` skips the erase when the LevelX structures are intact (seconds; also preserves erase-count history)
+- `fs format` without `full` skips the erase when the LevelX structures are intact (seconds; also preserves erase-count history). `full` is a raw chip erase and resets the erase-count history with it
 - While mounted, `qspi erase` / `qspi test` are refused; `fs umount` is the supported escape hatch
 - Power-loss-during-write integrity is **out of MVP scope**
 

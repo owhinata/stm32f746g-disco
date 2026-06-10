@@ -28,18 +28,18 @@ QSPI NOR + LevelX + FileX ファイルシステム基盤（Epic #27）の Phase 
 | サンプリング | 1/2 サイクルシフト | ST BSP と同設定 |
 | CS high time | 6 サイクル（≥50 ns） | デバイス要件 |
 
-## コマンドセット（全て 1-1-1）
+## コマンドセット
 
 | 操作 | opcode | 備考 |
 |------|--------|------|
 | JEDEC ID | 0x9F | 期待値 `20 BA 18` |
-| Read | 0x0B FAST_READ | dummy 8 サイクル（電源投入時デフォルト、設定レジスタ変更不要） |
+| **Read** | **0x6B FAST READ QUAD OUTPUT（1-1-4）** | **dummy 10（init が VCR[7:4] に設定・read-back 検証、#31）。失敗時は 0x0B（1-1-1, dummy 8）に fallback** |
 | Write enable | 0x06 | program/erase 前に毎回。WEL ラッチを read-back 確認 |
-| Page program | 0x02 | 256 B 単位。ドライバがページ境界で自動分割 |
+| Page program | 0x02 | 256 B 単位、1-1-1。ドライバがページ境界で自動分割 |
 | Erase | 0x20（4 KB）/ 0xD8（64 KB）/ 0xC7（全チップ） | typ 0.25 s / 0.7 s / 数分 |
 | Status | 0x05（WIP ポーリング）、0x70 Flag Status（P_ERR/E_ERR 確認、0x50 でクリア） | エラーは WIP では区別できないため FSR を毎回確認 |
 
-quad read（0x6B）は Epic #27 Phase C で追加予定。
+VCR（volatile configuration register）は電源断でデフォルトに戻るため毎 boot 設定する（warm reset では flash 側は保持されるが、再書込みは冪等）。VCR の dummy 設定は fast read 系コマンド全体に効くので、fallback の 0x0B も VCR と整合する dummy 数で発行する。現在のモードは `qspi info` の `read` 行で確認できる。0xEB（1-4-4、ST BSP の選択）は address も 4 線になるため採用していない。
 
 ## 排他とスレッド文脈
 
