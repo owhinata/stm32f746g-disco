@@ -35,6 +35,7 @@
 #include "cli_instance.h"
 #include "cli_backend_uart.h"
 #include "qspi_flash.h"
+#include "fs_glue.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -124,6 +125,10 @@ void tx_application_define(void *first_unused_memory)
 	 * the `qspi` command reports "driver not initialized"; nothing else stops. */
 	if (qspi_flash_init() != 0)
 		printf("qspi: init failed (qspi command disabled)\r\n");
+
+	/* Filesystem glue (issue #30): mount mutex + fx_system_initialize only;
+	 * the media itself mounts lazily on the first `fs` command. */
+	fs_glue_init();
 
 	/* Timer lists exist now: let the SysTick ISR drive ThreadX. */
 	tx_glue_timer_enable();

@@ -14,3 +14,9 @@
 [submodule "lib/threadx"]
 	path = lib/threadx
 	url = https://github.com/eclipse-threadx/threadx
+[submodule "lib/filex"]
+	path = lib/filex
+	url = https://github.com/eclipse-threadx/filex
+[submodule "lib/levelx"]
+	path = lib/levelx
+	url = https://github.com/eclipse-threadx/levelx

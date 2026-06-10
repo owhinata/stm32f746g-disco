@@ -12,8 +12,10 @@
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
-# Fetch HAL/CMSIS/CoreMark/ThreadX submodules if they are missing.
-if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32f7xx_hal_driver/Src/stm32f7xx_hal.c")
+# Fetch HAL/CMSIS/CoreMark/ThreadX/FileX/LevelX submodules if any is missing
+# (the filex check also re-fetches existing checkouts that predate issue #30).
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32f7xx_hal_driver/Src/stm32f7xx_hal.c"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/filex/common/src/fx_media_open.c")
     message(STATUS "Initializing git submodules ...")
     execute_process(
         COMMAND git submodule update --init --recursive
@@ -131,6 +133,19 @@ list(FILTER TX_CORE EXCLUDE REGEX "tx_misra\\.c$")
 file(GLOB TX_ASM "${TX_PORT}/src/*.S")
 list(FILTER TX_ASM EXCLUDE REGEX "tx_misra\\.S$")
 
+# --- FileX + LevelX (QSPI NOR filesystem, issue #30 / epic #27) -------------
+# Same pattern as ThreadX: GLOB the cores, configure via port/<lib>/<x>_user.h
+# headers (FX/LX_INCLUDE_USER_DEFINE_FILE below).  NAND support and the RAM
+# simulator/demo drivers are excluded -- this firmware is NOR-only (lx_nor_*)
+# and ships its own driver glue in port/levelx + port/filex.  gc-sections
+# drops the unused FileX feature paths from the final image.
+set(FX_DIR "${CMAKE_SOURCE_DIR}/lib/filex")
+set(LX_DIR "${CMAKE_SOURCE_DIR}/lib/levelx")
+file(GLOB FX_CORE "${FX_DIR}/common/src/*.c")
+list(FILTER FX_CORE EXCLUDE REGEX "simulat")            # RAM-disk demo drivers
+file(GLOB LX_CORE "${LX_DIR}/common/src/*.c")
+list(FILTER LX_CORE EXCLUDE REGEX "lx_nand|simulat")    # NOR only
+
 # --- App: threadx (the interactive ThreadX CLI shell) ----------------------
 # The single firmware: the ThreadX CLI shell over the USART1 VCP.  Uses the
 # ThreadX core/port set up above and omits src/stm32f7xx_it.c because ThreadX
@@ -202,21 +217,33 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_watch.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_qspi.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_fs.c"
     "${CMAKE_SOURCE_DIR}/port/qspi/qspi_flash.c"
+    "${CMAKE_SOURCE_DIR}/port/levelx/lx_nor_qspi_driver.c"
+    "${CMAKE_SOURCE_DIR}/port/filex/fx_lx_nor_driver.c"
+    "${CMAKE_SOURCE_DIR}/port/filex/fs_glue.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c"  # EPK (issue #19 cpu%)
     ${TX_CORE}
-    ${TX_ASM})
+    ${TX_ASM}
+    ${FX_CORE}
+    ${LX_CORE})
 target_link_libraries(threadx PRIVATE common shell_obj coremark_obj)
 target_include_directories(threadx PRIVATE
     "${TX_DIR}/common/inc" "${TX_PORT}/inc"
     "${TX_DIR}/utility/execution_profile_kit"   # EPK header (issue #19 cpu%)
     "${CMAKE_SOURCE_DIR}/port/threadx"
     "${CMAKE_SOURCE_DIR}/port/qspi"
+    "${FX_DIR}/common/inc" "${FX_DIR}/ports/cortex_m7/gnu/inc"
+    "${LX_DIR}/common/inc"
+    "${CMAKE_SOURCE_DIR}/port/filex"
+    "${CMAKE_SOURCE_DIR}/port/levelx"
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
     "${CMAKE_SOURCE_DIR}/shell/backend")  # CLI_BACKEND_*_DEFINE macros
 target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE
+    FX_INCLUDE_USER_DEFINE_FILE           # port/filex/fx_user.h  (issue #30)
+    LX_INCLUDE_USER_DEFINE_FILE           # port/levelx/lx_user.h (issue #30)
     CLI_ENABLE_DANGEROUS_CMDS=$<BOOL:${CLI_ENABLE_DANGEROUS_CMDS}>
     CLI_DEVMEM_DUMP_MAX_LEN=${CLI_DEVMEM_DUMP_MAX_LEN}
     CLI_INSTANCE_STACK_SIZE=4096          # headroom: coremark runs in this thread
