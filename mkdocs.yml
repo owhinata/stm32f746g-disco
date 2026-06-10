@@ -50,6 +50,7 @@ nav:
   - Home: index.md
   - ハードウェア:
       - hardware/board.md
+      - hardware/qspi-flash.md
   - ビルド:
       - build/cmake.md
   - RTOS:

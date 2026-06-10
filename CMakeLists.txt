@@ -201,6 +201,8 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sleep.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_watch.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_qspi.c"
+    "${CMAKE_SOURCE_DIR}/port/qspi/qspi_flash.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c"  # EPK (issue #19 cpu%)
     ${TX_CORE}
@@ -210,6 +212,7 @@ target_include_directories(threadx PRIVATE
     "${TX_DIR}/common/inc" "${TX_PORT}/inc"
     "${TX_DIR}/utility/execution_profile_kit"   # EPK header (issue #19 cpu%)
     "${CMAKE_SOURCE_DIR}/port/threadx"
+    "${CMAKE_SOURCE_DIR}/port/qspi"
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
     "${CMAKE_SOURCE_DIR}/shell/backend")  # CLI_BACKEND_*_DEFINE macros
