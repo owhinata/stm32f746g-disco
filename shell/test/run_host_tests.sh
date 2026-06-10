@@ -60,7 +60,7 @@ gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
     -DCLI_USE_COLOR=0 \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
     "$here/test_core.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_core"
 "$out/test_core"
@@ -75,7 +75,7 @@ gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
 # unused dispatch/prompt code is dropped by --gc-sections.
 gcc $CFLAGS \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
-    "$here/test_output.c" "$core/cli_printf.c" "$core/cli_session.c" \
+    "$here/test_output.c" "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_session.c" \
     $glue \
     $LDFLAGS -o "$out/test_output"
 "$out/test_output"
@@ -89,7 +89,7 @@ gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
     -DCLI_USE_COLOR=0 \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
     "$here/test_integration.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_integration"
 "$out/test_integration"
@@ -104,7 +104,7 @@ gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
 gcc $CFLAGS -DCLI_USE_COLOR=0 \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
     "$here/test_edit.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_edit"
 "$out/test_edit"
@@ -118,7 +118,7 @@ gcc $CFLAGS -DCLI_USE_COLOR=0 \
 gcc $CFLAGS -DCLI_USE_COLOR=0 -DCLI_HISTORY_BUFFER_SIZE=32 \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
     "$here/test_history.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_history"
 "$out/test_history"
@@ -140,7 +140,7 @@ gcc $CFLAGS -I "$backend" \
 gcc $CFLAGS -DCLI_USE_COLOR=0 \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
     "$here/test_complete.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_complete"
 "$out/test_complete"
@@ -151,7 +151,7 @@ gcc $CFLAGS -DCLI_USE_COLOR=0 \
 gcc $CFLAGS -DCLI_USE_COLOR=0 -DCLI_CMD_BUFFER_SIZE=8 -DTEST_COMPLETE_SMALL_BUF \
     $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
     "$here/test_complete.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_complete_smallbuf"
 "$out/test_complete_smallbuf"

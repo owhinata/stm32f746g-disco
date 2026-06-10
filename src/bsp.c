@@ -11,6 +11,9 @@
 #include "bsp.h"
 #include <stdio.h>
 
+#define LOG_TAG "bsp"
+#include "log.h"
+
 UART_HandleTypeDef huart1;
 
 static void SystemClock_Config(void);
@@ -23,6 +26,14 @@ void bsp_init(void)
        The FPU is already enabled by SystemInit() in the startup path. */
     SCB_EnableICache();
     SCB_EnableDCache();
+
+    /* RAM log first: validate the reset-persistent ring (and record the reset
+       cause) before anything else can log, so a fault during the rest of
+       bring-up is captured.  log_init() reads RCC->CSR / HAL_GetTick(), neither
+       of which needs HAL_Init().  fault_init() (issue #28, src/fault.c) is added
+       right after, once present, so the fault handler always finds a valid ring. */
+    log_init();
+    fault_init();   /* enable Mem/Bus/Usage faults before the rest of bring-up */
 
     HAL_Init();
     SystemClock_Config();
@@ -182,6 +193,9 @@ __attribute__((weak)) int _write(int file, char *ptr, int len)
 
 void Error_Handler(void)
 {
+    /* Record before halting: a clock/HAL bring-up failure is then visible in
+       `dmesg` after the next reset (the ring is reset-persistent, issue #28). */
+    LOG_ERR("Error_Handler trapped");
     __disable_irq();
     while (1)
     {

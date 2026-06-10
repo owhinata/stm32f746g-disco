@@ -149,6 +149,7 @@ add_library(shell_obj OBJECT
     "${CMAKE_SOURCE_DIR}/shell/core/cli_job.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_parse.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_printf.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_fmt.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_session.c"
     "${CMAKE_SOURCE_DIR}/shell/backend/cli_backend_uart.c"
     "${CMAKE_SOURCE_DIR}/shell/backend/cli_backend_dummy.c")
@@ -188,6 +189,10 @@ set(CLI_DEVMEM_DUMP_MAX_LEN "256" CACHE STRING "Max bytes per devmem dump")
 
 add_executable(threadx
     "${CMAKE_SOURCE_DIR}/src/main.c"
+    "${CMAKE_SOURCE_DIR}/src/log.c"
+    "${CMAKE_SOURCE_DIR}/src/fault.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_dmesg.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_crash.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_system.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_thread.c"

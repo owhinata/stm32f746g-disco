@@ -4,7 +4,7 @@
  */
 /**
  * @file    cli_printf.c
- * @brief   Shell output API: minimal formatter, staging buffer, colour, hexdump.
+ * @brief   Shell output API: staging buffer + colour + hexdump over cli_fmt.
  *
  * The public cli_print/error/warn/info/write/hexdump are implemented here.  Each
  * call is bracketed by cli_lock/cli_unlock (per-instance TX mutex) so formatting,
@@ -13,18 +13,17 @@
  * cli_core.c.  This file calls no tx_* function, so it builds and unit-tests on
  * the host against the tx_api.h shim.
  *
- * The formatter is a small original implementation that streams characters into
- * the staging buffer (no large intermediate buffer; honours the §8 "32 B printf
- * buffer, flush when full" model).  Supported conversions: %% %c %s %d %i %u %x
- * %X %p, length modifiers l / ll / z, field width with '0' / '-' flags.  No
- * precision, no + / space / # flags.  It is clean-room -- neither newlib's nor
- * Zephyr's printf code is reused.
+ * The actual number formatting is the clean-room formatter in cli_fmt.c (issue
+ * #28); this file only supplies the staging-buffer putc sink (cli_out_putc, ctx
+ * = the instance) and the lock/colour brackets.  Behaviour is unchanged from the
+ * earlier inline formatter.
  */
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "cli_fmt.h"
 #include "cli_instance.h"
 #include "cli_internal.h"
 #include "cli_vt100.h"
@@ -53,169 +52,16 @@ void cli_out_putc(struct cli_instance *sh, char c)
 		cli_out_flush(sh);
 }
 
+/* cli_fmt putc sink: ctx is the owning instance, output goes to its staging. */
+static void inst_putc(void *ctx, char c)
+{
+	cli_out_putc((struct cli_instance *)ctx, c);
+}
+
 static void out_str(struct cli_instance *sh, const char *s)
 {
 	while (*s)
 		cli_out_putc(sh, *s++);
-}
-
-/* ---- minimal formatter ------------------------------------------------- */
-
-enum len_mod { LM_INT, LM_LONG, LM_LLONG, LM_SIZE };
-
-/* Emit a body (digits/text) of @p blen chars with optional sign / "0x" prefix,
- * padded to @p width using spaces, or zeros when @p zero (zeros go after the
- * sign/prefix), left-justified when @p left. */
-static void emit_padded(struct cli_instance *sh, const char *prefix,
-                        const char *body, int blen, int width,
-                        int zero, int left)
-{
-	int plen = prefix ? (int)strlen(prefix) : 0;
-	int total = plen + blen;
-	int pad = width > total ? width - total : 0;
-
-	if (left) {
-		if (prefix) out_str(sh, prefix);
-		for (int i = 0; i < blen; i++) cli_out_putc(sh, body[i]);
-		while (pad-- > 0) cli_out_putc(sh, ' ');
-	} else if (zero) {
-		if (prefix) out_str(sh, prefix);
-		while (pad-- > 0) cli_out_putc(sh, '0');
-		for (int i = 0; i < blen; i++) cli_out_putc(sh, body[i]);
-	} else {
-		while (pad-- > 0) cli_out_putc(sh, ' ');
-		if (prefix) out_str(sh, prefix);
-		for (int i = 0; i < blen; i++) cli_out_putc(sh, body[i]);
-	}
-}
-
-/* Render @p mag in @p base (10/16) into @p buf (reversed-safe), return length.
- * @p upper selects A-F vs a-f.  buf must hold >= 20 chars. */
-static int utoa_rev(unsigned long long mag, unsigned base, int upper, char *buf)
-{
-	const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-	char tmp[20];
-	int n = 0;
-	do {
-		tmp[n++] = digits[mag % base];
-		mag /= base;
-	} while (mag != 0);
-	for (int i = 0; i < n; i++)
-		buf[i] = tmp[n - 1 - i];     /* un-reverse */
-	return n;
-}
-
-/* Read the integer arg inline.  va_list is an array type on some ABIs (so it
- * decays to a pointer as a function parameter); reading directly off `ap` here
- * keeps the single sequential va_arg cursor correct -- passing &ap to a helper
- * would mistype it.  Magnitude is unsigned so LLONG_MIN negates safely. */
-#define GET_UNSIGNED(lm, ap)                                                  \
-	((lm) == LM_LONG  ? (unsigned long long)va_arg((ap), unsigned long)  : \
-	 (lm) == LM_LLONG ? va_arg((ap), unsigned long long)                 : \
-	 (lm) == LM_SIZE  ? (unsigned long long)va_arg((ap), size_t)         : \
-	                    (unsigned long long)va_arg((ap), unsigned int))
-
-/* For %zd the argument is the *signed type corresponding to size_t*, which has
- * no portable name -- read it as whichever standard signed type matches size_t's
- * width (int on targets where size_t is unsigned int, e.g. Cortex-M; long on
- * LP64 hosts).  Reading a fixed `long` would be the wrong va_arg type on M7. */
-#define GET_SIGNED(lm, ap)                                                    \
-	((lm) == LM_LONG  ? (long long)va_arg((ap), long)      :              \
-	 (lm) == LM_LLONG ? va_arg((ap), long long)            :              \
-	 (lm) == LM_SIZE                                                       \
-		? (sizeof(size_t) == sizeof(int)  ? (long long)va_arg((ap), int)  : \
-		   sizeof(size_t) == sizeof(long) ? (long long)va_arg((ap), long) : \
-		                                    va_arg((ap), long long))      : \
-	                    (long long)va_arg((ap), int))
-
-static void cli_vprintf(struct cli_instance *sh, const char *fmt, va_list ap)
-{
-	for (const char *p = fmt; *p; p++) {
-		if (*p != '%') {
-			cli_out_putc(sh, *p);
-			continue;
-		}
-		p++;                            /* consume '%' */
-
-		int left = 0, zero = 0;
-		for (;; p++) {                  /* flags */
-			if (*p == '-')      left = 1;
-			else if (*p == '0') zero = 1;
-			else break;
-		}
-
-		int width = 0;                  /* field width (capped at 4096) */
-		while (*p >= '0' && *p <= '9') {
-			width = width * 10 + (*p - '0');
-			if (width > 4096)
-				width = 4096;
-			p++;
-		}
-
-		enum len_mod lm = LM_INT;       /* length modifier */
-		if (*p == 'l') {
-			p++;
-			if (*p == 'l') { lm = LM_LLONG; p++; }
-			else             lm = LM_LONG;
-		} else if (*p == 'z') {
-			lm = LM_SIZE;
-			p++;
-		}
-
-		char body[20];
-		int  blen;
-		switch (*p) {
-		case '%':
-			cli_out_putc(sh, '%');
-			break;
-		case 'c': {
-			char ch = (char)va_arg(ap, int);
-			emit_padded(sh, NULL, &ch, 1, width, 0, left);
-			break;
-		}
-		case 's': {
-			const char *s = va_arg(ap, const char *);
-			if (s == NULL) s = "(null)";
-			emit_padded(sh, NULL, s, (int)strlen(s), width, 0, left);
-			break;
-		}
-		case 'd':
-		case 'i': {
-			long long v = GET_SIGNED(lm, ap);
-			unsigned long long mag = (v < 0)
-				? (unsigned long long)(-(v + 1)) + 1ULL   /* safe for LLONG_MIN */
-				: (unsigned long long)v;
-			blen = utoa_rev(mag, 10, 0, body);
-			emit_padded(sh, v < 0 ? "-" : NULL, body, blen, width, zero, left);
-			break;
-		}
-		case 'u':
-			blen = utoa_rev(GET_UNSIGNED(lm, ap), 10, 0, body);
-			emit_padded(sh, NULL, body, blen, width, zero, left);
-			break;
-		case 'x':
-			blen = utoa_rev(GET_UNSIGNED(lm, ap), 16, 0, body);
-			emit_padded(sh, NULL, body, blen, width, zero, left);
-			break;
-		case 'X':
-			blen = utoa_rev(GET_UNSIGNED(lm, ap), 16, 1, body);
-			emit_padded(sh, NULL, body, blen, width, zero, left);
-			break;
-		case 'p': {
-			uintptr_t v = (uintptr_t)va_arg(ap, void *);
-			blen = utoa_rev((unsigned long long)v, 16, 0, body);
-			emit_padded(sh, "0x", body, blen, width, zero, left);
-			break;
-		}
-		case '\0':                      /* trailing '%': emit literally, stop */
-			cli_out_putc(sh, '%');
-			return;
-		default:                        /* unknown spec: emit verbatim */
-			cli_out_putc(sh, '%');
-			cli_out_putc(sh, *p);
-			break;
-		}
-	}
 }
 
 /* ---- output bracket (lock + bg line-break, issues #5/#25) --------------- */
@@ -256,7 +102,7 @@ static int vemit(struct cli_instance *sh, const char *color,
 	if (cli_out_begin(sh) != 0)
 		return -1;
 	if (color[0]) out_str(sh, color);
-	cli_vprintf(sh, fmt, ap);
+	cli_vformat(inst_putc, sh, fmt, ap);
 	if (color[0]) out_str(sh, CLI_VT100_RESET);
 	cli_out_flush(sh);
 	int r = sh->tx_failed ? -1 : 0;
@@ -327,14 +173,14 @@ int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
 			return -1;
 		}
 
-		int n = utoa_rev(base + (unsigned long long)off, 16, 0, body);
-		emit_padded(sh, NULL, body, n, 8, 1, 0);   /* %08x offset */
+		int n = cli_fmt_utoa(base + (unsigned long long)off, 16, 0, body);
+		cli_fmt_padded(inst_putc, sh, NULL, body, n, 8, 1, 0);   /* %08x offset */
 		out_str(sh, "  ");
 
 		for (int j = 0; j < 16; j++) {
 			if (off + (size_t)j < len) {
-				int h = utoa_rev(p[off + j], 16, 0, body);
-				emit_padded(sh, NULL, body, h, 2, 1, 0);   /* %02x */
+				int h = cli_fmt_utoa(p[off + j], 16, 0, body);
+				cli_fmt_padded(inst_putc, sh, NULL, body, h, 2, 1, 0);  /* %02x */
 				cli_out_putc(sh, ' ');
 			} else {
 				out_str(sh, "   ");

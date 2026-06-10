@@ -25,4 +25,11 @@ void bsp_udelay(uint32_t us);
 
 void Error_Handler(void);
 
+/**
+ * Enable the configurable faults (MemManage/Bus/Usage) and divide-by-zero
+ * trapping so the crash-dump handler (src/fault.c, issue #28) can classify a
+ * fault precisely.  Call early in bsp_init(), after log_init().
+ */
+void fault_init(void);
+
 #endif /* BSP_H */

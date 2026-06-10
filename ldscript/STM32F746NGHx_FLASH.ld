@@ -35,6 +35,7 @@ SECTIONS
   .text :
   {
     . = ALIGN(4);
+    _stext = .;                 /* .text start, used by fault.c backtrace scan */
     *(.text)
     *(.text*)
     *(.glue_7)
@@ -101,6 +102,26 @@ SECTIONS
     KEEP (*(.fini_array*))
     PROVIDE_HIDDEN (__fini_array_end = .);
   } >FLASH
+
+  /* RAM log ring (issue #28): NOLOAD so the CMSIS Reset_Handler .data copy /
+   * .bss clear never touches it -- contents survive any system reset (reboot /
+   * fault / IWDG / WWDG / NRST / LPWR, RM0385 5.1.1).  Placed first in RAM so it
+   * lands in the DTCM (0x20000000..0x2000FFFF), which bypasses the D-cache: log
+   * writes from fault context are committed without cache maintenance and are
+   * always visible to SWD.  .data/.bss simply shift up behind it; _estack is
+   * unchanged.  Power reset (POR/PDR/BOR, 5.1.2) does not guarantee SRAM
+   * retention -- log_init() validates the magic and re-initialises if invalid. */
+  .log_noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _slog_noinit = .;
+    KEEP(*(.log_noinit))
+    . = ALIGN(4);
+    _elog_noinit = .;
+  } >RAM
+
+  ASSERT(_elog_noinit <= ORIGIN(RAM) + 64K,
+         ".log_noinit must fit inside the 64 KB DTCM")
 
   /* Initialized data: loaded from FLASH (_sidata), runs from RAM */
   _sidata = LOADADDR(.data);
