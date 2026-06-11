@@ -218,7 +218,9 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_qspi.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_fs.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sd.c"
     "${CMAKE_SOURCE_DIR}/port/qspi/qspi_flash.c"
+    "${CMAKE_SOURCE_DIR}/port/sd/sd_card.c"
     "${CMAKE_SOURCE_DIR}/port/levelx/lx_nor_qspi_driver.c"
     "${CMAKE_SOURCE_DIR}/port/filex/fx_lx_nor_driver.c"
     "${CMAKE_SOURCE_DIR}/port/filex/fs_glue.c"
@@ -234,6 +236,7 @@ target_include_directories(threadx PRIVATE
     "${TX_DIR}/utility/execution_profile_kit"   # EPK header (issue #19 cpu%)
     "${CMAKE_SOURCE_DIR}/port/threadx"
     "${CMAKE_SOURCE_DIR}/port/qspi"
+    "${CMAKE_SOURCE_DIR}/port/sd"
     "${FX_DIR}/common/inc" "${FX_DIR}/ports/cortex_m7/gnu/inc"
     "${LX_DIR}/common/inc"
     "${CMAKE_SOURCE_DIR}/port/filex"

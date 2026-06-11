@@ -36,6 +36,7 @@
 #include "cli_backend_uart.h"
 #include "qspi_flash.h"
 #include "fs_glue.h"
+#include "sd_card.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -129,6 +130,13 @@ void tx_application_define(void *first_unused_memory)
 	/* Filesystem glue (issue #30): mount mutex + fx_system_initialize only;
 	 * the media itself mounts lazily on the first `fs` command. */
 	fs_glue_init();
+
+	/* SDMMC1 SD-card bring-up (issue #33): GPIO/DMA/NVIC + operation mutex and
+	 * DMA-completion semaphore only -- no card I/O, so it is safe before the
+	 * scheduler starts.  On failure the `sd` command reports "driver not
+	 * initialized"; nothing else stops. */
+	if (sd_card_init() != 0)
+		printf("sd: init failed (sd command disabled)\r\n");
 
 	/* Timer lists exist now: let the SysTick ISR drive ThreadX. */
 	tx_glue_timer_enable();

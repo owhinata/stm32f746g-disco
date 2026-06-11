@@ -1,7 +1,14 @@
 /*
  * Linker script for STM32F746NGH6 (STM32F746G-DISCO).
  *   FLASH : 1024 KB @ 0x08000000
- *   RAM   :  320 KB @ 0x20000000 (DTCM 64K + SRAM1 240K + SRAM2 16K, contiguous)
+ *   DTCM  :   64 KB @ 0x20000000 (tightly coupled, not D-cached)
+ *   RAM   :  256 KB @ 0x20010000 (SRAM1 240K + SRAM2 16K, contiguous, D-cached)
+ *
+ * The physical RAM is one contiguous 320 KB block from 0x20000000, but it is
+ * split here into two regions (issue #33): the reset-persistent log lives in
+ * DTCM, while .data/.bss/heap/stack and the SDMMC DMA bounce buffer live in
+ * SRAM1+SRAM2 (RAM).  _estack = ORIGIN(RAM)+LENGTH(RAM) = 0x20050000, the same
+ * top-of-RAM value as the previous single-region layout, so the MSP is unmoved.
  *
  * Symbols (_estack, _sdata, _edata, _sidata, _sbss, _ebss) match the CMSIS
  * gcc startup file startup_stm32f746xx.s.
@@ -17,7 +24,8 @@ _Min_Stack_Size = 0x400;   /* required stack */
 
 MEMORY
 {
-  RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 320K
+  DTCM  (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
+  RAM   (xrw) : ORIGIN = 0x20010000, LENGTH = 256K   /* SRAM1 240K + SRAM2 16K */
   FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 1024K
 }
 
@@ -105,12 +113,13 @@ SECTIONS
 
   /* RAM log ring (issue #28): NOLOAD so the CMSIS Reset_Handler .data copy /
    * .bss clear never touches it -- contents survive any system reset (reboot /
-   * fault / IWDG / WWDG / NRST / LPWR, RM0385 5.1.1).  Placed first in RAM so it
-   * lands in the DTCM (0x20000000..0x2000FFFF), which bypasses the D-cache: log
-   * writes from fault context are committed without cache maintenance and are
-   * always visible to SWD.  .data/.bss simply shift up behind it; _estack is
-   * unchanged.  Power reset (POR/PDR/BOR, 5.1.2) does not guarantee SRAM
-   * retention -- log_init() validates the magic and re-initialises if invalid. */
+   * fault / IWDG / WWDG / NRST / LPWR, RM0385 5.1.1).  Placed in the DTCM region
+   * (0x20000000..0x2000FFFF), which bypasses the D-cache: log writes from fault
+   * context are committed without cache maintenance and are always visible to
+   * SWD.  Since #33 the DTCM is its own MEMORY region, so this placement is
+   * explicit (no longer relying on "first in RAM").  Power reset (POR/PDR/BOR,
+   * 5.1.2) does not guarantee SRAM retention -- log_init() validates the magic
+   * and re-initialises if invalid. */
   .log_noinit (NOLOAD) :
   {
     . = ALIGN(4);
@@ -118,9 +127,9 @@ SECTIONS
     KEEP(*(.log_noinit))
     . = ALIGN(4);
     _elog_noinit = .;
-  } >RAM
+  } >DTCM
 
-  ASSERT(_elog_noinit <= ORIGIN(RAM) + 64K,
+  ASSERT(_elog_noinit <= ORIGIN(DTCM) + LENGTH(DTCM),
          ".log_noinit must fit inside the 64 KB DTCM")
 
   /* Initialized data: loaded from FLASH (_sidata), runs from RAM */
@@ -148,6 +157,27 @@ SECTIONS
     _ebss = .;
     __bss_end__ = _ebss;
   } >RAM
+
+  /* SDMMC DMA bounce buffer (issue #33): NOLOAD, 32 B aligned (one Cortex-M7
+   * D-cache line), placed in SRAM1 so the D-cache clean/invalidate around DMA
+   * acts only on this dedicated buffer.  Not because DMA2 cannot reach the DTCM
+   * (it can, via the M7 AHBS slave -- RM0385 2.1.1/2.1.6) but to confine cache
+   * maintenance to one 32 B-aligned region; the SDMMC driver only ever DMAs into
+   * this buffer and memcpy's to/from the caller's buffer.  The two ASSERTs keep
+   * it strictly inside SRAM1 (0x20010000..0x2004BFFF), before SRAM2. */
+  .sram1_dma (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _ssram1_dma = .;
+    KEEP(*(.sram1_dma))
+    . = ALIGN(32);
+    _esram1_dma = .;
+  } >RAM
+
+  ASSERT(_ssram1_dma >= 0x20010000,
+         ".sram1_dma must start in SRAM1 (cache-managed DMA buffer)")
+  ASSERT(_esram1_dma <= 0x2004C000,
+         ".sram1_dma must end within SRAM1 (before SRAM2 @0x2004C000)")
 
   /* Make sure there is room left for the heap and stack */
   ._user_heap_stack :
