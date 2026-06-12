@@ -10,7 +10,7 @@
  *               (issue #16): it waits on the instance event flags, so a 0x03
  *               wakes it and the dispatcher prints "^C".
  * `usleep N` -- busy-wait N microseconds on the free-running TIM2 counter
- *               (bsp_udelay, 108 MHz).  Short, CPU-bound, NOT interruptible --
+ *               (udelay, 108 MHz).  Short, CPU-bound, NOT interruptible --
  *               capped small; use `sleep` for long delays.
  *
  * Linked into the threadx executable only (like cmd_system.c / cmd_thread.c).
@@ -19,7 +19,7 @@
 #include <stdint.h>
 
 #include "cli.h"
-#include "bsp.h"   /* bsp_udelay (TIM2 busy-wait) */
+#include "timebase.h"   /* udelay (TIM2 busy-wait) */
 
 /* Parse a plain decimal uint32 (no 0x, no sign).  Empty, non-digit, or 32-bit
  * overflow all fail.  No newlib strtoul (this firmware ships its own parsers). */
@@ -66,7 +66,7 @@ static int cmd_usleep(struct cli_instance *sh, int argc, char **argv)
 		          argv[1], (unsigned)CLI_USLEEP_MAX_US);
 		return 1;
 	}
-	bsp_udelay(us);   /* busy-wait; not interruptible (kept small by the cap) */
+	udelay(us);   /* busy-wait; not interruptible (kept small by the cap) */
 	return 0;
 }
 

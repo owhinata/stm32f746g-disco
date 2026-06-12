@@ -12,6 +12,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 inc="$here/../include"
 core="$here/../core"
+svc="$here/../../svc"       # freestanding service layer (fmt.c / fmt.h), issue #43
 backend="$here/../backend"
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
@@ -58,9 +59,9 @@ glue_inc="-I $here -I $backend"
 # too-many-tokens (CLI_MAX_ARGC) paths fit a compact input line.
 gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
     -DCLI_USE_COLOR=0 \
-    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" -I "$svc" \
     "$here/test_core.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$svc/fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_core"
 "$out/test_core"
@@ -74,8 +75,8 @@ gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
 # cli_cancel_requested, issue #16) that cli_hexdump_base + host_glue.c call; its
 # unused dispatch/prompt code is dropped by --gc-sections.
 gcc $CFLAGS \
-    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
-    "$here/test_output.c" "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_session.c" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" -I "$svc" \
+    "$here/test_output.c" "$core/cli_printf.c" "$svc/fmt.c" "$core/cli_session.c" \
     $glue \
     $LDFLAGS -o "$out/test_output"
 "$out/test_output"
@@ -87,9 +88,9 @@ gcc $CFLAGS \
 # colour OFF as for #4 so overflow / too-many-tokens fit and output compares plain.
 gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
     -DCLI_USE_COLOR=0 \
-    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" -I "$svc" \
     "$here/test_integration.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$svc/fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_integration"
 "$out/test_integration"
@@ -102,9 +103,9 @@ gcc $CFLAGS -DCLI_CMD_BUFFER_SIZE=16 -DCLI_MAX_ARGC=4 -DCLI_MAX_SUBCMD_DEPTH=2 \
 # default CLI_CMD_BUFFER_SIZE/term_width give room for multi-row cases.  Colour
 # OFF so escape bytes compare plainly.
 gcc $CFLAGS -DCLI_USE_COLOR=0 \
-    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" -I "$svc" \
     "$here/test_edit.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$svc/fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_edit"
 "$out/test_edit"
@@ -116,9 +117,9 @@ gcc $CFLAGS -DCLI_USE_COLOR=0 \
 # Drives cli_history_* + cli_input_byte directly (model assertions).  A small
 # 32 B CLI_HISTORY_BUFFER_SIZE forces eviction with a few short entries; colour OFF.
 gcc $CFLAGS -DCLI_USE_COLOR=0 -DCLI_HISTORY_BUFFER_SIZE=32 \
-    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" -I "$svc" \
     "$here/test_history.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$svc/fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_history"
 "$out/test_history"
@@ -138,9 +139,9 @@ gcc $CFLAGS -I "$backend" \
 # + cli_tab_complete directly and asserts the model (line/len/cur/tab_list_armed) +
 # captured output fragments.  Colour OFF so escape/BEL bytes compare plainly.
 gcc $CFLAGS -DCLI_USE_COLOR=0 \
-    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" -I "$svc" \
     "$here/test_complete.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$svc/fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_complete"
 "$out/test_complete"
@@ -149,9 +150,9 @@ gcc $CFLAGS -DCLI_USE_COLOR=0 \
 # that would overflow the line rings BEL and leaves the line unchanged, and a
 # LCP-extend that cannot fit still reaches the two-stage list on the next Tab.
 gcc $CFLAGS -DCLI_USE_COLOR=0 -DCLI_CMD_BUFFER_SIZE=8 -DTEST_COMPLETE_SMALL_BUF \
-    $glue_inc -I "$here/shim" -I "$inc" -I "$core" \
+    $glue_inc -I "$here/shim" -I "$inc" -I "$core" -I "$svc" \
     "$here/test_complete.c" "$core/cli_session.c" "$core/cli_edit.c" "$core/cli_history.c" \
-    "$core/cli_printf.c" "$core/cli_fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
+    "$core/cli_printf.c" "$svc/fmt.c" "$core/cli_parse.c" "$core/cli_complete.c" \
     $glue \
     $LDFLAGS -o "$out/test_complete_smallbuf"
 "$out/test_complete_smallbuf"

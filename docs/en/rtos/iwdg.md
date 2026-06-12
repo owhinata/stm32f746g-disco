@@ -16,7 +16,7 @@ Components:
   `tx_application_define()`.
 - `src/fault.c` — the fault halt loop now refreshes the IWDG only while a debugger
   owns the core.
-- `src/log.c` — `log_reset_cause()`, used by `wdt info` (the `IWDG` decode itself
+- `svc/log.c` — `log_reset_cause()`, used by `wdt info` (the `IWDG` decode itself
   already existed, RM0385 §5.3.21).
 - `shell/cmds/cmd_wdt.c` — the `wdt` command (`info` always, `starve` dangerous).
 

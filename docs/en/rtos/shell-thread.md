@@ -61,7 +61,7 @@ headroom) and `(isr)` (interrupt processing) pseudo-rows, the column sums to ~10
   (`lib/threadx/utility/execution_profile_kit/`). It accumulates each thread's busy
   time (64-bit) on every context switch — the port asm hooks are wired automatically.
 - **Time source is `TIM2->CNT`** (APB1, 32-bit, TIM2CLK = 2×PCLK1 = 108 MHz; started in
-  `src/bsp.c` `exec_timebase_init()`). The kit default DWT_CYCCNT freezes when the core
+  `svc/timebase.c` `timebase_init()`). The kit default DWT_CYCCNT freezes when the core
   clock is gated during WFI sleep, whereas TIM2 keeps counting in Sleep (TIM2LPEN reset
   = 1). So idle/cpu% stay correct even once WFI power saving
   ([#20](https://github.com/owhinata/stm32f746g-disco/issues/20)) is enabled.

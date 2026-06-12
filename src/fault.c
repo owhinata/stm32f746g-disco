@@ -10,7 +10,7 @@
  * startup weak aliases (which only spin in Default_Handler).  On a fault the
  * dump goes to two places, RAM log first so it survives even if the UART output
  * then wedges:
- *   1. RAM log (src/log.c): a couple of LOG_ERR lines -> reset-persistent, so
+ *   1. RAM log (svc/log.c): a couple of LOG_ERR lines -> reset-persistent, so
  *      `dmesg` after the next reset shows the crash.
  *   2. USART1 by polling (no HAL, no IRQ, no ThreadX) -> a full register / stack
  *      / backtrace dump even with the scheduler and interrupts dead.
@@ -28,7 +28,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 
-#include "cli_fmt.h"
+#include "fmt.h"
 #include "stm32f7xx_hal.h"
 #include "tx_api.h"
 #include "iwdg.h"        /* BSP_ENABLE_IWDG: debugger-aware fault halt (issue #38) */
@@ -78,7 +78,7 @@ static void fault_printf(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	cli_vformat(fault_putc, NULL, fmt, ap);
+	fmt_vformat(fault_putc, NULL, fmt, ap);
 	va_end(ap);
 }
 

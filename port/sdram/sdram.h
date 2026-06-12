@@ -19,7 +19,7 @@
  * touch it before sdram_init() ran.
  *
  * sdram_init() performs the FMC/GPIO/controller setup plus the JEDEC power-up
- * command sequence.  It busy-waits (bsp_udelay / register polls) and uses no
+ * command sequence.  It busy-waits (udelay / register polls) and uses no
  * interrupts or ThreadX objects, so it may run from tx_application_define()
  * before the scheduler starts.  Idempotent; later calls return the first
  * result.

@@ -4,7 +4,7 @@
  */
 /**
  * @file    cli_printf.c
- * @brief   Shell output API: staging buffer + colour + hexdump over cli_fmt.
+ * @brief   Shell output API: staging buffer + colour + hexdump over svc/fmt.
  *
  * The public cli_print/error/warn/info/write/hexdump are implemented here.  Each
  * call is bracketed by cli_lock/cli_unlock (per-instance TX mutex) so formatting,
@@ -13,7 +13,7 @@
  * cli_core.c.  This file calls no tx_* function, so it builds and unit-tests on
  * the host against the tx_api.h shim.
  *
- * The actual number formatting is the clean-room formatter in cli_fmt.c (issue
+ * The actual number formatting is the clean-room formatter in svc/fmt.c (issue
  * #28); this file only supplies the staging-buffer putc sink (cli_out_putc, ctx
  * = the instance) and the lock/colour brackets.  Behaviour is unchanged from the
  * earlier inline formatter.
@@ -23,7 +23,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "cli_fmt.h"
+#include "fmt.h"
 #include "cli_instance.h"
 #include "cli_internal.h"
 #include "cli_vt100.h"
@@ -52,7 +52,7 @@ void cli_out_putc(struct cli_instance *sh, char c)
 		cli_out_flush(sh);
 }
 
-/* cli_fmt putc sink: ctx is the owning instance, output goes to its staging. */
+/* fmt putc sink: ctx is the owning instance, output goes to its staging. */
 static void inst_putc(void *ctx, char c)
 {
 	cli_out_putc((struct cli_instance *)ctx, c);
@@ -102,7 +102,7 @@ static int vemit(struct cli_instance *sh, const char *color,
 	if (cli_out_begin(sh) != 0)
 		return -1;
 	if (color[0]) out_str(sh, color);
-	cli_vformat(inst_putc, sh, fmt, ap);
+	fmt_vformat(inst_putc, sh, fmt, ap);
 	if (color[0]) out_str(sh, CLI_VT100_RESET);
 	cli_out_flush(sh);
 	int r = sh->tx_failed ? -1 : 0;
@@ -173,14 +173,14 @@ int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
 			return -1;
 		}
 
-		int n = cli_fmt_utoa(base + (unsigned long long)off, 16, 0, body);
-		cli_fmt_padded(inst_putc, sh, NULL, body, n, 8, 1, 0);   /* %08x offset */
+		int n = fmt_utoa(base + (unsigned long long)off, 16, 0, body);
+		fmt_padded(inst_putc, sh, NULL, body, n, 8, 1, 0);   /* %08x offset */
 		out_str(sh, "  ");
 
 		for (int j = 0; j < 16; j++) {
 			if (off + (size_t)j < len) {
-				int h = cli_fmt_utoa(p[off + j], 16, 0, body);
-				cli_fmt_padded(inst_putc, sh, NULL, body, h, 2, 1, 0);  /* %02x */
+				int h = fmt_utoa(p[off + j], 16, 0, body);
+				fmt_padded(inst_putc, sh, NULL, body, h, 2, 1, 0);  /* %02x */
 				cli_out_putc(sh, ' ');
 			} else {
 				out_str(sh, "   ");

@@ -7,12 +7,12 @@ from NuttX ramlog / Zephyr logging; no code is reused).
 
 Components:
 
-- `include/log.h` / `src/log.c` — the levelled ring buffer in DTCM and the log API.
+- `svc/log.h` / `svc/log.c` — the levelled ring buffer in DTCM and the log API.
 - `shell/cmds/cmd_dmesg.c` — the `dmesg` command that replays the log.
 - `src/fault.c` — HardFault/MemManage/BusFault/UsageFault handlers and the dump.
 - `shell/cmds/cmd_crash.c` — a `crash` command that forces a fault on purpose
   (a dangerous command).
-- Formatting reuses the clean-room formatter (`shell/core/cli_fmt.c`) extracted
+- Formatting reuses the clean-room formatter (`svc/fmt.c`) extracted
   from the [output API](shell-output.md); `cli_print`, `dmesg` and the fault dump
   all share it.
 

@@ -36,7 +36,7 @@
 
 /* Time source for the execution profile = TIM2->CNT (0x40000024): APB1, 32-bit,
  * free-running at TIM2CLK = 2*PCLK1 = 108 MHz (wrap ~39.77 s).  TIM2 is started
- * in bsp.c (exec_timebase_init).  Chosen over the kit default DWT_CYCCNT because
+ * in svc/timebase.c (timebase_init).  Chosen over the kit default DWT_CYCCNT because
  * DWT freezes when the core clock is gated by WFI (#20): TIM2 keeps counting in
  * Sleep (TIM2LPEN reset = 1), so idle/cpu% stay correct once WFI is enabled.
  * TX_EXECUTION_MAX_TIME_SOURCE keeps its 0xFFFFFFFF default (32-bit). */

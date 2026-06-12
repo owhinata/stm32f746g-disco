@@ -24,7 +24,7 @@ sh> usleep 500     # waits ~500 us
 ```
 
 - Busy-waits on the free-running **TIM2** (108 MHz, started in #19) via
-  `bsp_udelay()` — 108 counts == 1 us.
+  `udelay()` — 108 counts == 1 us.
 - It **holds the CPU and does not yield, so it cannot be interrupted**. Interrupts
   (SysTick / UART) still run, so the ThreadX tick, the LED and higher-priority
   threads are unaffected, but the shell thread blocks for the duration.

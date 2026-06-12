@@ -33,7 +33,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#include "cli_fmt.h"
+#include "fmt.h"
 #include "stm32f7xx_hal.h"
 
 /* ---- on-DTCM ring ------------------------------------------------------ */
@@ -219,7 +219,7 @@ void log_vwrite(unsigned level, const char *tag, const char *fmt, va_list ap)
 		return;
 
 	char text[LOG_MSG_MAX + 1];
-	int  n = cli_vsnformat(text, sizeof text, fmt, ap);
+	int  n = fmt_vsnformat(text, sizeof text, fmt, ap);
 	uint32_t stored  = (uint32_t)(n < 0 ? 0 : n) + 1u;      /* incl. NUL */
 	uint32_t padded  = (stored + 3u) & ~3u;
 	uint32_t rec_len = LOG_HDR_SIZE + padded;               /* 24..LOG_REC_MAX */

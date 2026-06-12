@@ -46,7 +46,7 @@ static uint16_t cam_frame[320*240] __attribute__((aligned(32), section(".sdram")
 
 1. GPIO（AF12）+ FMC クロック
 2. `HAL_SDRAM_Init`（16-bit / CAS3 / SDCLK=HCLK/2、上記タイミング）
-3. JEDEC パワーアップシーケンス: CLK enable → **100 µs 待ち**（`bsp_udelay`、ThreadX tick 未稼働のため TIM2 busy-wait）→ PALL → auto-refresh ×8 → mode register（BL=1 / sequential / CAS3 / single write）→ リフレッシュカウンタ
+3. JEDEC パワーアップシーケンス: CLK enable → **100 µs 待ち**（`udelay`、ThreadX tick 未稼働のため TIM2 busy-wait）→ PALL → auto-refresh ×8 → mode register（BL=1 / sequential / CAS3 / single write）→ リフレッシュカウンタ
 
 ポーリングのみ（割込み・DMA・ThreadX オブジェクト不使用）。idempotent・fail-soft（失敗時は `sdram`/`camera capture` が報告、他は継続）。
 

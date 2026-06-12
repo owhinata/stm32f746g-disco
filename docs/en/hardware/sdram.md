@@ -46,7 +46,7 @@ static uint16_t cam_frame[320*240] __attribute__((aligned(32), section(".sdram")
 
 1. GPIO (AF12) + FMC clock
 2. `HAL_SDRAM_Init` (16-bit / CAS3 / SDCLK=HCLK/2, timings above)
-3. JEDEC power-up sequence: clock enable → **100 µs wait** (`bsp_udelay` -- a TIM2 busy-wait, since the ThreadX tick is not running yet) → precharge-all → 8× auto-refresh → load mode register (BL=1 / sequential / CAS3 / single write) → refresh counter
+3. JEDEC power-up sequence: clock enable → **100 µs wait** (`udelay` -- a TIM2 busy-wait, since the ThreadX tick is not running yet) → precharge-all → 8× auto-refresh → load mode register (BL=1 / sequential / CAS3 / single write) → refresh counter
 
 Polling only (no interrupts, DMA, or ThreadX objects). Idempotent and fail-soft (on failure, `sdram` / `camera capture` report it; everything else keeps running).
 

@@ -42,12 +42,15 @@ plugins:
           name: English
           build: true
           nav_translations:
+            アーキテクチャ: Architecture
             ハードウェア: Hardware
             ビルド: Build
             RTOS: RTOS
 
 nav:
   - Home: index.md
+  - アーキテクチャ:
+      - architecture/layering.md
   - ハードウェア:
       - hardware/board.md
       - hardware/qspi-flash.md
@@ -58,6 +61,7 @@ nav:
       - build/cmake.md
   - RTOS:
       - rtos/threadx.md
+      - rtos/shell-requirements.md
       - rtos/shell-architecture.md
       - rtos/shell-registration.md
       - rtos/shell-parser.md

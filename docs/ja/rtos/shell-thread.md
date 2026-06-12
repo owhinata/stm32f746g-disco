@@ -53,7 +53,7 @@ System Timer Thread  susp     0      1   1024   180   17%   0.0%
 - `port/threadx/tx_user.h` で `TX_EXECUTION_PROFILE_ENABLE` / `TX_CORTEX_M_EPK` を定義し、ThreadX 同梱の
   Execution Profile Kit（`lib/threadx/utility/execution_profile_kit/`）を有効化。コンテキストスイッチ毎に
   各スレッドの busy 時間を 64bit 累積する（port asm のフックが自動で効く）。
-- **時間ソースは `TIM2->CNT`**（APB1・32bit・TIM2CLK = 2×PCLK1 = 108 MHz、`src/bsp.c` の `exec_timebase_init()`）。
+- **時間ソースは `TIM2->CNT`**（APB1・32bit・TIM2CLK = 2×PCLK1 = 108 MHz、`svc/timebase.c` の `timebase_init()`）。
   kit 既定の DWT_CYCCNT は WFI スリープ中にコアクロックがゲートされ凍結するが、TIM2 は Sleep 中も計数
   （TIM2LPEN 初期=1）するため、将来 WFI 省電力（[#20](https://github.com/owhinata/stm32f746g-disco/issues/20)）を
   有効化しても idle/cpu% が破綻しない。

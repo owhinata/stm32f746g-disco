@@ -3,7 +3,7 @@
  * Copyright (c) 2026 ThreadX Shell Project
  */
 /**
- * @file    cli_fmt.c
+ * @file    fmt.c
  * @brief   Clean-room minimal printf formatter (callback / fixed-buffer sinks).
  *
  * The formatter that used to live inline in cli_printf.c (issue #5), lifted here
@@ -21,11 +21,11 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "cli_fmt.h"
+#include "fmt.h"
 
 /* ---- low-level helpers ------------------------------------------------- */
 
-static void out_str(cli_fmt_putc_t put, void *ctx, const char *s)
+static void out_str(fmt_putc_t put, void *ctx, const char *s)
 {
 	while (*s)
 		put(ctx, *s++);
@@ -34,8 +34,8 @@ static void out_str(cli_fmt_putc_t put, void *ctx, const char *s)
 /* Emit a body (digits/text) of @p blen chars with optional sign / "0x" prefix,
  * padded to @p width using spaces, or zeros when @p zero (zeros go after the
  * sign/prefix), left-justified when @p left. */
-void cli_fmt_padded(cli_fmt_putc_t put, void *ctx, const char *prefix,
-                    const char *body, int blen, int width, int zero, int left)
+void fmt_padded(fmt_putc_t put, void *ctx, const char *prefix,
+                const char *body, int blen, int width, int zero, int left)
 {
 	int plen = prefix ? (int)strlen(prefix) : 0;
 	int total = plen + blen;
@@ -58,7 +58,7 @@ void cli_fmt_padded(cli_fmt_putc_t put, void *ctx, const char *prefix,
 
 /* Render @p mag in @p base (10/16) into @p buf (reversed-safe), return length.
  * @p upper selects A-F vs a-f.  buf must hold >= 20 chars. */
-int cli_fmt_utoa(unsigned long long mag, unsigned base, int upper, char *buf)
+int fmt_utoa(unsigned long long mag, unsigned base, int upper, char *buf)
 {
 	const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
 	char tmp[20];
@@ -99,7 +99,7 @@ enum len_mod { LM_INT, LM_LONG, LM_LLONG, LM_SIZE };
 		                                    va_arg((ap), long long))      : \
 	                    (long long)va_arg((ap), int))
 
-void cli_vformat(cli_fmt_putc_t put, void *ctx, const char *fmt, va_list ap)
+void fmt_vformat(fmt_putc_t put, void *ctx, const char *fmt, va_list ap)
 {
 	for (const char *p = fmt; *p; p++) {
 		if (*p != '%') {
@@ -141,13 +141,13 @@ void cli_vformat(cli_fmt_putc_t put, void *ctx, const char *fmt, va_list ap)
 			break;
 		case 'c': {
 			char ch = (char)va_arg(ap, int);
-			cli_fmt_padded(put, ctx, NULL, &ch, 1, width, 0, left);
+			fmt_padded(put, ctx, NULL, &ch, 1, width, 0, left);
 			break;
 		}
 		case 's': {
 			const char *s = va_arg(ap, const char *);
 			if (s == NULL) s = "(null)";
-			cli_fmt_padded(put, ctx, NULL, s, (int)strlen(s), width, 0, left);
+			fmt_padded(put, ctx, NULL, s, (int)strlen(s), width, 0, left);
 			break;
 		}
 		case 'd':
@@ -156,26 +156,26 @@ void cli_vformat(cli_fmt_putc_t put, void *ctx, const char *fmt, va_list ap)
 			unsigned long long mag = (v < 0)
 				? (unsigned long long)(-(v + 1)) + 1ULL   /* safe for LLONG_MIN */
 				: (unsigned long long)v;
-			blen = cli_fmt_utoa(mag, 10, 0, body);
-			cli_fmt_padded(put, ctx, v < 0 ? "-" : NULL, body, blen, width, zero, left);
+			blen = fmt_utoa(mag, 10, 0, body);
+			fmt_padded(put, ctx, v < 0 ? "-" : NULL, body, blen, width, zero, left);
 			break;
 		}
 		case 'u':
-			blen = cli_fmt_utoa(GET_UNSIGNED(lm, ap), 10, 0, body);
-			cli_fmt_padded(put, ctx, NULL, body, blen, width, zero, left);
+			blen = fmt_utoa(GET_UNSIGNED(lm, ap), 10, 0, body);
+			fmt_padded(put, ctx, NULL, body, blen, width, zero, left);
 			break;
 		case 'x':
-			blen = cli_fmt_utoa(GET_UNSIGNED(lm, ap), 16, 0, body);
-			cli_fmt_padded(put, ctx, NULL, body, blen, width, zero, left);
+			blen = fmt_utoa(GET_UNSIGNED(lm, ap), 16, 0, body);
+			fmt_padded(put, ctx, NULL, body, blen, width, zero, left);
 			break;
 		case 'X':
-			blen = cli_fmt_utoa(GET_UNSIGNED(lm, ap), 16, 1, body);
-			cli_fmt_padded(put, ctx, NULL, body, blen, width, zero, left);
+			blen = fmt_utoa(GET_UNSIGNED(lm, ap), 16, 1, body);
+			fmt_padded(put, ctx, NULL, body, blen, width, zero, left);
 			break;
 		case 'p': {
 			uintptr_t v = (uintptr_t)va_arg(ap, void *);
-			blen = cli_fmt_utoa((unsigned long long)v, 16, 0, body);
-			cli_fmt_padded(put, ctx, "0x", body, blen, width, zero, left);
+			blen = fmt_utoa((unsigned long long)v, 16, 0, body);
+			fmt_padded(put, ctx, "0x", body, blen, width, zero, left);
 			break;
 		}
 		case '\0':                      /* trailing '%': emit literally, stop */
@@ -191,24 +191,24 @@ void cli_vformat(cli_fmt_putc_t put, void *ctx, const char *fmt, va_list ap)
 
 /* ---- fixed-buffer sink ------------------------------------------------- */
 
-struct cli_fmt_snbuf { char *buf; size_t size; size_t pos; };
+struct fmt_snbuf { char *buf; size_t size; size_t pos; };
 
 /* Store while a byte plus the trailing NUL still fits; pos tracks bytes stored
  * (it never advances past size-1, so it is the truncated length, not the
  * would-have-been length of a full vsnprintf). */
 static void snbuf_putc(void *ctx, char c)
 {
-	struct cli_fmt_snbuf *s = (struct cli_fmt_snbuf *)ctx;
+	struct fmt_snbuf *s = (struct fmt_snbuf *)ctx;
 	if (s->pos + 1 < s->size)
 		s->buf[s->pos++] = c;
 }
 
-int cli_vsnformat(char *buf, size_t size, const char *fmt, va_list ap)
+int fmt_vsnformat(char *buf, size_t size, const char *fmt, va_list ap)
 {
-	struct cli_fmt_snbuf s = { buf, size, 0 };
+	struct fmt_snbuf s = { buf, size, 0 };
 	if (size == 0)
 		return 0;
-	cli_vformat(snbuf_putc, &s, fmt, ap);
+	fmt_vformat(snbuf_putc, &s, fmt, ap);
 	buf[s.pos] = '\0';
 	return (int)s.pos;
 }

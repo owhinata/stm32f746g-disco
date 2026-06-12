@@ -30,8 +30,8 @@
  * The JEDEC power-up sequence (clock enable -> >=100 us -> precharge-all ->
  * 8 auto-refresh cycles -> load mode register -> refresh counter) runs on
  * HAL_SDRAM_SendCommand, which polls the FMC busy flag.  The 100 us wait uses
- * bsp_udelay (TIM2 busy-wait) because sdram_init() runs before the ThreadX
- * scheduler/tick is live.
+ * udelay (svc/timebase TIM2 busy-wait) because sdram_init() runs before the
+ * ThreadX scheduler/tick is live.
  *
  * Mode register: burst length 1, sequential, CAS 3, standard operation,
  * single-location writes -- the device CAS must match the controller's
@@ -45,7 +45,7 @@
  * Clean-room implementation; ST BSP / RM0385 §13 used as reference only.
  */
 #include "sdram.h"
-#include "bsp.h"
+#include "timebase.h"
 
 #include "stm32f7xx_hal.h"
 
@@ -132,7 +132,7 @@ static int sdram_powerup_sequence(void)
 
 	/* 2: >= 100 us before the first command (datasheet power-up).  Busy-wait
 	   on TIM2 -- the ThreadX tick is not running yet. */
-	bsp_udelay(200);
+	udelay(200);
 
 	/* 3: precharge all banks. */
 	cmd.CommandMode = FMC_SDRAM_CMD_PALL;

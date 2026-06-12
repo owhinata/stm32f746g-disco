@@ -57,6 +57,7 @@ option(BSP_ENABLE_IWDG "Enable the IWDG watchdog and wdt shell command" ON)
 add_library(bsp_iface INTERFACE)
 target_include_directories(bsp_iface INTERFACE
     "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/svc"       # freestanding service layer: fmt.h/log.h/timebase.h (issue #43)
     "${GEN_DIR}"
     "${HAL_DIR}/Inc"
     "${CMSIS_DEV}/Include"
@@ -82,6 +83,19 @@ add_library(common OBJECT
     "${CMAKE_SOURCE_DIR}/src/bsp.c")
 target_link_libraries(common PUBLIC bsp_iface)
 target_compile_options(common PRIVATE -O2)
+
+# --- Freestanding service layer (issue #43) --------------------------------
+# fmt (clean-room printf), log (DTCM RAM ring) and timebase (TIM2 free-run +
+# udelay), depended on by HAL/CMSIS only.  Lives below port/ so drivers take
+# log/udelay from here instead of reaching up into shell/ or src/ (one-way
+# layering: HAL/CMSIS/ThreadX <- svc <- port <- shell/src).  Linked into the
+# threadx exe; bsp.c (in `common`) resolves timebase_init() at the final link.
+add_library(svc_obj OBJECT
+    "${CMAKE_SOURCE_DIR}/svc/fmt.c"
+    "${CMAKE_SOURCE_DIR}/svc/log.c"
+    "${CMAKE_SOURCE_DIR}/svc/timebase.c")
+target_link_libraries(svc_obj PUBLIC bsp_iface)
+target_compile_options(svc_obj PRIVATE -O2)
 
 # --- Helper: post-build artifacts + flash target ---------------------------
 # Single firmware, so the flash target is simply `flash` (not flash-<tgt>).
@@ -173,7 +187,6 @@ add_library(shell_obj OBJECT
     "${CMAKE_SOURCE_DIR}/shell/core/cli_job.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_parse.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_printf.c"
-    "${CMAKE_SOURCE_DIR}/shell/core/cli_fmt.c"
     "${CMAKE_SOURCE_DIR}/shell/core/cli_session.c"
     "${CMAKE_SOURCE_DIR}/shell/backend/cli_backend_uart.c"
     "${CMAKE_SOURCE_DIR}/shell/backend/cli_backend_dummy.c")
@@ -213,7 +226,6 @@ set(CLI_DEVMEM_DUMP_MAX_LEN "256" CACHE STRING "Max bytes per devmem dump")
 
 add_executable(threadx
     "${CMAKE_SOURCE_DIR}/src/main.c"
-    "${CMAKE_SOURCE_DIR}/src/log.c"
     "${CMAKE_SOURCE_DIR}/src/fault.c"
     "${CMAKE_SOURCE_DIR}/src/iwdg.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_dmesg.c"
@@ -250,7 +262,7 @@ add_executable(threadx
     ${TX_ASM}
     ${FX_CORE}
     ${LX_CORE})
-target_link_libraries(threadx PRIVATE common shell_obj coremark_obj)
+target_link_libraries(threadx PRIVATE common shell_obj coremark_obj svc_obj)
 target_include_directories(threadx PRIVATE
     "${TX_DIR}/common/inc" "${TX_PORT}/inc"
     "${TX_DIR}/utility/execution_profile_kit"   # EPK header (issue #19 cpu%)

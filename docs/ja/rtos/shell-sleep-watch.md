@@ -19,7 +19,7 @@ sh> sleep 3        # 約 3 秒ブロック。Ctrl+C で ^C を出して即復帰
 sh> usleep 500     # 約 500us 待つ
 ```
 
-- free-run の **TIM2**（108 MHz, #19 で起動）を使った `bsp_udelay()` のビジーウェイト（108 カウント = 1us）。
+- free-run の **TIM2**（108 MHz, #19 で起動）を使った `udelay()` のビジーウェイト（108 カウント = 1us）。
 - **CPU を占有し yield しない＝中断不可**。割込み（SysTick / UART）は動くので ThreadX tick・LED・上位スレッドは止まらないが、シェルスレッドはその間ブロックする。
 - 上限 `CLI_USLEEP_MAX_US`（既定 10000=10ms）。長い遅延は `sleep` を使う。範囲外・不正はエラー。
 
