@@ -44,6 +44,85 @@ static const char *cam_strerror(int rc)
 	}
 }
 
+/* ---- `camera set` quality controls (issue #44) --------------------------- */
+
+/* Symbolic-value tables for the enumerated settings (name <-> port enum). */
+struct cam_named { const char *name; int val; };
+
+static const struct cam_named awb_names[] = {
+	{ "auto", CAM_AWB_AUTO }, { "sunny", CAM_AWB_SUNNY },
+	{ "office", CAM_AWB_OFFICE }, { "home", CAM_AWB_HOME },
+	{ "cloudy", CAM_AWB_CLOUDY }, { NULL, 0 }
+};
+static const struct cam_named effect_names[] = {
+	{ "none", CAM_FX_NONE }, { "bw", CAM_FX_BW }, { "sepia", CAM_FX_SEPIA },
+	{ "negative", CAM_FX_NEGATIVE }, { "blue", CAM_FX_BLUE },
+	{ "red", CAM_FX_RED }, { "green", CAM_FX_GREEN }, { NULL, 0 }
+};
+static const struct cam_named flip_names[] = {
+	{ "none", CAM_FLIP_NONE }, { "mirror", CAM_FLIP_MIRROR },
+	{ "flip", CAM_FLIP_FLIP }, { "both", CAM_FLIP_BOTH }, { NULL, 0 }
+};
+
+static int cam_lookup(const struct cam_named *t, const char *s, int *out)
+{
+	for (; t->name != NULL; t++) {
+		if (strcmp(t->name, s) == 0) {
+			*out = t->val;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static const char *cam_name_of(const struct cam_named *t, int v)
+{
+	for (; t->name != NULL; t++)
+		if (t->val == v)
+			return t->name;
+	return "?";
+}
+
+/* Signed decimal parse for the small bounded levels (brightness/hue/zoom). */
+static int cam_parse_int(const char *s, int *out)
+{
+	const char *p = s;
+	int sign = 1, val = 0, any = 0;
+
+	if (p == NULL || *p == '\0')
+		return -1;
+	if (*p == '-' || *p == '+') {
+		sign = (*p == '-') ? -1 : 1;
+		p++;
+	}
+	for (; *p != '\0'; p++) {
+		if (*p < '0' || *p > '9')
+			return -1;
+		val = val * 10 + (*p - '0');
+		if (val > 100000)        /* far beyond any camera range */
+			return -1;
+		any = 1;
+	}
+	if (!any)
+		return -1;
+	*out = sign * val;
+	return 0;
+}
+
+static void print_settings(struct cli_instance *sh,
+                           const struct camera_settings *s)
+{
+	cli_print(sh, "brightness: %d\r\n", s->brightness);
+	cli_print(sh, "contrast:   %d\r\n", s->contrast);
+	cli_print(sh, "saturation: %d\r\n", s->saturation);
+	cli_print(sh, "hue:        %d deg\r\n", s->hue * 30);
+	cli_print(sh, "awb:        %s\r\n", cam_name_of(awb_names, s->awb));
+	cli_print(sh, "effect:     %s\r\n", cam_name_of(effect_names, s->effect));
+	cli_print(sh, "flip:       %s\r\n", cam_name_of(flip_names, s->flip));
+	cli_print(sh, "zoom:       x%u\r\n", (unsigned)s->zoom);
+	cli_print(sh, "night:      %s\r\n", s->night ? "on" : "off");
+}
+
 static int cmd_camera_probe(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t id = 0;
@@ -67,6 +146,7 @@ static int cmd_camera_probe(struct cli_instance *sh, int argc, char **argv)
 static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 {
 	struct camera_info ci;
+	struct camera_settings cs;
 	int rc;
 
 	(void)argc;
@@ -87,6 +167,11 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		cli_print(sh, "- (not probed)\r\n");
 	cli_print(sh, "configured: %s\r\n", ci.configured ? "yes" : "no");
 	cli_print(sh, "frame:      %s\r\n", ci.frame_valid ? "valid" : "none");
+
+	if (camera_get_settings(&cs) == 0) {
+		cli_print(sh, "-- settings (camera set) --\r\n");
+		print_settings(sh, &cs);
+	}
 	return 0;
 }
 
@@ -312,6 +397,172 @@ static int cmd_camera_off(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * `camera set` is a real subcommand tree (one leaf per OV5640 control) so the
+ * hierarchical help (issue #37) lists every setting via `help camera set`, and
+ * a missing/extra value auto-prints the leaf's usage.  Each leaf validates its
+ * value, calls the matching port setter and reports the outcome; the settings
+ * are cached and applied immediately when the sensor is live, else at the next
+ * capture.  brightness/contrast/saturation/hue coexist (the driver fixes up the
+ * OV5640's shared SDE_CTRL0/CTRL8 registers).
+ */
+static int set_reject(struct cli_instance *sh, const char *name, const char *val)
+{
+	cli_error(sh, "camera: bad value '%s' for %s\r\n", val, name);
+	return 1;
+}
+
+static int set_report(struct cli_instance *sh, const char *name,
+                      const char *val, int rc)
+{
+	if (rc != 0) {
+		cli_error(sh, "camera: %s '%s' for %s\r\n", cam_strerror(rc),
+		          val, name);
+		return 1;
+	}
+	cli_print(sh, "camera: %s = %s\r\n", name, val);
+	return 0;
+}
+
+/* The framework guarantees argv[1] (each leaf is registered mandatory = 2). */
+static int cmd_set_brightness(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+	(void)argc;
+	if (cam_parse_int(argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1], camera_set_brightness(n));
+}
+
+static int cmd_set_contrast(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+	(void)argc;
+	if (cam_parse_int(argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1], camera_set_contrast(n));
+}
+
+static int cmd_set_saturation(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+	(void)argc;
+	if (cam_parse_int(argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1], camera_set_saturation(n));
+}
+
+static int cmd_set_hue(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+	(void)argc;
+	if (cam_parse_int(argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1], camera_set_hue(n));
+}
+
+static int cmd_set_awb(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+	(void)argc;
+	if (cam_lookup(awb_names, argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1], camera_set_awb((enum camera_awb)n));
+}
+
+static int cmd_set_effect(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+	(void)argc;
+	if (cam_lookup(effect_names, argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1],
+	                  camera_set_effect((enum camera_effect)n));
+}
+
+static int cmd_set_flip(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+	(void)argc;
+	if (cam_lookup(flip_names, argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1],
+	                  camera_set_flip((enum camera_flip)n));
+}
+
+static int cmd_set_zoom(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+	(void)argc;
+	if (cam_parse_int(argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1], camera_set_zoom(n));
+}
+
+static int cmd_set_night(struct cli_instance *sh, int argc, char **argv)
+{
+	int on;
+	(void)argc;
+	if (strcmp(argv[1], "on") == 0)
+		on = 1;
+	else if (strcmp(argv[1], "off") == 0)
+		on = 0;
+	else
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1], camera_set_night(on));
+}
+
+static int cmd_set_default(struct cli_instance *sh, int argc, char **argv)
+{
+	int rc;
+	(void)argc;
+	(void)argv;
+	rc = camera_set_defaults();
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+		return 1;
+	}
+	cli_print(sh, "camera: settings reset to defaults\r\n");
+	return 0;
+}
+
+/* `camera set` with no subcommand shows the current values; an unrecognized
+   token falls here too (the parser passes it as an argument when it matches no
+   leaf). */
+static int cmd_camera_set(struct cli_instance *sh, int argc, char **argv)
+{
+	struct camera_settings s;
+	int rc;
+
+	if (argc > 1) {
+		cli_error(sh, "camera: unknown setting '%s'\r\n", argv[1]);
+		cli_print(sh, "type 'help camera set' for the list of settings\r\n");
+		return 1;
+	}
+	rc = camera_get_settings(&s);
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+		return 1;
+	}
+	print_settings(sh, &s);
+	cli_print(sh, "type 'help camera set' for the list of settings\r\n");
+	return 0;
+}
+
+CLI_SUBCMD_SET_CREATE(camera_set_subcmds,
+	CLI_CMD_ARG(brightness, NULL, "<-4..4>", cmd_set_brightness, 2, 0),
+	CLI_CMD_ARG(contrast,   NULL, "<-4..4>", cmd_set_contrast, 2, 0),
+	CLI_CMD_ARG(saturation, NULL, "<-4..4>", cmd_set_saturation, 2, 0),
+	CLI_CMD_ARG(hue,    NULL, "<-180..150> in 30 deg steps", cmd_set_hue, 2, 0),
+	CLI_CMD_ARG(awb,    NULL, "<auto|sunny|office|home|cloudy>", cmd_set_awb, 2, 0),
+	CLI_CMD_ARG(effect, NULL, "<none|bw|sepia|negative|blue|red|green>",
+	            cmd_set_effect, 2, 0),
+	CLI_CMD_ARG(flip,   NULL, "<none|mirror|flip|both>", cmd_set_flip, 2, 0),
+	CLI_CMD_ARG(zoom,   NULL, "<1|2|4|8>", cmd_set_zoom, 2, 0),
+	CLI_CMD_ARG(night,  NULL, "<on|off>", cmd_set_night, 2, 0),
+	CLI_CMD(default,    NULL, "reset all settings to neutral", cmd_set_default),
+	CLI_SUBCMD_SET_END);
+
 CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD(probe, NULL, "power-cycle + read the OV5640 chip ID", cmd_camera_probe),
 	CLI_CMD(info,  NULL, "driver / sensor state", cmd_camera_info),
@@ -319,6 +570,9 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	            cmd_camera_capture, 1, 1),
 	CLI_CMD_ARG(save, NULL, "write frame as raw RGB565 <sd|fs> <path>",
 	            cmd_camera_save, 3, 0),
+	CLI_CMD_ARG(set,  camera_set_subcmds,
+	            "OV5640 image quality (no arg = show current)",
+	            cmd_camera_set, 1, 1),
 	CLI_CMD(off,   NULL, "cut camera module power", cmd_camera_off),
 	CLI_SUBCMD_SET_END);
 

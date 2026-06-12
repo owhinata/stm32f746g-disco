@@ -87,6 +87,49 @@
 /* One QVGA frame at any plausible OV5640 frame rate is well under 1 s. */
 #define CAM_XFER_TIMEOUT_TICKS 1000u
 
+/*
+ * SDE_CTRL0 (0x5580) -- the Special-Digital-Effects master enable register
+ * (OV5640 datasheet table 7-26).  Each lib/ov5640 quality setter *overwrites*
+ * this register with only its own enable bit, so applying brightness then
+ * saturation leaves just the saturation bit set and brightness silently dies.
+ * The fixup in settings_apply_all_locked() OR-s the right bits back together.
+ *   b7 Fixed Y  b6 Negative  b5 Gray  b4 Fixed V  b3 Fixed U
+ *   b2 Contrast (shared by brightness: it rides the contrast Y-bright path)
+ *   b1 Saturation  b0 Hue
+ */
+#define OV5640_REG_SDE_CTRL0  0x5580u
+#define SDE0_HUE_EN       0x01u
+#define SDE0_SAT_EN       0x02u
+#define SDE0_CONTRAST_EN  0x04u   /* brightness + contrast (both Y path)    */
+#define SDE0_FIXED_U_EN   0x08u
+#define SDE0_FIXED_V_EN   0x10u
+#define SDE0_NEG_EN       0x40u
+#define SDE0_TINT         (SDE0_FIXED_U_EN | SDE0_FIXED_V_EN)  /* 0x18      */
+/* Bits this driver owns; bits we never touch (b5 Gray, b7 Fixed Y) are kept. */
+#define SDE0_MANAGED      (SDE0_NEG_EN | SDE0_TINT | SDE0_CONTRAST_EN | \
+                           SDE0_SAT_EN | SDE0_HUE_EN)          /* 0x5F      */
+
+/*
+ * SDE_CTRL8 (0x5588) carries the sign / UV-adjust-manual-enable bits the
+ * brightness/contrast/saturation/hue setters poke via the vendored
+ * ov5640_modify_reg -- which is OR-only (ov5640.c: TempData1 |= data & mask)
+ * and so can SET but never CLEAR a masked bit.  Worse, the setters' masks
+ * overlap on bit0: contrast/saturation force it (mask 0x41) while hue owns it
+ * (mask 0x33), so OR-only leaves bit0 stuck for hue degrees whose table entry
+ * lacks it (e.g. -180 deg wants 0x32 but ends 0x33).  Rather than fight the
+ * OR-only helper, settings_apply_all_locked() rewrites the managed bits of
+ * SDE_CTRL8 with an EXACT value computed from the cache after the setters run.
+ *   b6 UV-adjust-manual-enable (the contrast/saturation path needs it)
+ *   b3 Y-bright sign for contrast (set when brightness < 0)
+ *   b5 b4 b1 b0 hue sin/cos sign bits (from the OV5640 hue table)
+ */
+#define OV5640_REG_SDE_CTRL8  0x5588u
+#define SDE8_UV_MANUAL    0x40u
+#define SDE8_YBRIGHT_SIGN 0x08u
+#define SDE8_HUE_SIGNS    0x33u
+#define SDE8_MANAGED      (SDE8_UV_MANUAL | SDE8_YBRIGHT_SIGN | SDE8_HUE_SIGNS)
+                                                              /* 0x7B */
+
 static I2C_HandleTypeDef hcam_i2c;     /* I2C1, SCCB to the OV5640      */
 static DCMI_HandleTypeDef hdcmi;       /* DCMI, 8-bit parallel capture  */
 static DMA_HandleTypeDef hdma_dcmi;    /* DMA2 Stream1/Ch1: DCMI -> mem */
@@ -101,6 +144,19 @@ static int cam_ready;                  /* camera_init() done           */
 static int cam_colorbar = -1;          /* last pattern mode; -1 unknown */
 static uint32_t cam_frame_gen;         /* bumped per successful capture */
 static struct camera_info info;
+
+/* Quality settings (issue #44): RAM cache, all neutral by default.  Survives
+   power cycles so a `camera set` made while powered off still takes effect at
+   the next capture; cleared back to these defaults only by camera_set_defaults. */
+static struct camera_settings settings = {
+	.brightness = 0, .contrast = 0, .saturation = 0, .hue = 0,
+	.awb        = CAM_AWB_AUTO, .effect = CAM_FX_NONE,
+	.flip       = CAM_FLIP_NONE, .zoom = 1, .night = 0,
+};
+/* Set whenever the cache changes; cleared only after a successful apply.  Lets
+   a live capture re-apply when a previous immediate apply failed (I2C glitch),
+   so the cache and the sensor never silently diverge. */
+static int settings_dirty;
 
 /* Frame buffer in external SDRAM (.sdram: NOLOAD, MPU non-cacheable, #40).
    DMA-written by DCMI, CPU-read by camera_frame_read -- coherent with no
@@ -219,6 +275,155 @@ static int camera_probe_locked(uint32_t *chip_id)
 	return 0;
 }
 
+/* ---- quality settings (locked helpers, issue #44) ------------------------ */
+
+/* Map the port-neutral enums to the lib/ov5640 constants. */
+static uint32_t awb_to_ov(uint8_t a)
+{
+	switch (a) {
+	case CAM_AWB_SUNNY:  return OV5640_LIGHT_SUNNY;
+	case CAM_AWB_OFFICE: return OV5640_LIGHT_OFFICE;
+	case CAM_AWB_HOME:   return OV5640_LIGHT_HOME;
+	case CAM_AWB_CLOUDY: return OV5640_LIGHT_CLOUDY;
+	default:             return OV5640_LIGHT_AUTO;
+	}
+}
+
+static uint32_t effect_to_ov(uint8_t e)
+{
+	switch (e) {
+	case CAM_FX_BW:       return OV5640_COLOR_EFFECT_BW;
+	case CAM_FX_SEPIA:    return OV5640_COLOR_EFFECT_SEPIA;
+	case CAM_FX_NEGATIVE: return OV5640_COLOR_EFFECT_NEGATIVE;
+	case CAM_FX_BLUE:     return OV5640_COLOR_EFFECT_BLUE;
+	case CAM_FX_RED:      return OV5640_COLOR_EFFECT_RED;
+	case CAM_FX_GREEN:    return OV5640_COLOR_EFFECT_GREEN;
+	default:              return OV5640_COLOR_EFFECT_NONE;
+	}
+}
+
+static uint32_t flip_to_ov(uint8_t f)
+{
+	switch (f) {
+	case CAM_FLIP_MIRROR: return OV5640_MIRROR;
+	case CAM_FLIP_FLIP:   return OV5640_FLIP;
+	case CAM_FLIP_BOTH:   return OV5640_MIRROR_FLIP;
+	default:              return OV5640_MIRROR_FLIP_NONE;
+	}
+}
+
+static uint32_t zoom_to_ov(uint8_t z)
+{
+	switch (z) {
+	case 2:  return OV5640_ZOOM_x2;
+	case 4:  return OV5640_ZOOM_x4;
+	case 8:  return OV5640_ZOOM_x8;
+	default: return OV5640_ZOOM_x1;
+	}
+}
+
+/* A tinting effect (bw/sepia/blue/red/green) fixes the U/V channels via
+   SDE_CTRL3/4; saturation and hue write those same registers, so they fight.
+   Negative and "none" leave U/V alone, so saturation/hue coexist with them. */
+static int effect_is_tint(uint8_t e)
+{
+	return e == CAM_FX_BW || e == CAM_FX_SEPIA || e == CAM_FX_BLUE ||
+	       e == CAM_FX_RED || e == CAM_FX_GREEN;
+}
+
+/*
+ * Push the whole cached settings block to a powered+configured sensor and fix
+ * up SDE_CTRL0 so the SDE controls coexist.  Applied in a fixed order so the
+ * shared SDE_CTRL8 sign/enable bits (touched via the ST setters' read-modify-
+ * writes) settle deterministically; SDE_CTRL0 is then rewritten as the OR of
+ * every active function's enable bit (the ST setters each leave only their own).
+ * Caller holds cam_lock and has info.configured == 1.
+ */
+static int settings_apply_all_locked(void)
+{
+	/* Mirrors lib/ov5640 hue_degree_ctrl8[] (OV5640 hue sin/cos sign bits,
+	   masked to SDE8_HUE_SIGNS); indexed by settings.hue - CAM_HUE_MIN. */
+	static const uint8_t hue_sign[CAM_HUE_MAX - CAM_HUE_MIN + 1] = {
+		0x32u, 0x32u, 0x32u, 0x02u, 0x02u, 0x02u,
+		0x01u, 0x01u, 0x01u, 0x31u, 0x31u, 0x31u
+	};
+	int tint = effect_is_tint(settings.effect);
+	uint8_t sde0, sde8, want = 0, want8;
+
+	if (OV5640_SetLightMode(&ov5640, awb_to_ov(settings.awb)) != OV5640_OK)
+		goto io_err;
+	if (OV5640_SetColorEffect(&ov5640, effect_to_ov(settings.effect))
+	    != OV5640_OK)
+		goto io_err;
+	if (OV5640_SetBrightness(&ov5640, settings.brightness) != OV5640_OK)
+		goto io_err;
+	if (OV5640_SetContrast(&ov5640, settings.contrast) != OV5640_OK)
+		goto io_err;
+	if (!tint) {
+		if (OV5640_SetSaturation(&ov5640, settings.saturation) != OV5640_OK)
+			goto io_err;
+		if (OV5640_SetHueDegree(&ov5640, settings.hue) != OV5640_OK)
+			goto io_err;
+	}
+
+	/* SDE_CTRL8 fixup: the OR-only setters above cannot clear their shared
+	   sign bits, so rewrite the managed bits with the exact value the cache
+	   implies (see OV5640_REG_SDE_CTRL8 comment). */
+	want8 = SDE8_UV_MANUAL;
+	if (settings.brightness < 0)
+		want8 |= SDE8_YBRIGHT_SIGN;
+	if (!tint)
+		want8 |= (uint8_t)(hue_sign[settings.hue - CAM_HUE_MIN] &
+		                   SDE8_HUE_SIGNS);
+	if (cam_io_read(CAM_I2C_ADDR, OV5640_REG_SDE_CTRL8, &sde8, 1) != OV5640_OK)
+		goto io_err;
+	sde8 = (uint8_t)((sde8 & (uint8_t)~SDE8_MANAGED) | want8);
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_REG_SDE_CTRL8, &sde8, 1) != OV5640_OK)
+		goto io_err;
+
+	/* SDE_CTRL0 fixup -- combine the enable bits the setters above each wiped. */
+	if (settings.effect == CAM_FX_NEGATIVE)
+		want |= SDE0_NEG_EN;
+	else if (tint)
+		want |= SDE0_TINT;
+	want |= SDE0_CONTRAST_EN;             /* brightness + contrast (Y path) */
+	if (!tint)
+		want |= SDE0_SAT_EN | SDE0_HUE_EN;
+
+	if (cam_io_read(CAM_I2C_ADDR, OV5640_REG_SDE_CTRL0, &sde0, 1) != OV5640_OK)
+		goto io_err;
+	sde0 = (uint8_t)((sde0 & (uint8_t)~SDE0_MANAGED) | want);
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_REG_SDE_CTRL0, &sde0, 1) != OV5640_OK)
+		goto io_err;
+
+	/* Geometry / exposure controls are independent of the SDE block. */
+	if (OV5640_MirrorFlipConfig(&ov5640, flip_to_ov(settings.flip)) != OV5640_OK)
+		goto io_err;
+	if (OV5640_ZoomConfig(&ov5640, zoom_to_ov(settings.zoom)) != OV5640_OK)
+		goto io_err;
+	if (OV5640_NightModeConfig(&ov5640,
+	        settings.night ? NIGHT_MODE_ENABLE : NIGHT_MODE_DISABLE)
+	    != OV5640_OK)
+		goto io_err;
+
+	settings_dirty = 0;
+	return 0;
+io_err:
+	LOG_ERR("OV5640 settings apply failed (I2C)");
+	return CAM_ERR_HAL;
+}
+
+/* Apply now if the sensor is live; otherwise the cache is enough.  Cache-only
+   when not configured (the next capture's lazy configure re-applies it after
+   OV5640_Init wipes the SDE block) or while the colorbar test pattern is up
+   (returning to live re-applies, and we must not disturb its SDE_CTRL4). */
+static int apply_if_live_locked(void)
+{
+	if (!info.configured || cam_colorbar != 0)
+		return 0;
+	return settings_apply_all_locked();
+}
+
 /* ---- capture (locked helpers, issue #41) ---------------------------------- */
 
 /* Remove any leftover signals so a stale post cannot satisfy the next wait. */
@@ -240,7 +445,7 @@ static int camera_configure_locked(int colorbar)
 			return CAM_ERR_HAL;
 		}
 		info.configured = 1;
-		cam_colorbar    = -1;
+		cam_colorbar    = -1;   /* forces the mode block below to run */
 		tx_thread_sleep(CAM_SETTLE_INIT_MS);
 	}
 
@@ -252,8 +457,32 @@ static int camera_configure_locked(int colorbar)
 			LOG_ERR("OV5640 colorbar config failed");
 			return CAM_ERR_HAL;
 		}
-		cam_colorbar = colorbar;
 		tx_thread_sleep(CAM_SETTLE_MODE_MS);
+
+		/* Re-apply the cached quality settings LAST, in live mode only:
+		   OV5640_Init and ColorbarModeConfig(DISABLE) both write the SDE
+		   register block (the latter sets SDE_CTRL4), so the settings must
+		   land after them or they get clobbered (issue #44).  The colorbar
+		   test pattern owns its own SDE_CTRL4 and ignores quality, so skip
+		   it there.  cam_colorbar is committed only after a successful apply
+		   so a failed apply re-runs this block on the next capture. */
+		if (!colorbar) {
+			int rc = settings_apply_all_locked();
+
+			if (rc != 0)
+				return rc;
+		}
+		cam_colorbar = colorbar;
+	}
+
+	/* Mode unchanged but a prior live apply failed (settings_dirty): retry so
+	   the sensor matches the cache.  Skipped in colorbar mode -- quality is
+	   irrelevant there and would disturb the test pattern's SDE_CTRL4. */
+	if (!colorbar && settings_dirty) {
+		int rc = settings_apply_all_locked();
+
+		if (rc != 0)
+			return rc;
 	}
 	return 0;
 }
@@ -407,6 +636,165 @@ int camera_get_info(struct camera_info *out)
 	*out = info;
 	op_unlock();
 	return 0;
+}
+
+/* ---- quality settings public API (issue #44) ----------------------------- */
+
+int camera_get_settings(struct camera_settings *out)
+{
+	int rc;
+
+	if (out == NULL)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	*out = settings;
+	op_unlock();
+	return 0;
+}
+
+/* Shared tail for every level setter: takes the mutex, stashes the validated
+   value (already range-checked) and re-applies if the sensor is live.
+   @field points into `settings`. */
+static int set_level(int8_t *field, int value)
+{
+	int rc = op_lock();
+
+	if (rc != 0)
+		return rc;
+	*field = (int8_t)value;
+	settings_dirty = 1;
+	rc = apply_if_live_locked();
+	op_unlock();
+	return rc;
+}
+
+int camera_set_brightness(int level)
+{
+	if (level < CAM_LEVEL_MIN || level > CAM_LEVEL_MAX)
+		return CAM_ERR_PARAM;
+	return set_level(&settings.brightness, level);
+}
+
+int camera_set_contrast(int level)
+{
+	if (level < CAM_LEVEL_MIN || level > CAM_LEVEL_MAX)
+		return CAM_ERR_PARAM;
+	return set_level(&settings.contrast, level);
+}
+
+int camera_set_saturation(int level)
+{
+	if (level < CAM_LEVEL_MIN || level > CAM_LEVEL_MAX)
+		return CAM_ERR_PARAM;
+	return set_level(&settings.saturation, level);
+}
+
+int camera_set_hue(int degrees)
+{
+	if (degrees < CAM_HUE_MIN * 30 || degrees > CAM_HUE_MAX * 30 ||
+	    (degrees % 30) != 0)
+		return CAM_ERR_PARAM;
+	return set_level(&settings.hue, degrees / 30);
+}
+
+int camera_set_awb(enum camera_awb mode)
+{
+	int rc;
+
+	if ((unsigned)mode > CAM_AWB_CLOUDY)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	settings.awb = (uint8_t)mode;
+	settings_dirty = 1;
+	rc = apply_if_live_locked();
+	op_unlock();
+	return rc;
+}
+
+int camera_set_effect(enum camera_effect effect)
+{
+	int rc;
+
+	if ((unsigned)effect > CAM_FX_GREEN)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	settings.effect = (uint8_t)effect;
+	settings_dirty = 1;
+	rc = apply_if_live_locked();
+	op_unlock();
+	return rc;
+}
+
+int camera_set_flip(enum camera_flip flip)
+{
+	int rc;
+
+	if ((unsigned)flip > CAM_FLIP_BOTH)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	settings.flip = (uint8_t)flip;
+	settings_dirty = 1;
+	rc = apply_if_live_locked();
+	op_unlock();
+	return rc;
+}
+
+int camera_set_zoom(int factor)
+{
+	int rc;
+
+	if (factor != 1 && factor != 2 && factor != 4 && factor != 8)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	settings.zoom = (uint8_t)factor;
+	settings_dirty = 1;
+	rc = apply_if_live_locked();
+	op_unlock();
+	return rc;
+}
+
+int camera_set_night(int on)
+{
+	int rc = op_lock();
+
+	if (rc != 0)
+		return rc;
+	settings.night = on ? 1u : 0u;
+	settings_dirty = 1;
+	rc = apply_if_live_locked();
+	op_unlock();
+	return rc;
+}
+
+int camera_set_defaults(void)
+{
+	int rc = op_lock();
+
+	if (rc != 0)
+		return rc;
+	settings.brightness = 0;
+	settings.contrast   = 0;
+	settings.saturation = 0;
+	settings.hue        = 0;
+	settings.awb        = CAM_AWB_AUTO;
+	settings.effect     = CAM_FX_NONE;
+	settings.flip       = CAM_FLIP_NONE;
+	settings.zoom       = 1;
+	settings.night      = 0;
+	settings_dirty      = 1;
+	rc = apply_if_live_locked();
+	op_unlock();
+	return rc;
 }
 
 int camera_init(void)

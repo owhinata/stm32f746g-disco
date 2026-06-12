@@ -78,9 +78,10 @@ Sensor setup is lazy, at capture time: probe if needed → `OV5640_Init` (once p
 
 ```
 camera probe             power cycle + read the OV5640 chip ID (~1 s)
-camera info              driver / sensor state
+camera info              driver / sensor state + current quality settings
 camera capture [test]    snapshot one QVGA RGB565 frame (test = colorbar pattern)
 camera save <sd|fs> <p>  write the captured frame to a file, raw RGB565
+camera set [<name> <v>]  OV5640 image-quality controls (no arg = show)
 camera off               cut module power
 ```
 
@@ -124,6 +125,65 @@ wrote bar.png (320x240)
 ```
 
 Channels are expanded to 8 bits by bit replication (full-scale 5/6-bit values map to exactly 255). Use `--width/--height` for other geometries.
+
+## Image-quality settings (camera set, #44)
+
+`camera set` adjusts the OV5640's built-in ISP (the B-CAMS-OMV has no module-side LED/AF, so only the sensor ISP is controllable). Settings live in a **RAM cache** in `port/camera`: applied over I2C immediately when the sensor is live, or cached and applied in one pass by the next capture's lazy configure (`OV5640_Init` rewrites the SDE register block, so the cache must be re-applied after every init).
+
+| Setting | Value | Meaning |
+|---------|-------|---------|
+| `brightness` | -4..4 | brightness |
+| `contrast` | -4..4 | contrast |
+| `saturation` | -4..4 | saturation |
+| `hue` | -180..150 (30° steps) | hue (converted to a -6..5 index internally) |
+| `awb` | auto / sunny / office / home / cloudy | white balance (light mode) |
+| `effect` | none / bw / sepia / negative / blue / red / green | special color effect |
+| `flip` | none / mirror / flip / both | mirror / vertical flip |
+| `zoom` | 1 / 2 / 4 / 8 | digital zoom (ISP scaling, QVGA-capable) |
+| `night` | on / off | night mode (AEC stretches 15→3.75 fps) |
+| `default` | — | reset every setting to neutral |
+
+Each setting is a **subcommand** of `camera set` (`camera_set_subcmds` in `shell/cmds/cmd_camera.c`), so the hierarchical help (#37) lists them all and gives per-setting usage; omitting the value auto-prints that subcommand's usage.
+
+```
+sh> help camera set       # recursively lists the settings
+camera set -- OV5640 image quality (no arg = show current)
+Subcommands:
+  brightness <-4..4>
+  contrast   <-4..4>
+  saturation <-4..4>
+  hue        <-180..150> in 30 deg steps
+  awb        <auto|sunny|office|home|cloudy>
+  effect     <none|bw|sepia|negative|blue|red|green>
+  flip       <none|mirror|flip|both>
+  zoom       <1|2|4|8>
+  night      <on|off>
+  default    reset all settings to neutral
+Type 'help camera set <subcommand>' for details.
+sh> camera set brightness 2
+camera: brightness = 2
+sh> camera set brightness         # omitting the value prints usage
+camera set brightness: invalid number of arguments
+usage: camera set brightness  (<-4..4>)
+sh> camera set                    # no arg lists the current values
+brightness: 2
+contrast:   0
+saturation: 0
+hue:        0 deg
+awb:        auto
+effect:     none
+flip:       none
+zoom:       x1
+night:      off
+type 'help camera set' for the list of settings
+```
+
+!!! warning "SDE_CTRL0 / SDE_CTRL8 overwrite bug and fixup"
+    Each `lib/ov5640` (read-only submodule) setter **overwrites the SDE master-enable register `SDE_CTRL0` (0x5580) with only its own enable bit**, so with the ST driver as-is only the **last-applied** of brightness/contrast/saturation/hue takes effect. Worse, the sign / UV bits in **`SDE_CTRL8` (0x5588)** are updated through the vendored `ov5640_modify_reg`, which is **OR-only (can set but never clear a bit)**.
+
+    Without editing the submodule, `port/camera` absorbs this: it applies the setters in a **fixed order**, then read-modify-writes `SDE_CTRL0` to the OR of every active function's enable bit and `SDE_CTRL8` to the **exact** value derived from the cache. All four controls then coexist, with no stale hue / negative-brightness sign bits (per OV5640 datasheet table 7-26 bit definitions).
+
+    **Tint effects (bw/sepia/blue/red/green) own `SDE_CTRL3/4` via fixed U/V**, which collides with saturation/hue, so saturation/hue are skipped while a tint effect is active (they have no visible effect while U/V is fixed anyway).
 
 ## References
 

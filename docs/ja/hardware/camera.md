@@ -78,9 +78,10 @@ TIMINGR は **PCLK1 = 54 MHz** 用に再計算した値を使う（RM0385 §30.4
 
 ```
 camera probe             電源サイクル + OV5640 chip ID 読出し（~1 s）
-camera info              ドライバ / センサ状態の表示
+camera info              ドライバ / センサ状態 + 現在の画質設定を表示
 camera capture [test]    QVGA RGB565 を 1 フレーム snapshot（test = colorbar パターン）
 camera save <sd|fs> <p>  キャプチャ済みフレームを raw RGB565 でファイル保存
+camera set [<name> <値>] OV5640 画質設定（引数なしで一覧表示）
 camera off               モジュール電源 OFF
 ```
 
@@ -124,6 +125,65 @@ wrote bar.png (320x240)
 ```
 
 チャネルは bit 複製で 8-bit へ拡張（5/6-bit のフルスケールが正確に 255 になる）。解像度が異なる場合は `--width/--height` で指定。
+
+## 画質設定（camera set, #44）
+
+`camera set` で OV5640 内蔵 ISP の画質を調整する（B-CAMS-OMV はモジュール側に LED/AF を持たず、制御できるのはセンサ ISP 設定のみ）。設定は `port/camera` の **RAM キャッシュ**に保持し、センサが live なら即時 I2C 適用、未設定なら次回 capture の遅延 configure で一括適用する（`OV5640_Init` が SDE レジスタ群を書き潰すため、毎回 init 後に再適用が必要）。
+
+| 設定 | 値 | 内容 |
+|------|----|------|
+| `brightness` | -4..4 | 明るさ |
+| `contrast` | -4..4 | コントラスト |
+| `saturation` | -4..4 | 彩度 |
+| `hue` | -180..150（30° 刻み） | 色相（内部で -6..5 index に変換） |
+| `awb` | auto / sunny / office / home / cloudy | ホワイトバランス（光源モード） |
+| `effect` | none / bw / sepia / negative / blue / red / green | 特殊効果 |
+| `flip` | none / mirror / flip / both | ミラー / 上下反転 |
+| `zoom` | 1 / 2 / 4 / 8 | デジタルズーム（ISP スケーリング、QVGA 対応） |
+| `night` | on / off | ナイトモード（AEC で 15→3.75fps へ自動延長） |
+| `default` | — | 全設定を中立値へリセット |
+
+各設定は `camera set` 配下の**サブコマンド**（`shell/cmds/cmd_camera.c` の `camera_set_subcmds`）なので、階層 help（#37）で一覧・個別 usage が引ける。値を省くと該当サブコマンドの usage が自動表示される。
+
+```
+sh> help camera set       # 設定項目を再帰的に一覧
+camera set -- OV5640 image quality (no arg = show current)
+Subcommands:
+  brightness <-4..4>
+  contrast   <-4..4>
+  saturation <-4..4>
+  hue        <-180..150> in 30 deg steps
+  awb        <auto|sunny|office|home|cloudy>
+  effect     <none|bw|sepia|negative|blue|red|green>
+  flip       <none|mirror|flip|both>
+  zoom       <1|2|4|8>
+  night      <on|off>
+  default    reset all settings to neutral
+Type 'help camera set <subcommand>' for details.
+sh> camera set brightness 2
+camera: brightness = 2
+sh> camera set brightness         # 値を省くと usage
+camera set brightness: invalid number of arguments
+usage: camera set brightness  (<-4..4>)
+sh> camera set                    # 引数なしで現在値を一覧
+brightness: 2
+contrast:   0
+saturation: 0
+hue:        0 deg
+awb:        auto
+effect:     none
+flip:       none
+zoom:       x1
+night:      off
+type 'help camera set' for the list of settings
+```
+
+!!! warning "SDE_CTRL0 / SDE_CTRL8 の上書きバグと fixup"
+    `lib/ov5640`（read-only submodule）の各 setter は SDE master enable レジスタ **`SDE_CTRL0`(0x5580)** を**自分の enable ビットだけで上書き**するため、ST ドライバそのままでは brightness/contrast/saturation/hue は**最後に適用した 1 系統しか効かない**。さらに sign/UV ビットを持つ **`SDE_CTRL8`(0x5588)** を vendored の `ov5640_modify_reg` で更新するが、これは **OR-only（ビットを立てられるが消せない）**。
+
+    submodule は編集せず、`port/camera` 側で吸収する: setter 群を**固定順で適用**したあと、`SDE_CTRL0` を全有効機能の enable ビットの OR で、`SDE_CTRL8` をキャッシュから導いた**正確な値**でそれぞれ read-modify-write し直す。これにより 4 系統が併用可能になり、hue や負の brightness の sign ビットが残留しない（OV5640 datasheet table 7-26 の bit 定義に基づく）。
+
+    **tint 系 effect（bw/sepia/blue/red/green）は `SDE_CTRL3/4` を fixed U/V で占有**し saturation/hue と register が衝突するため、tint 適用中は saturation/hue を skip する（U/V 固定中はどのみち無効）。
 
 ## 参照
 

@@ -63,6 +63,45 @@ struct camera_info {
 	int      frame_valid; /* a captured frame is in the buffer             */
 };
 
+/* ---- quality settings (issue #44) ---------------------------------------- */
+/*
+ * OV5640 ISP image-quality controls, exposed port-neutral so the shell never
+ * sees the lib/ov5640 constants.  Settings live in a RAM cache: a `camera set`
+ * applies immediately when the sensor is powered+configured, otherwise it is
+ * stored and re-applied by the next capture's lazy configure -- OV5640_Init
+ * rewrites the whole SDE register block, so the cache must outlive it.
+ */
+enum camera_awb {     /* white balance / light mode */
+	CAM_AWB_AUTO = 0, CAM_AWB_SUNNY, CAM_AWB_OFFICE, CAM_AWB_HOME,
+	CAM_AWB_CLOUDY
+};
+enum camera_effect {  /* special color effect */
+	CAM_FX_NONE = 0, CAM_FX_BW, CAM_FX_SEPIA, CAM_FX_NEGATIVE,
+	CAM_FX_BLUE, CAM_FX_RED, CAM_FX_GREEN
+};
+enum camera_flip {    /* mirror / flip orientation */
+	CAM_FLIP_NONE = 0, CAM_FLIP_MIRROR, CAM_FLIP_FLIP, CAM_FLIP_BOTH
+};
+
+/* Inclusive ranges for the bipolar level controls. */
+#define CAM_LEVEL_MIN  (-4)   /* brightness / contrast / saturation        */
+#define CAM_LEVEL_MAX  (4)
+#define CAM_HUE_MIN    (-6)   /* hue index; degrees = index * 30 (-180 deg) */
+#define CAM_HUE_MAX    (5)    /* +150 deg                                    */
+
+/** Current OV5640 quality settings (defaults are all neutral). */
+struct camera_settings {
+	int8_t  brightness;  /* CAM_LEVEL_MIN..MAX, 0 = neutral               */
+	int8_t  contrast;    /* CAM_LEVEL_MIN..MAX                            */
+	int8_t  saturation;  /* CAM_LEVEL_MIN..MAX                            */
+	int8_t  hue;         /* CAM_HUE_MIN..MAX, units of 30 deg             */
+	uint8_t awb;         /* enum camera_awb                              */
+	uint8_t effect;      /* enum camera_effect                          */
+	uint8_t flip;        /* enum camera_flip                            */
+	uint8_t zoom;        /* digital zoom factor: 1, 2, 4 or 8           */
+	uint8_t night;       /* 0 = off, 1 = night mode on                  */
+};
+
 /**
  * One-time bring-up: PWR_EN GPIO (PH13, parked OFF), I2C1 (PB8/PB9 AF4,
  * 100 kHz) and the operation mutex.  Performs **no sensor I/O**, so it is safe
@@ -116,6 +155,29 @@ int camera_frame_read(uint32_t offset, void *dst, uint32_t len,
  * call in any state; a no-op when the driver is not initialized.
  */
 void camera_frame_invalidate(void);
+
+/** Copy the current quality settings into @p out (never touches the sensor). */
+int camera_get_settings(struct camera_settings *out);
+
+/*
+ * Quality setters.  Each validates its argument (CAM_ERR_PARAM out of range),
+ * updates the RAM cache, and -- when the sensor is already configured --
+ * re-applies the full settings block so the controls coexist (the OV5640
+ * setters each clobber the shared SDE_CTRL0 enable register; the driver fixes
+ * that up).  When the sensor is not yet configured the value is only cached.
+ */
+int camera_set_brightness(int level);          /* CAM_LEVEL_MIN..MAX        */
+int camera_set_contrast(int level);            /* CAM_LEVEL_MIN..MAX        */
+int camera_set_saturation(int level);          /* CAM_LEVEL_MIN..MAX        */
+int camera_set_hue(int degrees);               /* -180..150, multiple of 30 */
+int camera_set_awb(enum camera_awb mode);
+int camera_set_effect(enum camera_effect effect);
+int camera_set_flip(enum camera_flip flip);
+int camera_set_zoom(int factor);               /* 1, 2, 4 or 8              */
+int camera_set_night(int on);                  /* 0 = off, nonzero = on     */
+
+/** Reset every quality setting to its neutral default and re-apply. */
+int camera_set_defaults(void);
 
 #ifdef __cplusplus
 }
