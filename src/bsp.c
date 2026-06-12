@@ -20,9 +20,14 @@ UART_HandleTypeDef huart1;
 static void SystemClock_Config(void);
 static void VCP_UART_Init(void);
 static void exec_timebase_init(void);
+static void mpu_config_sdram(void);
 
 void bsp_init(void)
 {
+    /* MPU first: the SDRAM window must be Normal non-cacheable before the
+       D-cache turns on, so no SDRAM access can ever allocate a cache line. */
+    mpu_config_sdram();
+
     /* Caches on before HAL_Init so all later accesses are cached.
        The FPU is already enabled by SystemInit() in the startup path. */
     SCB_EnableICache();
@@ -50,6 +55,51 @@ void bsp_init(void)
 
     /* Unbuffered stdout so each printf reaches the VCP immediately. */
     setvbuf(stdout, NULL, _IONBF, 0);
+}
+
+/**
+ * @brief  MPU region for the 8 MB FMC SDRAM window (issue #40).
+ *
+ * The ARMv7-M default memory map types 0xA0000000..0xDFFFFFFF as Device, so
+ * without an MPU region the SDRAM would be uncached-but-Device (strongly
+ * ordered accesses, XN).  Region 0 remaps the 8 MB at 0xC0000000 as **Normal,
+ * non-cacheable, RW, XN**:
+ *
+ *   - Normal: the compiler/bus may merge and reorder plain data accesses
+ *     (Device semantics would serialize every word).
+ *   - Non-cacheable (TEX=1, C=0, B=0): the region holds large DMA-target
+ *     buffers (camera frames, #41).  With no cache lines ever allocated, DMA
+ *     writes and CPU reads are coherent by construction -- no
+ *     clean/invalidate choreography, no dirty-eviction races.  The cost is
+ *     slower CPU access; switch to WBWA + explicit maintenance later if a
+ *     consumer needs bandwidth (documented in docs/hardware/sdram.md).
+ *   - XN: no code execution from SDRAM.
+ *
+ * PRIVDEFENA keeps the default map for every other address, so flash/SRAM/
+ * peripheral behaviour is unchanged.  Runs before SCB_EnableDCache() so no
+ * SDRAM line can be cached even transiently.  The FMC itself is configured
+ * later (port/sdram/sdram.c, from tx_application_define).
+ */
+static void mpu_config_sdram(void)
+{
+    MPU_Region_InitTypeDef r = {0};
+
+    HAL_MPU_Disable();
+
+    r.Enable           = MPU_REGION_ENABLE;
+    r.Number           = MPU_REGION_NUMBER0;
+    r.BaseAddress      = 0xC0000000u;
+    r.Size             = MPU_REGION_SIZE_8MB;
+    r.SubRegionDisable = 0x00;
+    r.TypeExtField     = MPU_TEX_LEVEL1;          /* TEX=1, C=0, B=0: Normal, */
+    r.IsCacheable      = MPU_ACCESS_NOT_CACHEABLE;/* non-cacheable            */
+    r.IsBufferable     = MPU_ACCESS_NOT_BUFFERABLE;
+    r.IsShareable      = MPU_ACCESS_NOT_SHAREABLE;
+    r.AccessPermission = MPU_REGION_FULL_ACCESS;
+    r.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
+    HAL_MPU_ConfigRegion(&r);
+
+    HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 }
 
 /**

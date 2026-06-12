@@ -52,6 +52,7 @@ nav:
       - hardware/board.md
       - hardware/qspi-flash.md
       - hardware/sdmmc.md
+      - hardware/sdram.md
       - hardware/camera.md
   - ビルド:
       - build/cmake.md

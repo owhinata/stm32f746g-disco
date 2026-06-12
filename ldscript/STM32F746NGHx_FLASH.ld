@@ -26,6 +26,7 @@ MEMORY
 {
   DTCM  (xrw) : ORIGIN = 0x20000000, LENGTH = 64K
   RAM   (xrw) : ORIGIN = 0x20010000, LENGTH = 256K   /* SRAM1 240K + SRAM2 16K */
+  SDRAM (xrw) : ORIGIN = 0xC0000000, LENGTH = 8M     /* FMC bank1, 16-bit bus (issue #40) */
   FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 1024K
 }
 
@@ -178,6 +179,21 @@ SECTIONS
          ".sram1_dma must start in SRAM1 (cache-managed DMA buffer)")
   ASSERT(_esram1_dma <= 0x2004C000,
          ".sram1_dma must end within SRAM1 (before SRAM2 @0x2004C000)")
+
+  /* External FMC SDRAM (issue #40): 8 MB at 0xC0000000, MPU-mapped Normal
+   * non-cacheable (src/bsp.c).  NOLOAD only: the FMC is not initialized until
+   * sdram_init() runs from tx_application_define(), so the startup code
+   * (.data copy / .bss zeroing) must never touch this region -- objects here
+   * get no load image and no zero-init, and nothing survives reset.  Holds
+   * large DMA-target buffers (camera frame buffer, issue #41). */
+  .sdram (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _ssdram = .;
+    KEEP(*(.sdram))
+    . = ALIGN(32);
+    _esdram = .;
+  } >SDRAM
 
   /* Make sure there is room left for the heap and stack */
   ._user_heap_stack :

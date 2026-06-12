@@ -38,6 +38,7 @@
 #include "fs_glue.h"
 #include "sd_card.h"
 #include "sd_fs_glue.h"
+#include "sdram.h"
 #include "camera.h"
 #include "iwdg.h"
 
@@ -170,6 +171,13 @@ void tx_application_define(void *first_unused_memory)
 	 * mounts lazily on the first `sd` FS command.  fx_system_initialize() was
 	 * already run by fs_glue_init(), so this does not repeat it. */
 	sd_fs_glue_init();
+
+	/* FMC SDRAM bring-up (issue #40): GPIO/FMC controller + the JEDEC power-up
+	 * sequence (polling only, ~sub-ms).  Before camera_init() -- the camera
+	 * frame buffer (#41) lives in SDRAM.  On failure the `sdram`/`camera
+	 * capture` commands report it; nothing else stops. */
+	if (sdram_init() != 0)
+		printf("sdram: init failed (sdram/camera capture disabled)\r\n");
 
 	/* Camera bring-up (issue #39): PWR_EN GPIO (parked off), I2C1 and the
 	 * operation mutex only -- no sensor I/O, so it is safe before the scheduler

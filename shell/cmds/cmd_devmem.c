@@ -72,6 +72,13 @@ static const struct devmem_region devmem_map[] = {
 	{ 0x40010000u, 0x00006C00u, 1, 1, W32,  "APB2"     },
 	{ 0x40020000u, 0x00060000u, 1, 1, W32,  "AHB1"     },
 	{ 0x50000000u, 0x00060C00u, 1, 1, W32,  "AHB2"     },
+	/* External FMC SDRAM (issue #40).  The shell only runs after
+	   tx_application_define, where sdram_init() enabled the FMC clock on every
+	   path, so an access here cannot hit a clock-gated bus (worst case --
+	   init failed -- it reads garbage).  Only the real 8 MB window: past it
+	   the 16-bit part mirrors, and the rest of the 256 MB FMC bank stays
+	   rejected. */
+	{ 0xC0000000u, 0x00800000u, 1, 1, WALL, "SDRAM"    }, /* FMC bank1, 8 MB    */
 	{ 0xE0000000u, 0x00100000u, 1, 1, W32,  "PPB"      }, /* SCB/NVIC/SysTick.. */
 };
 
