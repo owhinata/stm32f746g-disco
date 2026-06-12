@@ -62,11 +62,74 @@ compile-time gate).
 
 | command | registration | behaviour |
 |---|---|---|
-| `help` | `CLI_CMD_REGISTER(help, NULL, ...,1,0)` | lists registered root commands via `CLI_ROOT_CMD_FOREACH` (the on-target proof that the `.shell_root_cmds` scan resolved, §18.1) |
+| `help` | `CLI_CMD_REGISTER(help, NULL, ...,1,CLI_MAX_SUBCMD_DEPTH+1)` | shows command help **hierarchically** (`help` / `help <cmd>` / `help <cmd> <sub>`) via `CLI_ROOT_CMD_FOREACH` + sentinel walk of subcommand sets (the on-target proof that the `.shell_root_cmds` scan resolved, §18.1). See the section below |
 | `echo` | `CLI_CMD_REGISTER(echo, NULL, ...,1,CLI_ARG_RAW)` | prints the rest of the line verbatim (RAW argument) |
 
 Both handlers touch only the `sh` passed to them through the output API, so they
 are reentrant when several instances run the same command at once (§10).
+
+## Hierarchical help and argument usage (#37)
+
+`help` walks the registered command tree using **public API only**
+(`CLI_ROOT_CMD_FOREACH` + a sentinel walk of each subcommand set) and prints in
+three forms. It **reuses the one-line `.help`** already on every `struct cli_cmd`;
+no new descriptor field is added.
+
+| form | shows |
+|---|---|
+| `help` | every root command; those with subcommands get a trailing `>` (command-group marker) |
+| `help <cmd>` | a group prints its own help + the list of its subcommands; a leaf prints its one-line help as usage |
+| `help <cmd> <sub> …` | descends the tree along the path and shows the resolved node as above |
+
+An unknown command/subcommand prints a red `help: no such command '<path>'` and
+exits non-zero.
+
+```text
+sh> help
+Commands:
+  echo       echo the rest of the line
+  fs         QSPI flash filesystem (FileX + LevelX) >
+  help       list commands
+  ...
+'>' marks a command group; type 'help <command> [subcommand]' for details.
+
+sh> help fs
+fs -- QSPI flash filesystem (FileX + LevelX)
+Subcommands:
+  ls         list directory [path]
+  cat        print file <path>
+  write      write <path> <text>
+  ...
+Type 'help fs <subcommand>' for details.
+
+sh> help fs ls
+fs ls  list directory [path]
+```
+
+**Registration**: `help` uses `optional = CLI_MAX_SUBCMD_DEPTH + 1` (**not**
+`CLI_ARG_RAW`, which would collapse the tail into one argument and stop `help fs ls`
+from tokenizing). This admits the deepest legal path `help + root +
+CLI_MAX_SUBCMD_DEPTH subcommands`.
+
+### Automatic usage on an argument error
+
+On a wrong argument count (`CLI_PARSE_WRONG_ARGS`), `cli_dispatch_segment`
+(`cli_session.c`) follows the existing `<cmd>: invalid number of arguments` with a
+**usage line**. It builds the full command path from the resolved command that
+`cli_parse()` populated before returning `WRONG_ARGS` (`pr.cmd` / `pr.cmd_level`)
+plus `sh->argv`, and appends the `.help`:
+
+```text
+sh> fs write
+write: invalid number of arguments
+usage: fs write  (write <path> <text>)
+```
+
+The text in `(...)` is the command's one-line `.help` **reused as usage** (note the
+`.help` strings mix argument-syntax style — `write <path> <text>` — with description
+style — `capacity / free / state`). The usage line is assembled into one local
+buffer and emitted with a **single `cli_print()`** so a background-job line cannot
+splice into the middle of it (§10/§11).
 
 ## Build / flash / connect
 

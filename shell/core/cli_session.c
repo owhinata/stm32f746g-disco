@@ -17,6 +17,7 @@
  * Clean-room design inspired by Zephyr shell; no code reused.
  */
 #include <stddef.h>
+#include <stdio.h>      /* snprintf (usage command-path join, issue #37) */
 #include <string.h>
 
 #include "cli_instance.h"
@@ -105,6 +106,21 @@ void cli_dispatch_segment(struct cli_instance *sh, char *seg)
 		break;
 	case CLI_PARSE_WRONG_ARGS:
 		cli_error(sh, "%s: invalid number of arguments\r\n", sh->pr.argv[0]);
+		/* Issue #37: follow with the command's usage -- its full command path
+		 * (sh->argv[0 .. cmd_level-1], populated by cli_parse before WRONG_ARGS)
+		 * plus its one-line .help reused as usage.  Built into one buffer and
+		 * emitted with a single cli_print so a background-job line cannot splice
+		 * into the middle of the usage line (each cli_print is its own TX lock). */
+		if (sh->pr.cmd != NULL && sh->pr.cmd->help != NULL) {
+			char path[CLI_CMD_BUFFER_SIZE];
+			size_t n = 0;
+
+			path[0] = '\0';
+			for (int i = 0; i < sh->pr.cmd_level && n < sizeof path; i++)
+				n += (size_t)snprintf(path + n, sizeof path - n,
+				                      i ? " %s" : "%s", sh->argv[i]);
+			cli_print(sh, "usage: %s  (%s)\r\n", path, sh->pr.cmd->help);
+		}
 		sh->last_result = CLI_DISPATCH_ERR;
 		break;
 	case CLI_PARSE_TOO_MANY_TOKENS:

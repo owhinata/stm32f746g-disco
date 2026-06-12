@@ -58,6 +58,7 @@ static int h_args(struct cli_instance *sh, int argc, char **argv)
 }
 
 CLI_SUBCMD_SET_CREATE(sub_thing, CLI_CMD_ARG(list, NULL, "list", h_ok, 1, 0),
+	CLI_CMD_ARG(put, NULL, "put <key>", h_args, 2, 0),   /* issue #37: sub w/ mandatory>1 */
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(hello, NULL,      "say hi",       h_ok,   1, 0);
@@ -319,6 +320,15 @@ static void test_arg_errors(void)
 	reset(&sh0, &tr0);
 	run_line(&sh0, "need2\r");                     /* mandatory 2, got 1 */
 	assert(has(&tr0, "need2: invalid number of arguments"));
+	/* issue #37: the usage line follows -- root-leaf path + .help as usage. */
+	assert(has(&tr0, "usage: need2  (needs 2 args)"));
+	assert(sh0.last_result == CLI_DISPATCH_ERR);
+
+	/* issue #37: a subcommand's WRONG_ARGS prints the FULL command path. */
+	reset(&sh0, &tr0);
+	run_line(&sh0, "thing put\r");                 /* sub mandatory 2, got 1 */
+	assert(has(&tr0, "put: invalid number of arguments"));
+	assert(has(&tr0, "usage: thing put  (put <key>)"));
 	assert(sh0.last_result == CLI_DISPATCH_ERR);
 
 	reset(&sh0, &tr0);
