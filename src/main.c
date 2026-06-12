@@ -38,6 +38,7 @@
 #include "fs_glue.h"
 #include "sd_card.h"
 #include "sd_fs_glue.h"
+#include "camera.h"
 #include "iwdg.h"
 
 #include <stddef.h>
@@ -169,6 +170,13 @@ void tx_application_define(void *first_unused_memory)
 	 * mounts lazily on the first `sd` FS command.  fx_system_initialize() was
 	 * already run by fs_glue_init(), so this does not repeat it. */
 	sd_fs_glue_init();
+
+	/* Camera bring-up (issue #39): PWR_EN GPIO (parked off), I2C1 and the
+	 * operation mutex only -- no sensor I/O, so it is safe before the scheduler
+	 * starts.  On failure the `camera` command reports "driver not
+	 * initialized"; nothing else stops. */
+	if (camera_init() != 0)
+		printf("camera: init failed (camera command disabled)\r\n");
 
 #if BSP_ENABLE_IWDG
 	/* IWDG last (issue #38).  Order here is deliberate and must stay

@@ -45,6 +45,11 @@ authoritative terms.
     A project of the Eclipse Foundation (donated by Microsoft from Azure RTOS);
     the sources carry both Microsoft and Eclipse copyrights.
 
+- STMicroelectronics OV5640 BSP component  -- BSD-3-Clause
+    lib/ov5640/LICENSE.md                  (Copyright STMicroelectronics)
+    Sensor register driver for the B-CAMS-OMV camera module, driven by the
+    clean-room glue under port/camera/.
+
 - EEMBC CoreMark                           -- Apache-2.0
     lib/coremark/LICENSE.md
     Run as the shell `coremark` command; the board port under port/coremark/ is

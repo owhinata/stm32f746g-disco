@@ -12,10 +12,12 @@
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
-# Fetch HAL/CMSIS/CoreMark/ThreadX/FileX/LevelX submodules if any is missing
-# (the filex check also re-fetches existing checkouts that predate issue #30).
+# Fetch HAL/CMSIS/CoreMark/ThreadX/FileX/LevelX/OV5640 submodules if any is
+# missing (the filex/ov5640 checks also re-fetch existing checkouts that
+# predate issues #30 / #39).
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32f7xx_hal_driver/Src/stm32f7xx_hal.c"
-   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/filex/common/src/fx_media_open.c")
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/filex/common/src/fx_media_open.c"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/ov5640/ov5640.c")
     message(STATUS "Initializing git submodules ...")
     execute_process(
         COMMAND git submodule update --init --recursive
@@ -228,9 +230,13 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_qspi.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_fs.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sd.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_camera.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/fs_cmd_core.c"
     "${CMAKE_SOURCE_DIR}/port/qspi/qspi_flash.c"
     "${CMAKE_SOURCE_DIR}/port/sd/sd_card.c"
+    "${CMAKE_SOURCE_DIR}/port/camera/camera.c"
+    "${CMAKE_SOURCE_DIR}/lib/ov5640/ov5640.c"
+    "${CMAKE_SOURCE_DIR}/lib/ov5640/ov5640_reg.c"
     "${CMAKE_SOURCE_DIR}/port/levelx/lx_nor_qspi_driver.c"
     "${CMAKE_SOURCE_DIR}/port/filex/fx_lx_nor_driver.c"
     "${CMAKE_SOURCE_DIR}/port/filex/fx_sd_driver.c"
@@ -249,6 +255,8 @@ target_include_directories(threadx PRIVATE
     "${CMAKE_SOURCE_DIR}/port/threadx"
     "${CMAKE_SOURCE_DIR}/port/qspi"
     "${CMAKE_SOURCE_DIR}/port/sd"
+    "${CMAKE_SOURCE_DIR}/port/camera"
+    "${CMAKE_SOURCE_DIR}/lib/ov5640"
     "${FX_DIR}/common/inc" "${FX_DIR}/ports/cortex_m7/gnu/inc"
     "${LX_DIR}/common/inc"
     "${CMAKE_SOURCE_DIR}/port/filex"

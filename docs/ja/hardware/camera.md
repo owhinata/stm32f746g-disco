@@ -1,0 +1,88 @@
+# カメラ（B-CAMS-OMV / OV5640）
+
+ST のカメラモジュールバンドル **B-CAMS-OMV**（アダプタ MB1683 + カメラモジュール MB1379、センサ **OV5640** 5MP）をボードの **P1**（30-pin ZIF）に接続して使う。ドライバは `port/camera/camera.{c,h}`、シェルコマンドは `camera`（`shell/cmds/cmd_camera.c`）。
+
+カメラ基盤（Epic #22）の **Phase 1**（#39）。Phase 1 は**センサ検出まで**: 電源制御（PWR_EN）と I2C1（SCCB）での chip ID 読出し。DCMI + DMA によるフレームキャプチャは Phase 2（#41）、ファイル保存は Phase 3（#42）。
+
+## 配線（P1 ↔ B-CAMS-OMV CN5）
+
+ボードの P1（UM1907 §7.2 Table 5）と B-CAMS-OMV の 30-pin ZIF CN5（UM2779 Table 7）は、付属 FFC で**全信号 1:1 対応**（コネクタのピン番号は互いに逆順）。
+
+| 信号 | MCU ピン | 備考 |
+|------|----------|------|
+| I2C1_SCL（SCCB） | PB8 | AF4、open-drain。CN2 拡張コネクタと共用バス |
+| I2C1_SDA（SCCB） | PB9 | AF4、open-drain |
+| DCMI_PWR_EN | PH13 | **Low = 電源 ON**（モジュールの POWER_DOWN、active-high） |
+| DCMI_NRST | -    | ボードの **NRST 網に直結**（GPIO 制御不可） |
+| DCMI D0-D7 / HSYNC / VSYNC / PIXCLK | （Phase 2） | AF13。#41 で使用 |
+
+既存ペリフェラル（USART1=PA9/PB7、QSPI=PB2/PB6/PD11-13/PE2、SDMMC1=PC8-13/PD2、LED=PI1）と競合しない。
+
+!!! note "クロック（XCLK）"
+    MB1379 モジュールは**自前の 24 MHz クリスタル**（MB1379/X1）で OV5640 を駆動する（UM2779 §3.2）。ホスト側の MCO 供給は**不要**。P1 pin21 の Camera_CLK（ボード X1 由来の OSC_24M）は接続されるが使われない。
+
+## I2C（SCCB）
+
+| 項目 | 値 | 根拠 |
+|------|----|------|
+| インスタンス | **I2C1**（PB8/PB9） | UM1907 CN2 / P1 |
+| アドレス | **0x78**（8-bit write） | OV5640 / H747I BSP |
+| レジスタアドレス | **16-bit**（`I2C_MEMADD_SIZE_16BIT`） | OV5640 datasheet |
+| chip ID | 0x300A/0x300B = **0x5640** | OV5640 datasheet |
+| 速度 | ~100 kHz standard mode | SCCB |
+
+TIMINGR は **PCLK1 = 54 MHz** 用に再計算した値を使う（RM0385 §30.4.10）: PRESC=11 / SCLL=24 / SCLH=19 / SCLDEL=5 / SDADEL=2 → SCL ≈ 99 kHz。ST BSP の定数 `0x40912732` は APB1=50 MHz 前提のため流用しない（54 MHz では ~118 kHz になる）。
+
+## 電源とリセット
+
+- PWR_EN（PH13）は `camera_init()` で**出力に切り替える前に OFF レベルを書き**、モジュールへのグリッチを防ぐ
+- probe は毎回 **電源サイクル**（High 100 ms → Low → 20 ms 整定、H747I BSP の HwReset と同タイミング）から始める
+- DCMI_NRST は GPIO で制御できないため、**PWR_EN サイクル + OV5640 ソフトリセット**（`OV5640_ReadID` が 0x3008=0x80 を書いて 500 ms 待つ）で代替する
+
+## OV5640 component driver（submodule）
+
+センサのレジスタ制御は ST 公式の **OV5640 BSP component driver** を使う:
+
+- submodule: `lib/ov5640` = [STMicroelectronics/stm32-ov5640](https://github.com/STMicroelectronics/stm32-ov5640) **v4.0.3**（BSD-3-Clause、`NOTICE` 参照）
+- BSP v2 API（`OV5640_Object_t` + `OV5640_IO_t`）。純 I2C で自己完結（DCMIPP 等への依存なし）
+- バスグルーは `port/camera/camera.c` の `cam_io_*`（`HAL_I2C_Mem_Write/Read`）。`OV5640_ReadID()` が `IO.Init()` を無条件に呼ぶため、**no-op の Init/DeInit スタブを必ず登録**する
+
+!!! note "stm32-mw-camera を使わない理由"
+    ST の Camera Middleware（`stm32-mw-camera`）と X-CUBE-ISP は **DCMIPP**（STM32N6 系）専用で、F7 の classic DCMI では使えない。単体公開されている OV5640 component driver のみを取り込む。
+
+## 排他とスレッド文脈
+
+- 公開 API は内部 ThreadX mutex（TX_INHERIT）で直列化。実体は `*_locked()` ヘルパに分離し、**公開 API が同一 mutex を再取得する経路を構造的に排除**（Phase 2 の capture が probe を内部で呼ぶ際は `_locked` 版を使う）
+- **thread context 専用**。ISR から呼んではならない
+- 初期化は `tx_application_define()`（`src/main.c`）で 1 回。**センサ I/O は発行しない**（GPIO/I2C1 と mutex 生成のみ）。センサへのアクセスは最初の `camera probe` で遅延実行
+
+## `camera` シェルコマンド
+
+```
+camera probe   電源サイクル + OV5640 chip ID 読出し（~1 s）
+camera info    ドライバ / センサ状態の表示
+camera off     モジュール電源 OFF
+```
+
+実行例:
+
+```
+sh> camera probe
+camera: probing OV5640 (takes ~1s) ...
+OV5640 detected: chip ID 0x5640
+sh> camera info
+module:     B-CAMS-OMV (OV5640) on P1/DCMI, I2C1 @0x78
+power:      on
+chip ID:    0x5640
+configured: no
+frame:      none
+sh> camera off
+camera: power off
+```
+
+## 参照
+
+- UM2779 — B-CAMS-OMV ユーザマニュアル（CN5 ピンアウト、MB1379/X1 クリスタル、JP1）
+- UM1907 §7.2 — P1 カメラコネクタピンアウト
+- RM0385 §30 — I2C（TIMINGR）
+- `_ref/STM32Cube_FW_H7_V1.13.0/Drivers/BSP/STM32H747I-DISCO/stm32h747i_discovery_camera.c` — OV5640 の電源シーケンス / 極性の参照実装
