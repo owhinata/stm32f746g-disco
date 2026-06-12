@@ -80,6 +80,12 @@ int fs_core_mkdir (const struct fs_device *dev, struct cli_instance *sh, int arg
 int fs_core_info  (const struct fs_device *dev, struct cli_instance *sh, int argc, char **argv);
 int fs_core_umount(const struct fs_device *dev, struct cli_instance *sh, int argc, char **argv);
 
+/* Device accessors for cross-command reuse (issue #42: `camera save` writes
+ * a frame through the same ownership gates as the fs/sd commands).  Defined
+ * by the owning command files. */
+const struct fs_device *fs_qspi_device(void);   /* cmd_fs.c */
+const struct fs_device *fs_sd_device(void);     /* cmd_sd.c */
+
 #ifdef __cplusplus
 }
 #endif

@@ -2,7 +2,7 @@
 
 ST's camera module bundle **B-CAMS-OMV** (MB1683 adapter + MB1379 camera module, **OV5640** 5MP sensor) connects to the board's **P1** (30-pin ZIF) connector. The driver lives in `port/camera/camera.{c,h}`, the shell command is `camera` (`shell/cmds/cmd_camera.c`).
 
-Camera epic (#22): Phase 1 (#39) = sensor detection (PWR_EN + I2C1/SCCB chip ID); Phase 2 (#41) = **DCMI + DMA2 single-frame QVGA RGB565 snapshot into SDRAM** (`camera capture`). Saving frames to a file is Phase 3 (#42).
+Camera epic (#22): Phase 1 (#39) = sensor detection (PWR_EN + I2C1/SCCB chip ID); Phase 2 (#41) = **DCMI + DMA2 single-frame QVGA RGB565 snapshot into SDRAM** (`camera capture`); Phase 3 (#42) = **raw frame export + PNG conversion on the PC** (`camera save` + `scripts/rgb565_to_png.py`).
 
 ## Wiring (P1 ↔ B-CAMS-OMV CN5)
 
@@ -77,10 +77,11 @@ Sensor setup is lazy, at capture time: probe if needed → `OV5640_Init` (once p
 ## The `camera` shell command
 
 ```
-camera probe          power cycle + read the OV5640 chip ID (~1 s)
-camera info           driver / sensor state
-camera capture [test] snapshot one QVGA RGB565 frame (test = colorbar pattern)
-camera off            cut module power
+camera probe             power cycle + read the OV5640 chip ID (~1 s)
+camera info              driver / sensor state
+camera capture [test]    snapshot one QVGA RGB565 frame (test = colorbar pattern)
+camera save <sd|fs> <p>  write the captured frame to a file, raw RGB565
+camera off               cut module power
 ```
 
 `camera capture` prints per-channel (R5/G6/B5) min/max/mean statistics and a hexdump of the first 16 pixels. `camera capture test` grabs the OV5640's built-in **8-bar colorbar** (white/yellow/cyan/green/magenta/red/blue/black), validating DCMI polarity, timing and wiring **independent of optics** (expect mins near 0, maxes near saturation, flat values within each band). On a live capture, covering the lens must pull the means down.
@@ -102,6 +103,27 @@ camera: capturing live frame ...
 frame: 320x240 RGB565 (153600 bytes)
 ...
 ```
+
+## Saving frames and viewing them on a PC (#42)
+
+`camera save <sd|fs> <path>` writes the captured frame **as raw little-endian RGB565 (153,600 B)** to the chosen medium (`sd` = microSD FAT32, `fs` = QSPI NOR), streaming row by row (640 B × 240 rows) through `camera_frame_read` into a FileX write -- no staging buffer. It runs under the same **shared op slot** as the fs/sd command bodies, so `sd format`/`umount` cannot yank the media mid-save. Ctrl+C cancels (a partial file is reported as such).
+
+Read the microSD card on the PC (card reader) and convert with the bundled script:
+
+```
+sh> camera capture test
+sh> camera save sd /bar.raw
+wrote 153600 bytes (320x240 RGB565 raw) to sd:/bar.raw
+PC: python3 scripts/rgb565_to_png.py <file> out.png
+```
+
+```console
+$ pip install Pillow
+$ python3 scripts/rgb565_to_png.py bar.raw bar.png
+wrote bar.png (320x240)
+```
+
+Channels are expanded to 8 bits by bit replication (full-scale 5/6-bit values map to exactly 255). Use `--width/--height` for other geometries.
 
 ## References
 

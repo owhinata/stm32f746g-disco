@@ -100,8 +100,15 @@ int camera_capture(int colorbar);
  * Copy @p len bytes at byte offset @p offset out of the captured frame into
  * @p dst (any alignment).  Serialized against capture/save by the driver
  * mutex.  Fails with CAM_ERR_NO_FRAME until a capture succeeded.
+ *
+ * @p gen (optional, may be NULL) receives the frame's generation counter,
+ * bumped by every successful capture.  A multi-call reader (stats, save)
+ * must compare generations across its reads: a concurrent capture between
+ * two reads re-validates the buffer with NEW pixels -- frame_valid alone
+ * cannot detect that, only the generation change does.
  */
-int camera_frame_read(uint32_t offset, void *dst, uint32_t len);
+int camera_frame_read(uint32_t offset, void *dst, uint32_t len,
+                      uint32_t *gen);
 
 /**
  * Drop the captured-frame flag (the buffer contents are about to be clobbered

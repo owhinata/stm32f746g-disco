@@ -2,7 +2,7 @@
 
 ST のカメラモジュールバンドル **B-CAMS-OMV**（アダプタ MB1683 + カメラモジュール MB1379、センサ **OV5640** 5MP）をボードの **P1**（30-pin ZIF）に接続して使う。ドライバは `port/camera/camera.{c,h}`、シェルコマンドは `camera`（`shell/cmds/cmd_camera.c`）。
 
-カメラ基盤（Epic #22）: Phase 1（#39）= センサ検出（PWR_EN + I2C1/SCCB chip ID）、Phase 2（#41）= **DCMI + DMA2 で QVGA RGB565 を 1 フレーム SDRAM へ snapshot**（`camera capture`）。ファイル保存は Phase 3（#42）。
+カメラ基盤（Epic #22）: Phase 1（#39）= センサ検出（PWR_EN + I2C1/SCCB chip ID）、Phase 2（#41）= **DCMI + DMA2 で QVGA RGB565 を 1 フレーム SDRAM へ snapshot**（`camera capture`）、Phase 3（#42）= **フレームの raw 保存 + PC で PNG 変換**（`camera save` + `scripts/rgb565_to_png.py`）。
 
 ## 配線（P1 ↔ B-CAMS-OMV CN5）
 
@@ -77,10 +77,11 @@ TIMINGR は **PCLK1 = 54 MHz** 用に再計算した値を使う（RM0385 §30.4
 ## `camera` シェルコマンド
 
 ```
-camera probe          電源サイクル + OV5640 chip ID 読出し（~1 s）
-camera info           ドライバ / センサ状態の表示
-camera capture [test] QVGA RGB565 を 1 フレーム snapshot（test = colorbar パターン）
-camera off            モジュール電源 OFF
+camera probe             電源サイクル + OV5640 chip ID 読出し（~1 s）
+camera info              ドライバ / センサ状態の表示
+camera capture [test]    QVGA RGB565 を 1 フレーム snapshot（test = colorbar パターン）
+camera save <sd|fs> <p>  キャプチャ済みフレームを raw RGB565 でファイル保存
+camera off               モジュール電源 OFF
 ```
 
 `camera capture` は取得後に R5/G6/B5 各チャネルの min/max/mean と先頭 16 画素の hexdump を表示する。`camera capture test` は OV5640 内蔵の **8 本縦帯 colorbar**（白/黄/シアン/緑/マゼンタ/赤/青/黒）を取り込むため、**光学系と無関係に** DCMI 極性・タイミング・配線を検証できる（min が 0 付近・max が飽和付近・帯ごとにフラット、が期待値）。live 撮影ではレンズを覆うと mean が下がる。
@@ -102,6 +103,27 @@ camera: capturing live frame ...
 frame: 320x240 RGB565 (153600 bytes)
 ...
 ```
+
+## ファイル保存と PC での画像確認（#42）
+
+`camera save <sd|fs> <path>` は、キャプチャ済みフレームを **raw little-endian RGB565（153,600 B）のまま**選択した媒体（`sd` = microSD FAT32、`fs` = QSPI NOR）へ書き出す。行単位（640 B × 240 行）で `camera_frame_read` → FileX write のストリーム書きなので追加バッファ不要。fs/sd コマンドと同じ **shared op slot** 下で動くため、保存中に `sd format`/`umount` が媒体を奪うことはない。Ctrl+C で中断可（部分ファイルが残る旨を表示）。
+
+PC 側では microSD をカードリーダで読む（または `sd cat` 以外の転送手段）か、そのまま付属スクリプトで PNG に変換する:
+
+```
+sh> camera capture test
+sh> camera save sd /bar.raw
+wrote 153600 bytes (320x240 RGB565 raw) to sd:/bar.raw
+PC: python3 scripts/rgb565_to_png.py <file> out.png
+```
+
+```console
+$ pip install Pillow
+$ python3 scripts/rgb565_to_png.py bar.raw bar.png
+wrote bar.png (320x240)
+```
+
+チャネルは bit 複製で 8-bit へ拡張（5/6-bit のフルスケールが正確に 255 になる）。解像度が異なる場合は `--width/--height` で指定。
 
 ## 参照
 

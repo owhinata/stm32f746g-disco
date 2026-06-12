@@ -190,6 +190,12 @@ static const struct fs_device sd_dev = {
 	.info_extra = NULL,
 };
 
+/* Accessor for cross-command reuse (camera save, issue #42). */
+const struct fs_device *fs_sd_device(void)
+{
+	return &sd_dev;
+}
+
 static int cmd_sd_ls(struct cli_instance *sh, int argc, char **argv)
 {
 	return fs_core_ls(&sd_dev, sh, argc, argv);

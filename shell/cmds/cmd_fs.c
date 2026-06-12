@@ -60,6 +60,12 @@ static const struct fs_device qspi_dev = {
 	.info_extra = qspi_info_extra,
 };
 
+/* Accessor for cross-command reuse (camera save, issue #42). */
+const struct fs_device *fs_qspi_device(void)
+{
+	return &qspi_dev;
+}
+
 /* ---- fs format (QSPI-specific: LevelX + full erase) ----------------------- */
 
 /*

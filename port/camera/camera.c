@@ -99,6 +99,7 @@ static volatile int cam_xfer_active;   /* 1 between DMA issue and completion */
 
 static int cam_ready;                  /* camera_init() done           */
 static int cam_colorbar = -1;          /* last pattern mode; -1 unknown */
+static uint32_t cam_frame_gen;         /* bumped per successful capture */
 static struct camera_info info;
 
 /* Frame buffer in external SDRAM (.sdram: NOLOAD, MPU non-cacheable, #40).
@@ -324,6 +325,7 @@ static int camera_capture_locked(int colorbar)
 	/* Snapshot auto-cleared CAPTURE; Stop also disables the DCMI and leaves
 	   the HAL in a clean READY state for the next capture. */
 	(void)HAL_DCMI_Stop(&hdcmi);
+	cam_frame_gen++;        /* new pixels: multi-call readers must notice */
 	info.frame_valid = 1;
 	return 0;
 }
@@ -340,7 +342,8 @@ int camera_capture(int colorbar)
 	return rc;
 }
 
-int camera_frame_read(uint32_t offset, void *dst, uint32_t len)
+int camera_frame_read(uint32_t offset, void *dst, uint32_t len,
+                      uint32_t *gen)
 {
 	int rc;
 
@@ -358,6 +361,8 @@ int camera_frame_read(uint32_t offset, void *dst, uint32_t len)
 		return CAM_ERR_NO_FRAME;
 	}
 	memcpy(dst, (const uint8_t *)cam_frame + offset, len);
+	if (gen != NULL)
+		*gen = cam_frame_gen;
 	op_unlock();
 	return 0;
 }
