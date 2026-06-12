@@ -58,3 +58,30 @@ media cache は 4 KB（512 B × 8 セクタ）static。LevelX の sector buffer 
 - 電源断（書込み中断）耐性は **MVP スコープ外**
 
 コマンドの使い方は [シェル / fs コマンド](shell-fs.md)。
+
+## 媒体非依存コアと microSD（Epic #32 / #34）
+
+`fs`(QSPI) と `sd`(microSD, [SDMMC1](../hardware/sdmmc.md)) は **同一の FileX コマンド本体**を共有する。媒体差は `struct fs_device`（`shell/cmds/fs_cmd_core.h`）の vtable で吸収:
+
+```
+shell `fs`/`sd` コマンド (cmd_fs.c / cmd_sd.c: device 束縛 + 登録)
+  → fs_cmd_core.c   ls/cat/write/rm/mkdir/info(df)/umount  ← struct fs_device 経由
+     → QSPI: fs_glue.c → fx_lx_nor_driver.c → LevelX → QSPI
+     → SD  : sd_fs_glue.c → fx_sd_driver.c → sd_card_* (SDMMC1 + DMA)
+```
+
+- **`struct fs_device`**: `acquire`/`unmount`/`is_mounted`、所有権 gate(`op_begin/end`・`excl_begin/end`)、`dir_lock/unlock`、`mount_hint`、`info_extra`(QSPI=wear 行 / SD=なし)。CLI の leaf handler は argv で `fs`/`sd` を区別できないため、各コマンドファイルが自分の `fs_device` を閉じ込めた薄 wrapper を登録する。
+- `fs info`(QSPI) と `sd df`(SD) は同じ `fs_core_info` 本体。容量は **`fx_media_extended_space_available()`(64-bit)** で算出し、8/16/32GB の microSD でも溢れない。
+- 所有権モデル(shared/exclusive/raw + lazy mount)は QSPI/SD で**独立**（別 `FX_MEDIA`・cache・mutex）。`fx_system_initialize()` は `fs_glue_init()` が 1 回だけ呼び、`sd_fs_glue_init()` は mutex 生成のみ。
+
+### microSD FileX ドライバ（`port/filex/fx_sd_driver.c`）
+
+SD は内蔵 FTL を持つので **LevelX 不要**。FileX のドライバ要求を `sd_card_read/write_blocks()` に直接マップする。
+
+- **MBR / superfloppy 対応**: FileX の `fx_media_open` は LBA0 を boot sector として読むだけで partition offset を計算しない。PC/カメラのフォーマットは **MBR(LBA0) + FAT32 VBR(partition 先頭)** 構成なので、ドライバが `INIT` で LBA0 を読み、**VBR 強判定**（jmpBoot + `55 aa` + BPB sanity）なら superfloppy(`sd_part_lba=0`)、**MBR**なら partition[0] の先頭 LBA/サイズを採用。以降の全 I/O は `物理 = sd_part_lba + 論理`。`fx_media_hidden_sectors` は使わない（二重加算回避）。
+- **範囲ガード**: 全 request で `論理+セクタ数` が partition サイズ(`sd_part_blocks`)を超えないこと、物理加算が 32-bit wrap しないことを **subtraction-form** で検証し、壊れた MBR/VBR でも partition 外へ書き込まない。
+- **DMA/D-Cache**: FileX が渡す caller バッファ（cached SRAM）は `sd_card_*` が内部で SRAM1 の bounce buffer 経由にし cache 管理するため、ドライバ層では追加のキャッシュ操作不要。
+
+### microSD と PC の相互運用
+
+`sd` はマウント時に**再フォーマットしない**ので、PC で作った FAT32 をそのまま読み書きでき、ボードで書いたファイルは PC で読める。低レベルの `sd info`(カード情報)/`sd read`(生ブロック) はカードを再識別しうるため、FS マウント中は raw gate で拒否される（`sd umount` が退避経路）。`sd format`（FAT32）は後続（Phase C）。コマンドは [microSD（SDMMC1 + DMA）](../hardware/sdmmc.md)。

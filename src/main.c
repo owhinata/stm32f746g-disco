@@ -37,6 +37,7 @@
 #include "qspi_flash.h"
 #include "fs_glue.h"
 #include "sd_card.h"
+#include "sd_fs_glue.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -137,6 +138,11 @@ void tx_application_define(void *first_unused_memory)
 	 * initialized"; nothing else stops. */
 	if (sd_card_init() != 0)
 		printf("sd: init failed (sd command disabled)\r\n");
+
+	/* SD filesystem glue (issue #34): SD mount mutexes only -- the media
+	 * mounts lazily on the first `sd` FS command.  fx_system_initialize() was
+	 * already run by fs_glue_init(), so this does not repeat it. */
+	sd_fs_glue_init();
 
 	/* Timer lists exist now: let the SysTick ISR drive ThreadX. */
 	tx_glue_timer_enable();

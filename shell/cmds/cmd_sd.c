@@ -4,19 +4,30 @@
  */
 /**
  * @file    cmd_sd.c
- * @brief   `sd` shell command (issue #33): microSD bring-up / debug.
+ * @brief   `sd` shell command: microSD card + FileX filesystem (issue #33/#34).
  *
  *   sd info            card type, capacity, block geometry, bus width, CID/CSD
  *   sd read <lba>      hexdump one 512 B block (LBA addressing)
+ *   sd ls [path]       list a directory (default /)
+ *   sd cat <path>      print a file
+ *   sd write <p> <txt> create/overwrite a file
+ *   sd rm <path>       delete a file or empty directory
+ *   sd mkdir <path>    create a directory
+ *   sd df              filesystem capacity / free / FAT type
+ *   sd umount          flush + unmount
  *
- * Phase A is read-only: it powers up / identifies the inserted card over SDMMC1
- * with DMA and reads blocks, but never writes, so it is safe on a PC-formatted
- * card (the FileX filesystem and writes arrive in Epic #32 Phase B/C).
+ * The filesystem commands share fs_cmd_core.c with `fs` (QSPI) via sd_dev.  The
+ * low-level `info`/`read` may re-probe the card (HAL_SD_DeInit + re-identify,
+ * when it is not already usable), which would corrupt a mounted FileX media, so
+ * they take the raw ownership slot (refused while the SD filesystem is mounted
+ * -- run `sd umount` first).
  *
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
 #include "sd_card.h"
+#include "fs_cmd_core.h"
+#include "sd_fs_glue.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -68,6 +79,22 @@ static int parse_u32(const char *s, uint32_t *out)
 	return 0;
 }
 
+/*
+ * Take the raw slot for a card-disruptive op (re-probe).  Refused while the SD
+ * filesystem is mounted or busy, so a probe (HAL_SD_DeInit) can never run under
+ * a live FX_MEDIA.  Mirrors cmd_qspi.c's qspi_raw_gate.
+ */
+static int sd_raw_gate(struct cli_instance *sh)
+{
+	if (sd_raw_begin() != FX_SUCCESS) {
+		cli_error(sh, "sd: filesystem mounted or busy; run `sd umount` first\r\n");
+		return -1;
+	}
+	return 0;
+}
+
+/* ---- low-level card commands (Phase A, raw-gated) ------------------------- */
+
 static int cmd_sd_info(struct cli_instance *sh, int argc, char **argv)
 {
 	const struct sd_card_info *ci;
@@ -76,10 +103,18 @@ static int cmd_sd_info(struct cli_instance *sh, int argc, char **argv)
 	(void)argc;
 	(void)argv;
 
-	rc = sd_card_probe();
-	if (rc != 0) {
-		cli_error(sh, "sd: %s\r\n", sd_strerror(rc));
+	if (sd_raw_gate(sh) != 0)
 		return 1;
+
+	/* Identify only if not already usable; never re-probe a mounted card
+	 * (the raw gate already excludes that case). */
+	if (sd_card_status() != SD_OK) {
+		rc = sd_card_probe();
+		if (rc != 0) {
+			cli_error(sh, "sd: %s\r\n", sd_strerror(rc));
+			sd_raw_end();
+			return 1;
+		}
 	}
 
 	ci = sd_card_get_info();
@@ -99,6 +134,7 @@ static int cmd_sd_info(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "csd       : %08lx %08lx %08lx %08lx\r\n",
 	          (unsigned long)ci->csd[0], (unsigned long)ci->csd[1],
 	          (unsigned long)ci->csd[2], (unsigned long)ci->csd[3]);
+	sd_raw_end();
 	return 0;
 }
 
@@ -116,16 +152,20 @@ static int cmd_sd_read(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	}
 
-	/* Identify the card on first use (or after a swap); reuse it otherwise. */
+	if (sd_raw_gate(sh) != 0)
+		return 1;
+
 	if (sd_card_status() != SD_OK) {
 		rc = sd_card_probe();
 		if (rc != 0) {
 			cli_error(sh, "sd: %s\r\n", sd_strerror(rc));
+			sd_raw_end();
 			return 1;
 		}
 	}
 
 	rc = sd_card_read_blocks(lba, buf, 1);
+	sd_raw_end();        /* data is in buf; release before the hexdump */
 	if (rc != 0) {
 		cli_error(sh, "sd: read failed: %s\r\n", sd_strerror(rc));
 		return 1;
@@ -135,10 +175,66 @@ static int cmd_sd_read(struct cli_instance *sh, int argc, char **argv)
 	                        (unsigned long long)lba * 512ull) == 0 ? 0 : 1;
 }
 
+/* ---- filesystem commands (shared core, bound to sd_dev) ------------------- */
+
+static const struct fs_device sd_dev = {
+	.name       = "sd",
+	.mount_hint = "no FAT filesystem? insert a FAT-formatted card",
+	.acquire    = sd_media_acquire,
+	.unmount    = sd_media_unmount,
+	.is_mounted = sd_is_mounted,
+	.op_begin   = sd_op_begin,   .op_end   = sd_op_end,
+	.excl_begin = sd_exclusive_begin, .excl_end = sd_exclusive_end,
+	.dir_lock   = sd_dir_lock,   .dir_unlock = sd_dir_unlock,
+	.info_extra = NULL,
+};
+
+static int cmd_sd_ls(struct cli_instance *sh, int argc, char **argv)
+{
+	return fs_core_ls(&sd_dev, sh, argc, argv);
+}
+
+static int cmd_sd_cat(struct cli_instance *sh, int argc, char **argv)
+{
+	return fs_core_cat(&sd_dev, sh, argc, argv);
+}
+
+static int cmd_sd_write(struct cli_instance *sh, int argc, char **argv)
+{
+	return fs_core_write(&sd_dev, sh, argc, argv);
+}
+
+static int cmd_sd_rm(struct cli_instance *sh, int argc, char **argv)
+{
+	return fs_core_rm(&sd_dev, sh, argc, argv);
+}
+
+static int cmd_sd_mkdir(struct cli_instance *sh, int argc, char **argv)
+{
+	return fs_core_mkdir(&sd_dev, sh, argc, argv);
+}
+
+static int cmd_sd_df(struct cli_instance *sh, int argc, char **argv)
+{
+	return fs_core_info(&sd_dev, sh, argc, argv);
+}
+
+static int cmd_sd_umount(struct cli_instance *sh, int argc, char **argv)
+{
+	return fs_core_umount(&sd_dev, sh, argc, argv);
+}
+
 CLI_SUBCMD_SET_CREATE(sd_subcmds,
-	CLI_CMD_ARG(info, NULL, "card type/capacity/geometry/CID/CSD", cmd_sd_info, 1, 0),
-	CLI_CMD_ARG(read, NULL, "hexdump one 512 B block <lba>",       cmd_sd_read, 2, 0),
+	CLI_CMD_ARG(info,   NULL, "card type/capacity/geometry/CID/CSD", cmd_sd_info,   1, 0),
+	CLI_CMD_ARG(read,   NULL, "hexdump one 512 B block <lba>",       cmd_sd_read,   2, 0),
+	CLI_CMD_ARG(ls,     NULL, "list directory [path]",               cmd_sd_ls,     1, 1),
+	CLI_CMD_ARG(cat,    NULL, "print file <path>",                   cmd_sd_cat,    2, 0),
+	CLI_CMD_ARG(write,  NULL, "write <path> <text>",                 cmd_sd_write,  3, 0),
+	CLI_CMD_ARG(rm,     NULL, "delete file/empty dir <path>",        cmd_sd_rm,     2, 0),
+	CLI_CMD_ARG(mkdir,  NULL, "create directory <path>",             cmd_sd_mkdir,  2, 0),
+	CLI_CMD_ARG(df,     NULL, "filesystem capacity / free (FAT)",    cmd_sd_df,     1, 0),
+	CLI_CMD_ARG(umount, NULL, "flush and unmount",                   cmd_sd_umount, 1, 0),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(sd, sd_subcmds,
-                 "microSD card (SDMMC1, DMA)", NULL, 1, 0);
+                 "microSD card (SDMMC1, FileX FAT)", NULL, 1, 0);

@@ -121,13 +121,34 @@ touched solely by CPU memcpy, so any alignment is safe.
 
 ## `sd` shell command
 
+Low-level (card) commands:
+
 ```
 sd info        card type / capacity / block geometry / bus width / CID / CSD
 sd read <lba>  hexdump one 512 B block (LBA addressing)
 ```
 
-Phase A is read-only. `sd info` re-identifies the card each call; `sd read`
-identifies it first if not yet probed (or after a card swap).
+Filesystem (FileX FAT, #34) commands -- sharing the common core with `fs` (QSPI):
+
+```
+sd ls [path]        list a directory (default /)
+sd cat <path>       print a file
+sd write <p> <txt>  create/overwrite a file (quote for spaces)
+sd rm <path>        delete a file / empty directory
+sd mkdir <path>     create a directory
+sd df               filesystem capacity / free / FAT type (64-bit)
+sd umount           flush + unmount
+```
+
+- The filesystem **lazy-mounts** on the first `sd` FS command (no reformat), so a
+  PC-created FAT32 reads/writes directly and interoperates. Architecture:
+  [Filesystem](../rtos/filesystem.md).
+- **`sd info` / `sd read` are raw-gated**: they may re-identify the card, so they
+  are refused while the FS is mounted (`sd umount` first). When unmounted they
+  behave as before (probe only when needed).
+- Both MBR (standard PC format) and superfloppy (VBR @ 0) cards mount (the driver
+  detects the layout at LBA 0).
+- `sd format` (FAT32) is Phase C.
 
 ## Bring-up check
 

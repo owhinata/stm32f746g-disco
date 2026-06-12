@@ -58,3 +58,30 @@ The media cache is a static 4 KB (8 × 512 B sectors); the LevelX sector/verify 
 - Power-loss-during-write integrity is **out of MVP scope**
 
 Command usage: [Shell / fs command](shell-fs.md).
+
+## Media-independent core and microSD (Epic #32 / #34)
+
+`fs` (QSPI) and `sd` (microSD, [SDMMC1](../hardware/sdmmc.md)) share **one set of FileX command bodies**; the media difference is absorbed by a `struct fs_device` vtable (`shell/cmds/fs_cmd_core.h`):
+
+```
+shell `fs`/`sd` command (cmd_fs.c / cmd_sd.c: device binding + registration)
+  -> fs_cmd_core.c   ls/cat/write/rm/mkdir/info(df)/umount  <- via struct fs_device
+     -> QSPI: fs_glue.c -> fx_lx_nor_driver.c -> LevelX -> QSPI
+     -> SD  : sd_fs_glue.c -> fx_sd_driver.c -> sd_card_* (SDMMC1 + DMA)
+```
+
+- **`struct fs_device`**: `acquire`/`unmount`/`is_mounted`, the ownership gates (`op_begin/end`, `excl_begin/end`), `dir_lock/unlock`, `mount_hint`, and `info_extra` (QSPI = wear line / SD = none). The CLI leaf handler cannot tell `fs` from `sd` (argv[0] is the leaf name), so each command file registers thin wrappers that close over its own `fs_device`.
+- `fs info` (QSPI) and `sd df` (SD) share the same `fs_core_info` body. Capacity is computed with **`fx_media_extended_space_available()` (64-bit)** so multi-GB microSD cards do not overflow.
+- The ownership model (shared/exclusive/raw + lazy mount) is **independent** between QSPI and SD (separate `FX_MEDIA` / cache / mutexes). `fx_system_initialize()` is called once by `fs_glue_init()`; `sd_fs_glue_init()` only creates mutexes.
+
+### microSD FileX driver (`port/filex/fx_sd_driver.c`)
+
+The SD card has an internal FTL, so there is **no LevelX**; the driver maps FileX requests straight onto `sd_card_read/write_blocks()`.
+
+- **MBR / superfloppy handling**: FileX's `fx_media_open` only reads LBA 0 as the boot sector and never computes a partition offset. PC/camera formats are **MBR (LBA 0) + FAT32 VBR (partition start)**, so the driver reads LBA 0 at `INIT`: a **strong VBR check** (jmpBoot + `55 aa` + BPB sanity) means superfloppy (`sd_part_lba = 0`), otherwise it takes partition 0's start LBA / size from the MBR. Every access is then `physical = sd_part_lba + logical`. `fx_media_hidden_sectors` is not used (avoids double-counting).
+- **Range guards**: every request checks, in subtraction form, that `logical + count` stays within the partition size (`sd_part_blocks`) and that the physical addition does not 32-bit wrap, so a corrupt MBR/VBR cannot write outside the partition.
+- **DMA / D-cache**: the caller buffer FileX passes (cached SRAM) is bounced through the SRAM1 DMA buffer with cache maintenance inside `sd_card_*`, so the driver layer needs no extra cache handling.
+
+### microSD <-> PC interop
+
+`sd` does **not reformat on mount**, so a PC-created FAT32 reads/writes directly and board-written files are readable on a PC. The low-level `sd info` (card identity) / `sd read` (raw block) may re-identify the card, so they are refused by the raw gate while the FS is mounted (`sd umount` first). `sd format` (FAT32) is a follow-up (Phase C). Commands: [microSD (SDMMC1 + DMA)](../hardware/sdmmc.md).

@@ -77,12 +77,29 @@ DMA は常に **`sd_bounce`**（`8*512 = 4 KiB`、**32 B 整列**、リンカ `.
 
 ## `sd` シェルコマンド
 
+低レベル（カード）コマンド:
+
 ```
 sd info        カード種別 / 容量 / ブロックジオメトリ / バス幅 / CID / CSD
 sd read <lba>  1 ブロック（512 B）の hexdump（LBA アドレス）
 ```
 
-Phase A は読出しのみ。`sd info` は毎回カードを認識し直す。`sd read` は未認識（またはカード入替え後）なら認識してから読む。
+ファイルシステム（FileX FAT、#34）コマンド — `fs`(QSPI) と共通コアを共有:
+
+```
+sd ls [path]        ディレクトリ一覧（既定 /）
+sd cat <path>       ファイル表示
+sd write <p> <txt>  ファイル作成/上書き（空白はクォート）
+sd rm <path>        ファイル / 空ディレクトリ削除
+sd mkdir <path>     ディレクトリ作成
+sd df               FS 容量 / 空き / FAT 種別（64-bit）
+sd umount           flush + アンマウント
+```
+
+- FS は最初の `sd` FS コマンドで **lazy mount**（再フォーマットしない）。PC で作った FAT32 をそのまま読み書きでき、相互運用できる。詳細・アーキテクチャは [ファイルシステム](../rtos/filesystem.md)。
+- **`sd info`/`sd read` は raw gate**: カードを再識別しうるため、FS マウント中は拒否される（`sd umount` が退避経路）。未マウント時は従来どおり（必要時のみ probe）。
+- MBR(PC 標準) と superfloppy(VBR@0) の両方をマウントできる（ドライバが LBA0 を判定）。
+- `sd format`（FAT32）は Phase C。
 
 ## 動作確認
 

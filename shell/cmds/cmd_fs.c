@@ -12,20 +12,19 @@
  *   fs write <path> <text> create/overwrite a file with <text> (quote for spaces)
  *   fs rm <path>           delete a file or empty directory
  *   fs mkdir <path>        create a directory
- *   fs info                capacity / free space / FAT type
+ *   fs info                capacity / free space / FAT type / wear
  *   fs umount              flush + unmount (e.g. before `qspi test`)
  *
- * The media mounts lazily on first use (port/filex/fs_glue.c); on a virgin or
- * non-LevelX flash every command fails with a hint to run `fs format`.  Every
- * mutating command ends with fx_media_flush(), so a `reboot` (or power cycle)
- * any time later finds consistent content -- no explicit unmount needed.
- * Paths are absolute (FX_NO_LOCAL_PATH).  All output is via the cli_* API and
- * the only state is the mutex-guarded media singleton, so the commands are
- * safe from background jobs too (issue #25).
+ * Since issue #34 the media-independent bodies (ls/cat/write/rm/mkdir/info/
+ * umount) live in fs_cmd_core.c and are shared with the `sd` command; this file
+ * keeps only the QSPI-specific pieces: the LevelX format, the wear info line,
+ * the `struct fs_device` instance binding the QSPI glue, and the thin wrappers
+ * that register them.  Behaviour is unchanged from #30/#31.
  *
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
+#include "fs_cmd_core.h"
 #include "fs_glue.h"
 #include "fx_lx_nor_driver.h"
 #include "lx_nor_qspi_driver.h"
@@ -33,69 +32,35 @@
 
 #include <string.h>
 
-/* One read/copy unit for `fs cat`; small enough for the 4 KB shell stack. */
-#define FS_CAT_CHUNK 256u
+/* ---- QSPI device binding -------------------------------------------------- */
 
-static const char *fs_strerror(UINT status)
+/* Wear-leveling visibility (issue #31): LevelX keeps per-block erase counts in
+ * the block headers and tracks min/max live (updated at open and on every
+ * reclaim), so the spread shows leveling at work.  Trailing line of `fs info`. */
+static void qspi_info_extra(struct cli_instance *sh, FX_MEDIA *media)
 {
-	switch (status) {
-	case FS_ERR_BUSY:        return "busy (format in progress)";
-	case FX_BOOT_ERROR:      return "invalid boot record (run `fs format`)";
-	case FX_MEDIA_INVALID:   return "media invalid (run `fs format`)";
-	case FX_NOT_FOUND:       return "not found";
-	case FX_NOT_A_FILE:      return "not a file";
-	case FX_ACCESS_ERROR:    return "access error";
-	case FX_FILE_CORRUPT:    return "file corrupt";
-	case FX_NO_MORE_SPACE:   return "no space left";
-	case FX_ALREADY_CREATED: return "already exists";
-	case FX_INVALID_NAME:    return "invalid name";
-	case FX_NOT_DIRECTORY:   return "not a directory";
-	case FX_DIR_NOT_EMPTY:   return "directory not empty";
-	case FX_MEDIA_NOT_OPEN:  return "media not open";
-	case FX_WRITE_PROTECT:   return "write protected";
-	case FX_IO_ERROR:        return "I/O error";
-	default:                 return "filesystem error";
-	}
+	LX_NOR_FLASH *lx = fx_lx_nor_flash();
+
+	(void)media;
+	if (lx != NULL)
+		cli_print(sh, "wear     : erase count min %lu / max %lu\r\n",
+		          (unsigned long)lx->lx_nor_flash_minimum_erase_count,
+		          (unsigned long)lx->lx_nor_flash_maximum_erase_count);
 }
 
-/*
- * Run one normal fs subcommand body under a shared op slot, so `fs format` /
- * `fs umount` / raw qspi operations can never yank the media away mid-command
- * (they fail with FS_ERR_BUSY instead while any body is inside).
- */
-static int fs_run_op(struct cli_instance *sh, int argc, char **argv,
-                     int (*body)(struct cli_instance *, int, char **))
-{
-	UINT status = fs_op_begin();
-	int rc;
+static const struct fs_device qspi_dev = {
+	.name       = "fs",
+	.mount_hint = "not formatted? run `fs format yes`",
+	.acquire    = fs_media_acquire,
+	.unmount    = fs_media_unmount,
+	.is_mounted = fs_is_mounted,
+	.op_begin   = fs_op_begin,   .op_end   = fs_op_end,
+	.excl_begin = fs_exclusive_begin, .excl_end = fs_exclusive_end,
+	.dir_lock   = fs_dir_lock,   .dir_unlock = fs_dir_unlock,
+	.info_extra = qspi_info_extra,
+};
 
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: %s\r\n", fs_strerror(status));
-		return 1;
-	}
-	rc = body(sh, argc, argv);
-	fs_op_end();
-	return rc;
-}
-
-/* Mount-on-demand wrapper shared by every subcommand that needs the media. */
-static FX_MEDIA *fs_mount(struct cli_instance *sh)
-{
-	FX_MEDIA *media;
-	UINT status;
-
-	status = fs_media_acquire(&media);
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: mount failed: %s (0x%02x)\r\n",
-		          fs_strerror(status), status);
-		if (status != FS_ERR_BUSY)
-			cli_error(sh, "fs: not formatted? run `fs format yes`\r\n");
-		return NULL;
-	}
-	return media;
-}
-
-/* ---- fs format ------------------------------------------------------------ */
+/* ---- fs format (QSPI-specific: LevelX + full erase) ----------------------- */
 
 /*
  * Erase all 256 blocks with progress + Ctrl+C between blocks.  A cancelled run
@@ -194,319 +159,47 @@ out:
 	fs_exclusive_end();
 	if (rc != 0)
 		return 1;
-	if (fs_mount(sh) == NULL)
+	if (fs_core_mount(&qspi_dev, sh) == NULL)
 		return 1;
 	cli_print(sh, "formatted and mounted\r\n");
 	return 0;
 }
 
-/* ---- fs ls ---------------------------------------------------------------- */
+/* ---- thin wrappers: bind qspi_dev to the shared command bodies ------------ */
 
-static int do_fs_ls(struct cli_instance *sh, int argc, char **argv)
-{
-	char name[FX_MAX_LONG_NAME_LEN];
-	const char *path = (argc >= 2) ? argv[1] : "/";
-	FX_MEDIA *media = fs_mount(sh);
-	UINT attr, status;
-	ULONG size;
-	int rc = 0;
-
-	if (media == NULL)
-		return 1;
-
-	/* The default directory is media-global and the iteration spans many
-	 * FileX calls; serialize whole listings against each other (bg jobs). */
-	fs_dir_lock();
-
-	status = fx_directory_default_set(media, (CHAR *)path);
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: %s: %s (0x%02x)\r\n",
-		          path, fs_strerror(status), status);
-		fs_dir_unlock();
-		return 1;
-	}
-
-	status = fx_directory_first_full_entry_find(media, name, &attr, &size,
-	                                            NULL, NULL, NULL,
-	                                            NULL, NULL, NULL);
-	while (status == FX_SUCCESS) {
-		if (cli_cancel_requested(sh)) {
-			rc = 1;
-			break;
-		}
-		if (cli_print(sh, "%c %8lu  %s\r\n",
-		              (attr & FX_DIRECTORY) ? 'd' : '-',
-		              (unsigned long)size, name) < 0) {
-			rc = 1;
-			break;
-		}
-		status = fx_directory_next_full_entry_find(media, name, &attr, &size,
-		                                           NULL, NULL, NULL,
-		                                           NULL, NULL, NULL);
-	}
-	if (status != FX_SUCCESS && status != FX_NO_MORE_ENTRIES && rc == 0) {
-		cli_error(sh, "fs: ls failed: %s (0x%02x)\r\n",
-		          fs_strerror(status), status);
-		rc = 1;
-	}
-
-	(void)fx_directory_default_set(media, "/");
-	fs_dir_unlock();
-	return rc;
-}
-
-/* ---- fs cat --------------------------------------------------------------- */
-
-static int do_fs_cat(struct cli_instance *sh, int argc, char **argv)
-{
-	char buf[FS_CAT_CHUNK];
-	FX_MEDIA *media = fs_mount(sh);
-	FX_FILE file;
-	ULONG got;
-	UINT status;
-	int rc = 0;
-
-	(void)argc;
-
-	if (media == NULL)
-		return 1;
-
-	status = fx_file_open(media, &file, argv[1], FX_OPEN_FOR_READ);
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: %s: %s (0x%02x)\r\n",
-		          argv[1], fs_strerror(status), status);
-		return 1;
-	}
-
-	for (;;) {
-		if (cli_cancel_requested(sh)) {
-			rc = 1;
-			break;
-		}
-		status = fx_file_read(&file, buf, sizeof buf, &got);
-		if (status == FX_END_OF_FILE)
-			break;
-		if (status != FX_SUCCESS) {
-			cli_error(sh, "fs: read failed: %s (0x%02x)\r\n",
-			          fs_strerror(status), status);
-			rc = 1;
-			break;
-		}
-		if (cli_write(sh, buf, got) < 0) {
-			rc = 1;
-			break;
-		}
-	}
-	(void)fx_file_close(&file);
-	if (rc == 0)
-		cli_print(sh, "\r\n");
-	return rc;
-}
-
-/* ---- fs write ------------------------------------------------------------- */
-
-static int do_fs_write(struct cli_instance *sh, int argc, char **argv)
-{
-	FX_MEDIA *media = fs_mount(sh);
-	FX_FILE file;
-	ULONG len = (ULONG)strlen(argv[2]);
-	UINT status;
-
-	(void)argc;
-
-	if (media == NULL)
-		return 1;
-
-	status = fx_file_create(media, argv[1]);
-	if (status != FX_SUCCESS && status != FX_ALREADY_CREATED) {
-		cli_error(sh, "fs: create %s: %s (0x%02x)\r\n",
-		          argv[1], fs_strerror(status), status);
-		return 1;
-	}
-
-	status = fx_file_open(media, &file, argv[1], FX_OPEN_FOR_WRITE);
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: open %s: %s (0x%02x)\r\n",
-		          argv[1], fs_strerror(status), status);
-		return 1;
-	}
-
-	/* Overwrite semantics: truncate, write, close, flush to flash. */
-	status = fx_file_truncate(&file, 0);
-	if (status == FX_SUCCESS && len > 0)
-		status = fx_file_write(&file, argv[2], len);
-	(void)fx_file_close(&file);
-	if (status == FX_SUCCESS)
-		status = fx_media_flush(media);
-
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: write failed: %s (0x%02x)\r\n",
-		          fs_strerror(status), status);
-		return 1;
-	}
-	cli_print(sh, "wrote %lu bytes to %s\r\n", (unsigned long)len, argv[1]);
-	return 0;
-}
-
-/* ---- fs rm / mkdir -------------------------------------------------------- */
-
-static int do_fs_rm(struct cli_instance *sh, int argc, char **argv)
-{
-	FX_MEDIA *media = fs_mount(sh);
-	UINT status;
-
-	(void)argc;
-
-	if (media == NULL)
-		return 1;
-
-	status = fx_file_delete(media, argv[1]);
-	if (status == FX_NOT_A_FILE)
-		status = fx_directory_delete(media, argv[1]);
-	if (status == FX_SUCCESS)
-		status = fx_media_flush(media);
-
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: rm %s: %s (0x%02x)\r\n",
-		          argv[1], fs_strerror(status), status);
-		return 1;
-	}
-	cli_print(sh, "removed %s\r\n", argv[1]);
-	return 0;
-}
-
-static int do_fs_mkdir(struct cli_instance *sh, int argc, char **argv)
-{
-	FX_MEDIA *media = fs_mount(sh);
-	UINT status;
-
-	(void)argc;
-
-	if (media == NULL)
-		return 1;
-
-	status = fx_directory_create(media, argv[1]);
-	if (status == FX_SUCCESS)
-		status = fx_media_flush(media);
-
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: mkdir %s: %s (0x%02x)\r\n",
-		          argv[1], fs_strerror(status), status);
-		return 1;
-	}
-	cli_print(sh, "created %s\r\n", argv[1]);
-	return 0;
-}
-
-/* ---- fs info / umount ------------------------------------------------------ */
-
-static int do_fs_info(struct cli_instance *sh, int argc, char **argv)
-{
-	FX_MEDIA *media;
-	LX_NOR_FLASH *lx;
-	ULONG avail = 0, total_bytes, clusters;
-	UINT status;
-
-	(void)argc; (void)argv;
-
-	if (!fs_is_mounted())
-		cli_print(sh, "state    : unmounted (mounting...)\r\n");
-	media = fs_mount(sh);
-	if (media == NULL)
-		return 1;
-
-	clusters    = media->fx_media_total_clusters;
-	total_bytes = clusters * media->fx_media_sectors_per_cluster *
-	              media->fx_media_bytes_per_sector;
-	status = fx_media_space_available(media, &avail);
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: space query failed: %s (0x%02x)\r\n",
-		          fs_strerror(status), status);
-		return 1;
-	}
-
-	cli_print(sh, "state    : mounted\r\n");
-	cli_print(sh, "fat      : FAT%s (%lu clusters)\r\n",
-	          (clusters < 4085u) ? "12" : (clusters < 65525u) ? "16" : "32",
-	          (unsigned long)clusters);
-	cli_print(sh, "cluster  : %lu B\r\n",
-	          (unsigned long)(media->fx_media_sectors_per_cluster *
-	                          media->fx_media_bytes_per_sector));
-	cli_print(sh, "total    : %lu KiB\r\n", (unsigned long)(total_bytes / 1024u));
-	cli_print(sh, "free     : %lu KiB\r\n", (unsigned long)(avail / 1024u));
-
-	/* Wear-leveling visibility (issue #31): LevelX keeps per-block erase
-	 * counts in the block headers and tracks min/max live (updated at open
-	 * and on every reclaim), so the spread shows leveling at work. */
-	lx = fx_lx_nor_flash();
-	if (lx != NULL)
-		cli_print(sh, "wear     : erase count min %lu / max %lu\r\n",
-		          (unsigned long)lx->lx_nor_flash_minimum_erase_count,
-		          (unsigned long)lx->lx_nor_flash_maximum_erase_count);
-	return 0;
-}
-
-static int cmd_fs_umount(struct cli_instance *sh, int argc, char **argv)
-{
-	UINT status;
-	int rc = 0;
-
-	(void)argc; (void)argv;
-
-	/* Unmount closes the media (and any open files with it), so it needs the
-	 * same exclusive ownership as format: refused while a command is inside. */
-	status = fs_exclusive_begin();
-	if (status != FX_SUCCESS) {
-		cli_error(sh, "fs: %s\r\n", fs_strerror(status));
-		return 1;
-	}
-
-	if (!fs_is_mounted()) {
-		cli_print(sh, "not mounted\r\n");
-	} else {
-		status = fs_media_unmount();
-		if (status != FX_SUCCESS) {
-			cli_error(sh, "fs: unmount failed: %s (0x%02x)\r\n",
-			          fs_strerror(status), status);
-			rc = 1;
-		} else {
-			cli_print(sh, "unmounted\r\n");
-		}
-	}
-
-	fs_exclusive_end();
-	return rc;
-}
-
-/* Thin wrappers: every normal subcommand body runs under a shared op slot. */
 static int cmd_fs_ls(struct cli_instance *sh, int argc, char **argv)
 {
-	return fs_run_op(sh, argc, argv, do_fs_ls);
+	return fs_core_ls(&qspi_dev, sh, argc, argv);
 }
 
 static int cmd_fs_cat(struct cli_instance *sh, int argc, char **argv)
 {
-	return fs_run_op(sh, argc, argv, do_fs_cat);
+	return fs_core_cat(&qspi_dev, sh, argc, argv);
 }
 
 static int cmd_fs_write(struct cli_instance *sh, int argc, char **argv)
 {
-	return fs_run_op(sh, argc, argv, do_fs_write);
+	return fs_core_write(&qspi_dev, sh, argc, argv);
 }
 
 static int cmd_fs_rm(struct cli_instance *sh, int argc, char **argv)
 {
-	return fs_run_op(sh, argc, argv, do_fs_rm);
+	return fs_core_rm(&qspi_dev, sh, argc, argv);
 }
 
 static int cmd_fs_mkdir(struct cli_instance *sh, int argc, char **argv)
 {
-	return fs_run_op(sh, argc, argv, do_fs_mkdir);
+	return fs_core_mkdir(&qspi_dev, sh, argc, argv);
 }
 
 static int cmd_fs_info(struct cli_instance *sh, int argc, char **argv)
 {
-	return fs_run_op(sh, argc, argv, do_fs_info);
+	return fs_core_info(&qspi_dev, sh, argc, argv);
+}
+
+static int cmd_fs_umount(struct cli_instance *sh, int argc, char **argv)
+{
+	return fs_core_umount(&qspi_dev, sh, argc, argv);
 }
 
 CLI_SUBCMD_SET_CREATE(fs_subcmds,
