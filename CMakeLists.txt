@@ -45,6 +45,12 @@ set(GEN_DIR "${CMAKE_BINARY_DIR}/gen")
 configure_file("${HAL_DIR}/Inc/stm32f7xx_hal_conf_template.h"
                "${GEN_DIR}/stm32f7xx_hal_conf.h" COPYONLY)
 
+# Compile-time gate for the IWDG watchdog + `wdt` command (issue #38).  ON by
+# default; build with -DBSP_ENABLE_IWDG=OFF to drop the IWDG/LSI/petter entirely.
+# Defined on bsp_iface (below) -- NOT on the threadx target -- because src/bsp.c is
+# compiled in the `common` object library, which only sees bsp_iface's defines.
+option(BSP_ENABLE_IWDG "Enable the IWDG watchdog and wdt shell command" ON)
+
 # Usage requirements shared by every target (includes, defs, MCU flags, link).
 add_library(bsp_iface INTERFACE)
 target_include_directories(bsp_iface INTERFACE
@@ -53,7 +59,8 @@ target_include_directories(bsp_iface INTERFACE
     "${HAL_DIR}/Inc"
     "${CMSIS_DEV}/Include"
     "${CMSIS_CORE}/Include")
-target_compile_definitions(bsp_iface INTERFACE USE_HAL_DRIVER STM32F746xx)
+target_compile_definitions(bsp_iface INTERFACE USE_HAL_DRIVER STM32F746xx
+    BSP_ENABLE_IWDG=$<BOOL:${BSP_ENABLE_IWDG}>)   # issue #38; reaches common + threadx
 target_compile_options(bsp_iface INTERFACE
     ${MCU_OPTS} -Wall -fdata-sections -ffunction-sections -g -gdwarf-2)
 target_link_options(bsp_iface INTERFACE
@@ -206,6 +213,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/src/main.c"
     "${CMAKE_SOURCE_DIR}/src/log.c"
     "${CMAKE_SOURCE_DIR}/src/fault.c"
+    "${CMAKE_SOURCE_DIR}/src/iwdg.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_dmesg.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_crash.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
@@ -215,6 +223,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_coremark.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sleep.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_watch.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_wdt.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_qspi.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_fs.c"

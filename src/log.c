@@ -132,6 +132,11 @@ static uint16_t rec_total_at(uint32_t off)
 
 /* ---- init / reset cause ------------------------------------------------ */
 
+/* RCC->CSR snapshot from log_init(), kept because log_init() clears the flags
+ * (RMVF) right after reading them -- `wdt info` (issue #38) reads this back via
+ * log_reset_cause() to show what caused this boot (e.g. "IWDG"). */
+static uint32_t g_reset_csr;
+
 static const char *reset_cause_str(uint32_t csr)
 {
 	if (csr & RCC_CSR_LPWRRSTF) return "LPWR";
@@ -148,6 +153,7 @@ void log_init(void)
 {
 	uint32_t csr = RCC->CSR;        /* capture before clearing the flags */
 	RCC->CSR |= RCC_CSR_RMVF;       /* clear so the next boot reads its own cause */
+	g_reset_csr = csr;              /* keep for log_reset_cause() (issue #38) */
 
 	int valid = (g_log.magic == LOG_MAGIC) &&
 	            (g_log.version == LOG_VERSION) &&
@@ -196,6 +202,11 @@ void log_init(void)
 
 	log_write(LOG_LEVEL_INF, "boot", "#%lu reset cause: %s",
 	          (unsigned long)g_log.boot_count, reset_cause_str(csr));
+}
+
+const char *log_reset_cause(void)
+{
+	return reset_cause_str(g_reset_csr);
 }
 
 /* ---- append ------------------------------------------------------------ */

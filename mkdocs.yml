@@ -75,6 +75,7 @@ nav:
       - rtos/shell-fs.md
       - rtos/filesystem.md
       - rtos/logging.md
+      - rtos/iwdg.md
 
 markdown_extensions:
   - admonition

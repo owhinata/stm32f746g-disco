@@ -31,6 +31,7 @@
 #include "cli_fmt.h"
 #include "stm32f7xx_hal.h"
 #include "tx_api.h"
+#include "iwdg.h"        /* BSP_ENABLE_IWDG: debugger-aware fault halt (issue #38) */
 
 /* ThreadX current-thread pointer (tx_thread.h is internal; declare it here). */
 extern TX_THREAD *_tx_thread_current_ptr;
@@ -149,14 +150,30 @@ static void fault_backtrace(uint32_t sp, uint32_t top, uint32_t pc, uint32_t lr)
 
 /* ---- C fault handler --------------------------------------------------- */
 
+/* Final resting state for every fault path.  With the IWDG built in (issue #38)
+ * the board stays halted only while a debugger owns the core (DHCSR C_DEBUGEN is
+ * set): pet the watchdog so SWD post-mortem stays possible.  With no debugger we
+ * do NOT pet, so the IWDG times out (~2-6 s) and resets the board -- an unattended
+ * fault auto-recovers.  Without the IWDG it is a plain spin (SWD can still attach,
+ * #26).  IWDG->KR is written directly (no HAL handle) so it is safe here even with
+ * IRQs disabled and no valid driver state. */
+static void fault_halt(void)
+{
+	for (;;) {
+#if BSP_ENABLE_IWDG
+		if (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk)
+			IWDG->KR = 0x0000AAAAu;     /* reload key: refresh to hold the halt */
+#endif
+	}
+}
+
 void fault_handler_c(uint32_t *frame, uint32_t exc_return, uint32_t *cs_regs)
 {
 	static volatile uint32_t in_fault;
 
 	__disable_irq();
 	if (in_fault)
-		for (;;)                        /* secondary fault while dumping: halt */
-			;
+		fault_halt();                   /* secondary fault while dumping: halt */
 	in_fault = 1u;
 
 	/* The stacked frame may itself be unreadable on a stacking fault
@@ -230,8 +247,7 @@ void fault_handler_c(uint32_t *frame, uint32_t exc_return, uint32_t *cs_regs)
 		fault_puts(" stacked frame unavailable (stacking fault?)\r\n halted.\r\n");
 		while (!(USART1->ISR & USART_ISR_TC) && (USART1->CR1 & USART_CR1_UE))
 			;
-		for (;;)
-			;
+		fault_halt();
 	}
 
 	fault_printf(" R0=%08lx R1=%08lx R2=%08lx R3=%08lx\r\n",
@@ -261,8 +277,7 @@ void fault_handler_c(uint32_t *frame, uint32_t exc_return, uint32_t *cs_regs)
 	while (!(USART1->ISR & USART_ISR_TC) && (USART1->CR1 & USART_CR1_UE))
 		;                               /* let the last bytes leave */
 
-	for (;;)
-		;                               /* halt; SWD can still attach (#26) */
+	fault_halt();                       /* halt; SWD can still attach (#26) */
 }
 
 /* ---- naked entry stubs ------------------------------------------------- */

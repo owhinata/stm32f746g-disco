@@ -9,6 +9,7 @@
  *   - VCP    : USART1, TX=PA9 / RX=PB7, 115200 8N1 (ST-Link Virtual COM Port)
  */
 #include "bsp.h"
+#include "iwdg.h"        /* BSP_ENABLE_IWDG gate (LSI enable / DBGMCU freeze) */
 #include <stdio.h>
 
 #define LOG_TAG "bsp"
@@ -36,6 +37,13 @@ void bsp_init(void)
     fault_init();   /* enable Mem/Bus/Usage faults before the rest of bring-up */
 
     HAL_Init();
+#if BSP_ENABLE_IWDG
+    /* Freeze the IWDG counter when the core is halted by the debugger (RM0385
+       §40.16.5 DBGMCU_APB1_FZ.DBG_IWDG_STOP), so a SWD breakpoint does not let the
+       watchdog reset the board out from under the debug session (issue #38).  The
+       IWDG itself is armed late, at the end of tx_application_define(). */
+    __HAL_DBGMCU_FREEZE_IWDG();
+#endif
     SystemClock_Config();
     VCP_UART_Init();
     exec_timebase_init();   /* TIM2 free-run = ThreadX exec-profile time source (issue #19) */
@@ -108,6 +116,13 @@ static void SystemClock_Config(void)
 
     RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
     RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
+#if BSP_ENABLE_IWDG
+    /* Also bring up the LSI: the IWDG (issue #38) is clocked from it.  OR it into
+       the oscillator set so HSE/PLL stay untouched; HAL_RCC_OscConfig() waits for
+       LSIRDY.  LSI is independent of the HSE+PLL 216 MHz tree (RM0385 5.2). */
+    RCC_OscInitStruct.OscillatorType |= RCC_OSCILLATORTYPE_LSI;
+    RCC_OscInitStruct.LSIState        = RCC_LSI_ON;
+#endif
     RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
     RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
     RCC_OscInitStruct.PLL.PLLM       = 25;

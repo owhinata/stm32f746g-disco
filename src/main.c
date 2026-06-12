@@ -38,6 +38,7 @@
 #include "fs_glue.h"
 #include "sd_card.h"
 #include "sd_fs_glue.h"
+#include "iwdg.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -94,6 +95,31 @@ static void led_entry(ULONG arg)
 	}
 }
 
+#if BSP_ENABLE_IWDG
+/* IWDG petter (issue #38): a high-priority thread whose only job is to refresh the
+ * independent watchdog ~1 s.  Priority 5 sits above led (10), cli (16) and the bg
+ * workers (17), so it preempts CoreMark and any lower-priority runaway -- the
+ * watchdog then fires only on a tick/scheduler stall, an IRQ-off lockup, or a
+ * runaway at priority < 5.  ~1 s pet is <= T/2 at every LSI corner (T = 2.04 s at
+ * the 47 kHz fast corner), the standard refresh margin. */
+#define IWDG_PETTER_STACK_SIZE  512
+#define IWDG_PETTER_PRIORITY    5
+
+static TX_THREAD iwdg_thread;
+static UCHAR     iwdg_stack[IWDG_PETTER_STACK_SIZE];
+
+static void iwdg_entry(ULONG arg)
+{
+	(void)arg;
+
+	iwdg_refresh();             /* pet before the first sleep: minimise init->pet */
+	for (;;) {
+		tx_thread_sleep(1000);  /* ~1 s (1 tick == 1 ms) */
+		iwdg_refresh();
+	}
+}
+#endif /* BSP_ENABLE_IWDG */
+
 /* Called by ThreadX during tx_kernel_enter() to create the application. */
 void tx_application_define(void *first_unused_memory)
 {
@@ -143,6 +169,27 @@ void tx_application_define(void *first_unused_memory)
 	 * mounts lazily on the first `sd` FS command.  fx_system_initialize() was
 	 * already run by fs_glue_init(), so this does not repeat it. */
 	sd_fs_glue_init();
+
+#if BSP_ENABLE_IWDG
+	/* IWDG last (issue #38).  Order here is deliberate and must stay
+	 * "petter create -> iwdg_init() -> tx_glue_timer_enable()":
+	 *   - All fail-soft bring-up above (QSPI/SD HAL init can block up to ~5 s on a
+	 *     media fault) completes BEFORE the watchdog arms, so a media fault stays
+	 *     "qspi/sd disabled, shell keeps running" instead of a reset loop.
+	 *   - The petter exists before iwdg_init() arms the IWDG, and the scheduler
+	 *     starts right after, so the init->first-pet window is sub-millisecond. */
+	UINT iwdg_rc = tx_thread_create(&iwdg_thread, "iwdg", iwdg_entry, 0,
+	                                iwdg_stack, sizeof iwdg_stack,
+	                                IWDG_PETTER_PRIORITY, IWDG_PETTER_PRIORITY,
+	                                TX_NO_TIME_SLICE, TX_AUTO_START);
+	if (iwdg_rc == TX_SUCCESS)
+		iwdg_init();    /* arm only once the petter exists to refresh it */
+	else
+		/* No petter -> arming the IWDG would just reset-loop.  Fail soft like the
+		 * QSPI/SD bring-up above: skip the watchdog, keep the system running. */
+		printf("iwdg: petter create failed (%u); watchdog NOT armed\r\n",
+		       (unsigned)iwdg_rc);
+#endif
 
 	/* Timer lists exist now: let the SysTick ISR drive ThreadX. */
 	tx_glue_timer_enable();

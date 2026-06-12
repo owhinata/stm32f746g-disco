@@ -82,6 +82,11 @@ void log_vwrite(unsigned level, const char *tag, const char *fmt, va_list ap);
 /** Drop all stored records, keeping the sequence counter (dmesg -c). */
 void log_clear(void);
 
+/** Decoded cause of THIS boot's reset ("IWDG"/"SFT"/"POR"/...), captured by
+ *  log_init() before the RCC->CSR flags are cleared.  Used by `wdt info`
+ *  (issue #38); "?" if no flag was set. */
+const char *log_reset_cause(void);
+
 /** Run-time severity threshold: records above @p level are dropped (default
  *  INF).  log_get_level() returns the current threshold. */
 void     log_set_level(unsigned level);
