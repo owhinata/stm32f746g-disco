@@ -10,9 +10,10 @@
  *   sdram test [bytes]   DESTRUCTIVE write/read-back memtest (default: all 8 MB)
  *
  * The test overwrites the tested span -- everything placed in the `.sdram`
- * linker section (e.g. the camera frame buffer, #41) is clobbered.  Consumers
- * own their validity flags; the camera driver re-captures on demand, so no
- * cross-module hook is needed beyond the warning printed here.
+ * linker section (the camera frame buffer, #41) is clobbered, so the test
+ * first drops the camera's captured-frame flag via camera_frame_invalidate()
+ * (otherwise `camera save`/stats would read test patterns believing them to
+ * be a frame).
  *
  * Three passes over the span, word-wise: (1) address pattern (each word holds
  * its own address -- catches stuck/shorted/aliased address lines, which a
@@ -29,6 +30,7 @@
  */
 #include "cli.h"
 #include "sdram.h"
+#include "camera.h"   /* camera_frame_invalidate: the test clobbers .sdram */
 
 #include <stdint.h>
 
@@ -152,6 +154,7 @@ static int cmd_sdram_test(struct cli_instance *sh, int argc, char **argv)
 	cli_warn(sh, "sdram: DESTRUCTIVE test over %lu KB "
 	             "(clobbers .sdram contents, e.g. a captured frame)\r\n",
 	         (unsigned long)(bytes / 1024u));
+	camera_frame_invalidate();
 
 	for (unsigned p = 0; p < sizeof patterns / sizeof patterns[0]; p++) {
 		const char *name = (p == 0) ? "address" :

@@ -4,19 +4,25 @@
  */
 /**
  * @file    cmd_camera.c
- * @brief   `camera` shell command: B-CAMS-OMV / OV5640 control (issue #39).
+ * @brief   `camera` shell command: B-CAMS-OMV / OV5640 control (#39/#41).
  *
- *   camera probe   power-cycle the module and read the OV5640 chip ID
- *   camera info    driver / sensor state
- *   camera off     cut module power
+ *   camera probe          power-cycle the module and read the OV5640 chip ID
+ *   camera info           driver / sensor state
+ *   camera capture [test] snapshot one QVGA RGB565 frame (test = colorbar)
+ *   camera off            cut module power
  *
- * Phase 1 of Epic #22 -- sensor detection only.  `camera capture` (DCMI+DMA,
- * issue #41) and `camera save` (issue #42) come later.
+ * `capture` prints per-channel min/max/mean statistics plus a first-pixels
+ * hexdump so a frame can be sanity-checked without any display: the colorbar
+ * pattern gives known flat bands (DCMI polarity/timing check independent of
+ * optics), and covering the lens must move the live mean.  `camera save`
+ * (file export) is issue #42.
  *
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
 #include "camera.h"
+
+#include <string.h>
 
 static const char *cam_strerror(int rc)
 {
@@ -24,7 +30,7 @@ static const char *cam_strerror(int rc)
 	case CAM_ERR_PARAM:     return "bad argument";
 	case CAM_ERR_HAL:       return "I2C/sensor I/O failed";
 	case CAM_ERR_TIMEOUT:   return "operation timed out";
-	case CAM_ERR_STATE:     return "driver not initialized";
+	case CAM_ERR_STATE:     return "driver not initialized / SDRAM down";
 	case CAM_ERR_NO_SENSOR: return "OV5640 not detected (module connected?)";
 	case CAM_ERR_NO_FRAME:  return "no captured frame";
 	default:                return "unknown error";
@@ -77,6 +83,88 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * Per-channel statistics over the captured frame, computed row by row through
+ * camera_frame_read (the driver mutex serializes against a concurrent
+ * capture).  Sums fit comfortably: 76800 px * max 63 < 2^23.
+ */
+static int cmd_camera_capture(struct cli_instance *sh, int argc, char **argv)
+{
+	uint16_t row[CAMERA_FRAME_WIDTH];
+	uint32_t rmin = 31, rmax = 0, rsum = 0;
+	uint32_t gmin = 63, gmax = 0, gsum = 0;
+	uint32_t bmin = 31, bmax = 0, bsum = 0;
+	uint32_t npx = CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT;
+	int colorbar = 0;
+	int rc;
+
+	if (argc > 1) {
+		if (strcmp(argv[1], "test") != 0) {
+			cli_error(sh, "camera: unknown option '%s' (try: test)\r\n",
+			          argv[1]);
+			return 1;
+		}
+		colorbar = 1;
+	}
+
+	cli_print(sh, "camera: capturing %s frame ...\r\n",
+	          colorbar ? "colorbar test" : "live");
+	rc = camera_capture(colorbar);
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+		return 1;
+	}
+
+	for (uint32_t y = 0; y < CAMERA_FRAME_HEIGHT; y++) {
+		rc = camera_frame_read(y * sizeof row, row, sizeof row);
+		if (rc != 0) {
+			cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+			return 1;
+		}
+		for (uint32_t x = 0; x < CAMERA_FRAME_WIDTH; x++) {
+			uint32_t p = row[x];
+			uint32_t r = (p >> 11) & 0x1Fu;
+			uint32_t gg = (p >> 5) & 0x3Fu;
+			uint32_t b = p & 0x1Fu;
+
+			if (r < rmin) rmin = r;
+			if (r > rmax) rmax = r;
+			rsum += r;
+			if (gg < gmin) gmin = gg;
+			if (gg > gmax) gmax = gg;
+			gsum += gg;
+			if (b < bmin) bmin = b;
+			if (b > bmax) bmax = b;
+			bsum += b;
+		}
+		if (cli_cancel_requested(sh))
+			return 1;
+	}
+
+	cli_print(sh, "frame: %ux%u RGB565 (%lu bytes)\r\n",
+	          (unsigned)CAMERA_FRAME_WIDTH, (unsigned)CAMERA_FRAME_HEIGHT,
+	          (unsigned long)CAMERA_FRAME_BYTES);
+	cli_print(sh, "R5: min %2lu  max %2lu  mean %lu.%lu\r\n",
+	          (unsigned long)rmin, (unsigned long)rmax,
+	          (unsigned long)(rsum / npx),
+	          (unsigned long)((rsum % npx) * 10u / npx));
+	cli_print(sh, "G6: min %2lu  max %2lu  mean %lu.%lu\r\n",
+	          (unsigned long)gmin, (unsigned long)gmax,
+	          (unsigned long)(gsum / npx),
+	          (unsigned long)((gsum % npx) * 10u / npx));
+	cli_print(sh, "B5: min %2lu  max %2lu  mean %lu.%lu\r\n",
+	          (unsigned long)bmin, (unsigned long)bmax,
+	          (unsigned long)(bsum / npx),
+	          (unsigned long)((bsum % npx) * 10u / npx));
+
+	/* First 16 pixels of the top row, raw little-endian. */
+	if (camera_frame_read(0, row, 32) == 0) {
+		cli_print(sh, "row0[0..15]:\r\n");
+		cli_hexdump(sh, row, 32);
+	}
+	return 0;
+}
+
 static int cmd_camera_off(struct cli_instance *sh, int argc, char **argv)
 {
 	int rc;
@@ -96,6 +184,8 @@ static int cmd_camera_off(struct cli_instance *sh, int argc, char **argv)
 CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD(probe, NULL, "power-cycle + read the OV5640 chip ID", cmd_camera_probe),
 	CLI_CMD(info,  NULL, "driver / sensor state", cmd_camera_info),
+	CLI_CMD_ARG(capture, NULL, "snapshot QVGA RGB565 + stats ('test' = colorbar)",
+	            cmd_camera_capture, 1, 1),
 	CLI_CMD(off,   NULL, "cut camera module power", cmd_camera_off),
 	CLI_SUBCMD_SET_END);
 

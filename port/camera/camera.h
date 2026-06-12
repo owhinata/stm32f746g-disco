@@ -4,12 +4,14 @@
  */
 /**
  * @file    camera.h
- * @brief   B-CAMS-OMV (OV5640) camera driver over DCMI/I2C1 (issue #39, Epic #22).
+ * @brief   B-CAMS-OMV (OV5640) camera driver over DCMI/I2C1 (issues #39/#41,
+ *          Epic #22).
  *
  * Sensor-control layer for the B-CAMS-OMV camera bundle (MB1683 adapter +
- * MB1379 OV5640 module) on the board's P1 30-pin ZIF connector.  Phase 1
- * (this issue) covers power control and sensor identification over I2C1
- * (SCCB); the DCMI capture path is added by issue #41.
+ * MB1379 OV5640 module) on the board's P1 30-pin ZIF connector: power
+ * control and sensor identification over I2C1/SCCB (#39), plus single-frame
+ * QVGA RGB565 snapshot capture over DCMI + DMA2 into the SDRAM frame buffer
+ * (#41).
  *
  * Hardware facts (UM1907 / UM2779, verified in #22 Phase 0):
  *   - P1 <-> B-CAMS-OMV CN5 wire 1:1 over the FFC (reversed pin numbering).
@@ -42,17 +44,23 @@ extern "C" {
 #define CAM_OK             0
 #define CAM_ERR_PARAM     -1   /* bad argument                                  */
 #define CAM_ERR_HAL       -2   /* HAL / sensor I/O reported an error            */
-#define CAM_ERR_TIMEOUT   -3   /* capture never completed (issue #41)           */
-#define CAM_ERR_STATE     -4   /* driver not initialized / wrong state          */
+#define CAM_ERR_TIMEOUT   -3   /* capture never completed                       */
+#define CAM_ERR_STATE     -4   /* driver not initialized / SDRAM down           */
 #define CAM_ERR_NO_SENSOR -5   /* OV5640 not detected (no module / bad ID)      */
-#define CAM_ERR_NO_FRAME  -6   /* no captured frame available (issue #41)       */
+#define CAM_ERR_NO_FRAME  -6   /* no captured frame available                   */
+
+/* Fixed capture geometry (issue #41): QVGA RGB565, little-endian 16-bit
+   pixels (R5 in bits 15..11, G6 in 10..5, B5 in 4..0). */
+#define CAMERA_FRAME_WIDTH   320u
+#define CAMERA_FRAME_HEIGHT  240u
+#define CAMERA_FRAME_BYTES   (CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT * 2u)
 
 /** Driver state snapshot for the `camera info` command. */
 struct camera_info {
 	uint32_t chip_id;     /* 0x5640 after a successful probe, else 0       */
 	int      powered;     /* PWR_EN asserted and probe succeeded           */
-	int      configured;  /* sensor programmed for capture (issue #41)     */
-	int      frame_valid; /* a captured frame is in the buffer (issue #41) */
+	int      configured;  /* sensor programmed for QVGA RGB565 capture     */
+	int      frame_valid; /* a captured frame is in the buffer             */
 };
 
 /**
@@ -76,6 +84,31 @@ int camera_power_off(void);
 
 /** Fill @p out with the current driver state.  Never touches the sensor. */
 int camera_get_info(struct camera_info *out);
+
+/**
+ * Capture one QVGA RGB565 frame into the SDRAM frame buffer (DCMI snapshot +
+ * DMA2).  Probes and configures the sensor on demand (lazy); with @p colorbar
+ * nonzero the OV5640 emits its 8-bar test pattern instead of the live image.
+ * Blocks until the frame completes (<=1 s timeout).  On success the frame is
+ * readable via camera_frame_read() until the next capture/power-off.
+ * Returns CAM_ERR_STATE when SDRAM is down, CAM_ERR_TIMEOUT when no frame
+ * arrived (wiring/sync), CAM_ERR_HAL on a DCMI/DMA error (e.g. overrun).
+ */
+int camera_capture(int colorbar);
+
+/**
+ * Copy @p len bytes at byte offset @p offset out of the captured frame into
+ * @p dst (any alignment).  Serialized against capture/save by the driver
+ * mutex.  Fails with CAM_ERR_NO_FRAME until a capture succeeded.
+ */
+int camera_frame_read(uint32_t offset, void *dst, uint32_t len);
+
+/**
+ * Drop the captured-frame flag (the buffer contents are about to be clobbered
+ * -- called by `sdram test` before it overwrites the .sdram region).  Safe to
+ * call in any state; a no-op when the driver is not initialized.
+ */
+void camera_frame_invalidate(void);
 
 #ifdef __cplusplus
 }

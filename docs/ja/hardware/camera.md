@@ -2,7 +2,7 @@
 
 ST のカメラモジュールバンドル **B-CAMS-OMV**（アダプタ MB1683 + カメラモジュール MB1379、センサ **OV5640** 5MP）をボードの **P1**（30-pin ZIF）に接続して使う。ドライバは `port/camera/camera.{c,h}`、シェルコマンドは `camera`（`shell/cmds/cmd_camera.c`）。
 
-カメラ基盤（Epic #22）の **Phase 1**（#39）。Phase 1 は**センサ検出まで**: 電源制御（PWR_EN）と I2C1（SCCB）での chip ID 読出し。DCMI + DMA によるフレームキャプチャは Phase 2（#41）、ファイル保存は Phase 3（#42）。
+カメラ基盤（Epic #22）: Phase 1（#39）= センサ検出（PWR_EN + I2C1/SCCB chip ID）、Phase 2（#41）= **DCMI + DMA2 で QVGA RGB565 を 1 フレーム SDRAM へ snapshot**（`camera capture`）。ファイル保存は Phase 3（#42）。
 
 ## 配線（P1 ↔ B-CAMS-OMV CN5）
 
@@ -14,7 +14,11 @@ ST のカメラモジュールバンドル **B-CAMS-OMV**（アダプタ MB1683 
 | I2C1_SDA（SCCB） | PB9 | AF4、open-drain |
 | DCMI_PWR_EN | PH13 | **Low = 電源 ON**（モジュールの POWER_DOWN、active-high） |
 | DCMI_NRST | -    | ボードの **NRST 網に直結**（GPIO 制御不可） |
-| DCMI D0-D7 / HSYNC / VSYNC / PIXCLK | （Phase 2） | AF13。#41 で使用 |
+| DCMI_HSYNC | PA4 | AF13 |
+| DCMI_PIXCLK | PA6 | AF13 |
+| DCMI_VSYNC | PG9 | AF13 |
+| DCMI D0-D4 | PH9-PH12, PH14 | AF13 |
+| DCMI D5 / D6 / D7 | PD3 / PE5 / PE6 | AF13 |
 
 既存ペリフェラル（USART1=PA9/PB7、QSPI=PB2/PB6/PD11-13/PE2、SDMMC1=PC8-13/PD2、LED=PI1）と競合しない。
 
@@ -50,6 +54,20 @@ TIMINGR は **PCLK1 = 54 MHz** 用に再計算した値を使う（RM0385 §30.4
 !!! note "stm32-mw-camera を使わない理由"
     ST の Camera Middleware（`stm32-mw-camera`）と X-CUBE-ISP は **DCMIPP**（STM32N6 系）専用で、F7 の classic DCMI では使えない。単体公開されている OV5640 component driver のみを取り込む。
 
+## キャプチャパス（DCMI + DMA2、#41）
+
+| 項目 | 値 | 根拠 |
+|------|----|------|
+| 解像度 / 形式 | **QVGA 320x240 RGB565**（153,600 B、little-endian） | `OV5640_Init(R320x240, RGB565)` |
+| DCMI | 8-bit パラレル、HW 同期、**HSYNC=HIGH / VSYNC=HIGH / PCLK=RISING** | H747I-DISCO BSP の OV5640 実績値（`OV5640_Init` がセンサ側極性も設定） |
+| DMA | **DMA2 Stream1 / Ch1**（RM0385 Table 26。SD は Stream3/6 で競合なし）、`DMA_NORMAL` 単発、word、FIFO full + MBURST INC4 | 38,400 word ≤ NDTR 上限 65,535 → 単発転送 |
+| フレームバッファ | `.sdram` セクション（SDRAM 8MB、**MPU non-cacheable** → キャッシュ maintenance 不要） | [SDRAM](sdram.md) 参照 |
+| NVIC | DCMI=8、DMA2_Stream1=8（USART1=5 / SDMMC=6 / SD-DMA=7 の下位、SysTick=14 の上位） | ThreadX は PRIMASK マスクなので任意優先度から `tx_semaphore_put` 可 |
+
+完了モデル（HAL）: DMA がフレーム分の word を転送し終えると `DCMI_DMAXferCplt` が **FRAME 割込み**を arm → FRAME ISR が `HAL_DCMI_FrameEventCallback` → `tx_semaphore_put`。同期エラー / オーバーラン / DMA エラーはすべて `HAL_DCMI_ErrorCallback` に集約。SD ドライバと同じ **drain + `cam_xfer_active` ゲート + 有限タイムアウト（1 s）** で遅延 callback の誤通知を封じる。
+
+センサ設定は capture 時に遅延実行: 未 probe なら probe → `OV5640_Init`（電源投入毎に 1 回、AEC/AWB 整定 300 ms）→ `OV5640_ColorbarModeConfig`（live / colorbar 切替時 100 ms 整定）→ snapshot。`sdram test` は `.sdram` を上書きするため、開始時に `camera_frame_invalidate()` でフレーム無効化フラグを立てる。
+
 ## 排他とスレッド文脈
 
 - 公開 API は内部 ThreadX mutex（TX_INHERIT）で直列化。実体は `*_locked()` ヘルパに分離し、**公開 API が同一 mutex を再取得する経路を構造的に排除**（Phase 2 の capture が probe を内部で呼ぶ際は `_locked` 版を使う）
@@ -59,25 +77,30 @@ TIMINGR は **PCLK1 = 54 MHz** 用に再計算した値を使う（RM0385 §30.4
 ## `camera` シェルコマンド
 
 ```
-camera probe   電源サイクル + OV5640 chip ID 読出し（~1 s）
-camera info    ドライバ / センサ状態の表示
-camera off     モジュール電源 OFF
+camera probe          電源サイクル + OV5640 chip ID 読出し（~1 s）
+camera info           ドライバ / センサ状態の表示
+camera capture [test] QVGA RGB565 を 1 フレーム snapshot（test = colorbar パターン）
+camera off            モジュール電源 OFF
 ```
+
+`camera capture` は取得後に R5/G6/B5 各チャネルの min/max/mean と先頭 16 画素の hexdump を表示する。`camera capture test` は OV5640 内蔵の **8 本縦帯 colorbar**（白/黄/シアン/緑/マゼンタ/赤/青/黒）を取り込むため、**光学系と無関係に** DCMI 極性・タイミング・配線を検証できる（min が 0 付近・max が飽和付近・帯ごとにフラット、が期待値）。live 撮影ではレンズを覆うと mean が下がる。
 
 実行例:
 
 ```
-sh> camera probe
-camera: probing OV5640 (takes ~1s) ...
-OV5640 detected: chip ID 0x5640
-sh> camera info
-module:     B-CAMS-OMV (OV5640) on P1/DCMI, I2C1 @0x78
-power:      on
-chip ID:    0x5640
-configured: no
-frame:      none
-sh> camera off
-camera: power off
+sh> camera capture test
+camera: capturing colorbar test frame ...
+frame: 320x240 RGB565 (153600 bytes)
+R5: min  0  max 31  mean 15.4
+G6: min  0  max 63  mean 31.2
+B5: min  0  max 31  mean 15.5
+row0[0..15]:
+00000000: ff ff ff ff ff ff ff ff  ff ff ff ff ff ff ff ff
+00000010: ff ff ff ff ff ff ff ff  ff ff ff ff ff ff ff ff
+sh> camera capture
+camera: capturing live frame ...
+frame: 320x240 RGB565 (153600 bytes)
+...
 ```
 
 ## 参照
