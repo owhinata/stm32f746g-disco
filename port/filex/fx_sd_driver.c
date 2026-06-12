@@ -27,9 +27,19 @@
 static uint32_t sd_part_lba;
 static uint32_t sd_part_blocks;
 
+/* When set, the next INIT skips partition detection and uses the whole card as
+ * a superfloppy (for fx_media_format of a blank card).  Set/cleared by the `sd`
+ * command under the exclusive ownership slot. */
+static volatile int sd_format_mode;
+
 /* LBA 0 scratch for partition detection (INIT only). sd_card_read_blocks()
  * bounces through its own aligned DMA buffer, so any alignment is fine. */
 static uint8_t mbr_buf[SD_BLOCK_SIZE];
+
+void fx_sd_set_format_mode(int on)
+{
+	sd_format_mode = on;
+}
 
 static uint16_t rd_le16(const uint8_t *p)
 {
@@ -150,8 +160,16 @@ VOID fx_sd_driver(FX_MEDIA *media_ptr)
 		media_ptr->fx_media_driver_free_sector_update = FX_FALSE;
 		if (sd_card_probe() != SD_OK)
 			return;
-		if (detect_partition() != 0)
+		if (sd_format_mode) {
+			/* Formatting: write the whole card as a superfloppy (a blank
+			 * card has no VBR/MBR yet, so detection would fail). */
+			sd_part_lba = 0;
+			sd_part_blocks = sd_card_get_info()->block_count;
+			if (sd_part_blocks == 0u)
+				return;
+		} else if (detect_partition() != 0) {
 			return;     /* status stays FX_IO_ERROR -> mount fails cleanly */
+		}
 		media_ptr->fx_media_driver_status = FX_SUCCESS;
 		break;
 

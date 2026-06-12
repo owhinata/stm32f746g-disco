@@ -36,6 +36,12 @@ struct cli_instance;
 #define FS_ERR_BUSY 0xF0u
 #endif
 
+/* Returned by a device's acquire() when the slot is empty (microSD removed).
+ * Outside the FileX status space; mapped by fs_strerror(). */
+#ifndef FS_ERR_NO_CARD
+#define FS_ERR_NO_CARD 0xF1u
+#endif
+
 /**
  * Media abstraction for the shared command bodies.  One instance per command
  * file (cmd_fs.c => QSPI, cmd_sd.c => SD); the callbacks forward to that media's

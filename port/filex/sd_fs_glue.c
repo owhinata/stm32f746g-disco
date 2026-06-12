@@ -17,8 +17,9 @@
  * does the D-cache maintenance, so no special placement is needed here.
  */
 #include "sd_fs_glue.h"
-#include "fs_glue.h"        /* FS_ERR_BUSY (shared sentinel) */
+#include "fs_glue.h"        /* FS_ERR_BUSY / FS_ERR_NO_CARD (shared sentinels) */
 #include "fx_sd_driver.h"
+#include "sd_card.h"        /* present/status/deinit for hot-plug */
 
 #include "tx_api.h"
 
@@ -143,6 +144,31 @@ UINT sd_media_acquire(FX_MEDIA **out)
 		tx_mutex_put(&sd_mount_lock);
 		return FS_ERR_BUSY;
 	}
+
+	/* Hot-plug: if the mounted card was removed (present pin) or swapped (the
+	 * old RCA no longer answers CMD13), the open FX_MEDIA is now stale.  Evict it
+	 * WITHOUT flushing -- the card may be gone, so abort (not close).  Eviction is
+	 * only safe when no other op is using the media (active_ops counts this
+	 * caller's op_begin); if another op is in flight, refuse rather than hand back
+	 * the stale media (that op will fail with an I/O error and the next solo
+	 * command evicts). */
+	if (sd_mounted &&
+	    (!sd_card_is_present() || sd_card_status() != SD_OK)) {
+		if (sd_active_ops > 1) {
+			tx_mutex_put(&sd_mount_lock);
+			return FS_ERR_BUSY;
+		}
+		(void)fx_media_abort(&sd_media);
+		(void)sd_card_deinit();          /* HAL_SD_DeInit -> next mount re-probes */
+		sd_mounted = 0;
+		LOG_INF("card removed/changed; media evicted");
+	}
+
+	if (!sd_card_is_present()) {
+		tx_mutex_put(&sd_mount_lock);
+		return FS_ERR_NO_CARD;
+	}
+
 	if (!sd_mounted) {
 		status = fx_media_open(&sd_media, "sd", fx_sd_driver,
 		                       FX_NULL, sd_media_cache,

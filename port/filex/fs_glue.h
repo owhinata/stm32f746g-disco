@@ -22,7 +22,15 @@ extern "C" {
 
 /* Returned by fs_media_acquire()/fs_exclusive_begin() while a format owns the
  * media.  Outside FileX's status space so it cannot be confused with one. */
+#ifndef FS_ERR_BUSY
 #define FS_ERR_BUSY 0xF0u
+#endif
+
+/* Returned by a removable medium's acquire() when the slot is empty (microSD
+ * removed).  Shared with fs_cmd_core.h (guarded); QSPI never returns it. */
+#ifndef FS_ERR_NO_CARD
+#define FS_ERR_NO_CARD 0xF1u
+#endif
 
 /** Create the glue mutexes + fx_system_initialize().  Call once from
  *  tx_application_define(). */

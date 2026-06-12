@@ -128,27 +128,36 @@ sd info        card type / capacity / block geometry / bus width / CID / CSD
 sd read <lba>  hexdump one 512 B block (LBA addressing)
 ```
 
-Filesystem (FileX FAT, #34) commands -- sharing the common core with `fs` (QSPI):
+Filesystem (FileX FAT, #34/#36) commands -- sharing the common core with `fs` (QSPI):
 
 ```
-sd ls [path]        list a directory (default /)
-sd cat <path>       print a file
-sd write <p> <txt>  create/overwrite a file (quote for spaces)
-sd rm <path>        delete a file / empty directory
-sd mkdir <path>     create a directory
-sd df               filesystem capacity / free / FAT type (64-bit)
-sd umount           flush + unmount
+sd format [exfat] yes  format the whole card as FAT32 superfloppy (destructive, #36)
+sd ls [path]           list a directory (default /)
+sd cat <path>          print a file
+sd write <p> <txt>     create/overwrite a file (quote for spaces)
+sd rm <path>           delete a file / empty directory
+sd mkdir <path>        create a directory
+sd df                  filesystem capacity / free / FAT type (64-bit)
+sd umount              flush + unmount
 ```
 
 - The filesystem **lazy-mounts** on the first `sd` FS command (no reformat), so a
   PC-created FAT32 reads/writes directly and interoperates. Architecture:
   [Filesystem](../rtos/filesystem.md).
+- **`sd format yes`** (#36): formats the whole card as a **FAT32 superfloppy**
+  (destructive, `yes` required); works on a blank card too (board-side card
+  init). `sectors/cluster` is chosen by capacity to guarantee FAT32, and FAT32 is
+  verified after the format. **exFAT is not supported in this build** --
+  `sd format exfat yes` is a stub ([#35](https://github.com/owhinata/stm32f746g-disco/issues/35)).
+- **hot-plug** (#36): removing the card while mounted makes the next `sd` command
+  detect it and evict the media (`fx_media_abort`, no flush) -> "no card";
+  reinserting / swapping remounts on the next command (no stale BPB reuse). Polled
+  via the PC13 detect pin (no EXTI).
 - **`sd info` / `sd read` are raw-gated**: they may re-identify the card, so they
   are refused while the FS is mounted (`sd umount` first). When unmounted they
   behave as before (probe only when needed).
 - Both MBR (standard PC format) and superfloppy (VBR @ 0) cards mount (the driver
   detects the layout at LBA 0).
-- `sd format` (FAT32) is Phase C.
 
 ## Bring-up check
 

@@ -25,6 +25,16 @@ extern "C" {
 /** FileX media driver entry (pass to fx_media_open / fx_media_format). */
 VOID fx_sd_driver(FX_MEDIA *media_ptr);
 
+/**
+ * Enable/disable "format mode" for the next driver INIT.  A blank card has no
+ * valid VBR/MBR, so the normal INIT partition detection fails and fx_media_format
+ * could not run.  With format mode on, INIT skips detection and treats the whole
+ * card as a superfloppy (partition start 0, size = card block count).  The `sd`
+ * command sets it under the exclusive ownership slot around fx_media_format and
+ * clears it afterwards.
+ */
+void fx_sd_set_format_mode(int on);
+
 #ifdef __cplusplus
 }
 #endif
