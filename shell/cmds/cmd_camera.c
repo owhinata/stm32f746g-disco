@@ -710,6 +710,7 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "dropped:   %lu\r\n", (unsigned long)si.dropped);
 	cli_print(sh, "ovr dcmi:  %lu\r\n", (unsigned long)si.dcmi_ovr);
 	cli_print(sh, "ovr ring:  %lu\r\n", (unsigned long)si.ring_ovr);
+	cli_print(sh, "dma fe:    %lu\r\n", (unsigned long)si.dma_fe);
 	return 0;
 }
 

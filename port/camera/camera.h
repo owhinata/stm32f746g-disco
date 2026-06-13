@@ -170,6 +170,7 @@ struct camera_stream_info {
 	uint32_t dropped;    /* frames the sink dropped (busy)                   */
 	uint32_t dcmi_ovr;   /* DCMI FIFO overruns                               */
 	uint32_t ring_ovr;   /* ring exhaustion / lost completions               */
+	uint32_t dma_fe;     /* DMA FIFO/DME errors tolerated (non-fatal, #56)   */
 	uint32_t elapsed_ms; /* run duration (live, or frozen at stop)           */
 };
 
@@ -188,6 +189,42 @@ int camera_stream_stop(void);
 
 /** Fill @p out with the current or last stream statistics (any time). */
 int camera_stream_stats(struct camera_stream_info *out);
+
+/* ---- GUIX live preview ownership (issue #56) ----------------------------- */
+struct frame_sink;       /* svc/frame_pipeline.h */
+struct frame_desc;       /* svc/frame.h          */
+
+/**
+ * Start streaming for a GUIX live preview and attach @p s as an external push
+ * sink (in addition to the internal stats sink).  Equivalent to
+ * camera_stream_start(colorbar=0, unbounded) but also takes **preview
+ * ownership**: while it holds, the public `camera stream start/stop` are
+ * refused (CAM_ERR_STATE).  Returns 0 on success or a negative CAM_ERR_* (e.g.
+ * a plain stream / preview already running, no sensor, SDRAM down).  The
+ * producer's async teardown (DCMI overrun) also releases ownership and detaches
+ * @p s, so the slot/pin contract survives a later frame_pipeline_init().
+ */
+int camera_preview_start(struct frame_sink *s);
+
+/**
+ * Release preview ownership taken by camera_preview_start(@p s): detach @p s and
+ * stop the stream -- but ONLY while @p s is still the owner.  If an async
+ * teardown already released ownership, this is a no-op (it must not stop a
+ * different stream started since).  Returns the pipeline's in-flight pin count
+ * for @p s at detach time (0 when not the owner): a nonzero value means a
+ * consume() was pre-pinned and may not have started yet, so the caller must
+ * drain @p s (wait for that consume() to finish) AFTER this returns.
+ */
+int camera_preview_stop(struct frame_sink *s);
+
+/**
+ * Release one pre-pinned slot on behalf of preview sink @p s -- the sink's
+ * consume() calls this exactly once per delivered frame.  Wraps the pipeline
+ * put() so the GUIX glue never holds the camera's internal pipeline handle,
+ * eliminating any race where the producer consumes against @p s before a
+ * returned handle could be stored.
+ */
+void camera_frame_put(struct frame_sink *s, const struct frame_desc *f);
 
 /** Copy the current quality settings into @p out (never touches the sensor). */
 int camera_get_settings(struct camera_settings *out);

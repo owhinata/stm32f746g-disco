@@ -211,7 +211,13 @@ camera stream stop                                    stop
 camera stream stats                                   FPS / frames / overruns
 ```
 
-`start` returns immediately and never occupies the CLI prompt; the producer thread runs the capture and auto-stops on `--frames`/`--secs`, `stream stop`, or a DCMI overrun. **OVR is terminal**: a continuous-mode DCMI overrun makes the HAL abort the DMA, so it is counted, the stream stops, and it is reported by `stats` (it should be near zero given the FMC bandwidth for QVGA). Streaming and `camera capture` share one DCMI/DMA and are mutually exclusive (capture is rejected as busy while streaming).
+`start` returns immediately and never occupies the CLI prompt; the producer thread runs the capture and auto-stops on `--frames`/`--secs`, `stream stop`, or a **DMA transfer error (TE)**. Streaming and `camera capture` share one DCMI/DMA and are mutually exclusive (capture is rejected as busy while streaming).
+
+**DMA error handling (#56)**: the double-buffer arm (`HAL_DMAEx_MultiBufferStart_IT`) enables the **FIFO-error interrupt** the snapshot path (`HAL_DMA_Start_IT`) leaves off. With an incompatible FIFO-threshold/burst an FE can hardware-disable the stream, but this implementation's `FIFO_THRESHOLD_FULL + MBURST_INC4` is a valid combination, so the FE (FIFO overrun/underrun) / DME observed under the SDRAM contention from the LTDC continuously reading the framebuffer do **not** halt the stream (the snapshot path simply never observes them). They are therefore **counted and tolerated** (`stats` `dma fe`, thousands/s at QVGA), and only a **TE — which the hardware uses to actually stop the stream — is terminal**. A DCMI FIFO overrun (`ovr dcmi`) is a separate path and should stay near zero.
+
+### GUIX live preview (#56)
+
+`gui camera on` attaches a GUIX push sink to this streaming pipeline and shows the QVGA frames **at native scale** on the LTDC (GUIX) screen. While the preview owns the stream, `camera stream start/stop` are refused. See [GUIX › Camera live preview](../rtos/guix.md#camera-live-preview-56) for details.
 
 ## References
 

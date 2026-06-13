@@ -196,12 +196,15 @@ static TX_SEMAPHORE cam_start_sem;        /* start -> producer idle wakeup      
 static TX_THREAD    cam_producer;
 static UCHAR        cam_producer_stack[CAM_PRODUCER_STACK];
 static struct frame_sink cam_stat_sink;   /* counting sink (FPS / OVR source)   */
+static struct frame_sink *cam_ext_sink;   /* GUIX live-preview sink (#56), owner;
+                                             NULL = no preview (cam_lock-guarded) */
 
 static volatile int      cam_stream_active;  /* streaming mode gate             */
 static volatile int      cam_stop_req;       /* stop requested (producer drains)*/
 static volatile int      cam_stream_err;     /* DCMI OVR -> terminal stop       */
 static volatile uint32_t cam_stream_ovr;     /* DCMI overrun count              */
 static volatile uint32_t cam_ring_ovr;       /* free-slot exhaustion / lost     */
+static volatile uint32_t cam_stream_fe;      /* DMA FIFO/DME errors tolerated (#56) */
 static uint32_t cam_start_tick;              /* HAL tick at start (--secs)       */
 static uint32_t cam_target_frames;           /* 0 = unbounded                   */
 static uint32_t cam_target_secs;             /* 0 = unbounded                   */
@@ -908,12 +911,25 @@ static void cam_stream_dma_cb(DMA_HandleTypeDef *h)
 	(void)tx_semaphore_put(&cam_stream_sem);
 }
 
-/* DMA transport error (TE/DME/FE): terminal, like a DCMI overrun. */
+/* DMA error callback.  The double-buffer arm (HAL_DMAEx_MultiBufferStart_IT)
+   enables the FIFO-error interrupt the snapshot path (HAL_DMA_Start_IT) leaves
+   off.  FE (FIFO) and DME (direct-mode) errors are transient under SDRAM
+   contention (LTDC continuously reads the framebuffer) and, per RM0385 8.5.5,
+   do NOT disable the stream -- the snapshot path simply never sees them.  So
+   count and ignore them (cam_stream_fe); only a transfer error (TE), which the
+   hardware uses to actually halt the stream, is terminal (#56). */
 static void cam_stream_dma_err_cb(DMA_HandleTypeDef *h)
 {
-	(void)h;
 	if (!cam_stream_active)
 		return;
+	if (!(h->ErrorCode & HAL_DMA_ERROR_TE)) {
+		cam_stream_fe++;                    /* FE/DME: non-fatal, keep streaming */
+		/* HAL clears the FE/DME flags but not h->ErrorCode; clear the tolerated
+		   bits ourselves so HAL_DMA_IRQHandler does not re-enter this callback on
+		   every following (TC) interrupt while ErrorCode stays nonzero. */
+		h->ErrorCode &= ~(HAL_DMA_ERROR_FE | HAL_DMA_ERROR_DME);
+		return;
+	}
 	cam_stream_err = 1;
 	(void)tx_semaphore_put(&cam_stream_sem);
 }
@@ -943,6 +959,15 @@ static void cam_stream_teardown(void)
 		cam_elapsed_ms = HAL_GetTick() - cam_start_tick;
 		(void)HAL_DCMI_Stop(&hdcmi);          /* aborts the DMA internally */
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
+		/* Async stop (OVR/DMA error/auto-stop) while a GUIX preview owns the
+		   stream: detach its sink too and release ownership, so the next
+		   frame_pipeline_init() (a later start) cannot memset a still-linked
+		   sink.  The GUIX sink is synchronous (no cross-thread pin) and its
+		   close() is a no-op, so a producer-thread detach is safe here. */
+		if (cam_ext_sink != NULL) {
+			(void)frame_pipeline_detach(&cam_pipe, cam_ext_sink);
+			cam_ext_sink = NULL;
+		}
 		drain_stream_sem();
 		/* HAL_DCMI_Stop leaves CR.DBM set on the stream; re-init the DMA so the
 		   next snapshot's HAL_DCMI_Start_DMA runs a plain single transfer. */
@@ -950,9 +975,10 @@ static void cam_stream_teardown(void)
 		hdma_dcmi.Init.Mode = DMA_NORMAL;
 		(void)HAL_DMA_Init(&hdma_dcmi);
 		__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
-		LOG_INF("stream stop (%lu frames, ovr dcmi=%lu ring=%lu)",
+		LOG_INF("stream stop (%lu frames, ovr dcmi=%lu ring=%lu fe=%lu)",
 		        (unsigned long)cam_pipe.stats.published,
-		        (unsigned long)cam_stream_ovr, (unsigned long)cam_ring_ovr);
+		        (unsigned long)cam_stream_ovr, (unsigned long)cam_ring_ovr,
+		        (unsigned long)cam_stream_fe);
 	}
 	(void)tx_mutex_put(&cam_lock);
 }
@@ -1033,54 +1059,53 @@ static void cam_producer_entry(ULONG arg)
 	}
 }
 
-int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
+/* Start streaming with the ring/pipeline built fresh, attaching the counting
+   sink plus an optional external sink @p ext (GUIX live preview, #56).  cam_lock
+   MUST be held; returns 0 or CAM_ERR_* and NEVER unlocks (the public wrappers
+   own the lock).  On success ownership of @p ext is recorded in cam_ext_sink
+   (NULL for a plain `camera stream`). */
+static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
+                               struct frame_sink *ext)
 {
-	int rc = op_lock();
+	int rc;
 
-	if (rc != 0)
-		return rc;
-	if (cam_stream_active) {
-		op_unlock();
+	if (cam_stream_active)
 		return CAM_ERR_STATE;          /* already streaming */
-	}
-	if (!sdram_is_up()) {
-		op_unlock();
+	if (!sdram_is_up())
 		return CAM_ERR_STATE;
-	}
 	if (!info.powered) {
 		rc = camera_probe_locked(NULL);
-		if (rc != 0) {
-			op_unlock();
+		if (rc != 0)
 			return rc;
-		}
 	}
 	rc = camera_configure_locked(colorbar != 0);
-	if (rc != 0) {
-		op_unlock();
+	if (rc != 0)
 		return rc;
-	}
 
-	/* Build the ring + pipeline fresh and attach the counting sink. */
+	/* Build the ring + pipeline fresh and attach the counting sink (+ ext). */
 	if (frame_pipeline_init(&cam_pipe, &cam_pipe_os, cam_ring,
-	                        CAMERA_FRAME_BYTES, CAM_RING_N) != 0) {
-		op_unlock();
+	                        CAMERA_FRAME_BYTES, CAM_RING_N) != 0)
 		return CAM_ERR_STATE;
-	}
 	frame_pipeline_set_format(&cam_pipe, FRAME_FMT_RGB565,
 	                          CAMERA_FRAME_WIDTH, CAMERA_FRAME_HEIGHT);
-	if (frame_pipeline_attach(&cam_pipe, &cam_stat_sink) != 0) {
-		op_unlock();
+	if (frame_pipeline_attach(&cam_pipe, &cam_stat_sink) != 0)
+		return CAM_ERR_STATE;
+	if (ext != NULL && frame_pipeline_attach(&cam_pipe, ext) != 0) {
+		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		return CAM_ERR_STATE;
 	}
 	cam_m0 = frame_pipeline_acquire(&cam_pipe);
 	cam_m1 = frame_pipeline_acquire(&cam_pipe);
 	if (cam_m0 == NULL || cam_m1 == NULL) {
-		op_unlock();
+		if (ext != NULL)
+			frame_pipeline_detach(&cam_pipe, ext);
+		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		return CAM_ERR_STATE;
 	}
 
 	cam_stream_ovr    = 0;
 	cam_ring_ovr      = 0;
+	cam_stream_fe     = 0;
 	cam_stream_err    = 0;
 	cam_stop_req      = 0;
 	cam_last_ct       = 0;
@@ -1106,9 +1131,10 @@ int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 	        (uint32_t)cam_m0->data, (uint32_t)cam_m1->data,
 	        CAMERA_FRAME_BYTES / 4u) != HAL_OK) {
 		cam_stream_active = 0;
+		if (ext != NULL)
+			frame_pipeline_detach(&cam_pipe, ext);
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		LOG_ERR("stream DMA start failed");
-		op_unlock();
 		return CAM_ERR_HAL;
 	}
 	hdcmi.Instance->CR &= ~DCMI_CR_CM;            /* continuous */
@@ -1117,13 +1143,73 @@ int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 	hdcmi.Instance->CR |= DCMI_CR_CAPTURE;
 	hdcmi.State = HAL_DCMI_STATE_BUSY;
 
+	cam_ext_sink = ext;               /* record preview ownership (NULL = plain) */
+
 	/* Wake the producer out of its idle FOREVER wait on the dedicated start
 	   semaphore -- never the completion semaphore, so it cannot be miscounted. */
 	(void)tx_semaphore_put(&cam_start_sem);
-	op_unlock();
-	LOG_INF("stream start (frames=%lu secs=%lu)",
-	        (unsigned long)frames, (unsigned long)secs);
+	LOG_INF("stream start (frames=%lu secs=%lu%s)",
+	        (unsigned long)frames, (unsigned long)secs,
+	        ext ? ", gui preview" : "");
 	return 0;
+}
+
+int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
+{
+	int rc = op_lock();
+
+	if (rc != 0)
+		return rc;
+	if (cam_ext_sink != NULL) {        /* owned by the GUIX live preview (#56) */
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
+	rc = stream_start_locked(colorbar, frames, secs, NULL);
+	op_unlock();
+	return rc;
+}
+
+int camera_preview_start(struct frame_sink *s)
+{
+	int rc;
+
+	if (s == NULL)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	rc = stream_start_locked(0, 0, 0, s);
+	op_unlock();
+	return rc;
+}
+
+int camera_preview_stop(struct frame_sink *s)
+{
+	int inflight = 0;
+
+	if (op_lock() != 0)
+		return 0;
+	if (s != NULL && cam_ext_sink == s) {
+		/* Still the owner: unlink (no more new consume) -- detach reports the
+		   pins held for s (incl. a frame already pre-pinned by publish() but not
+		   yet consumed), so the caller can drain it -- release ownership, then
+		   ask the producer to tear the stream down. */
+		inflight = frame_pipeline_detach(&cam_pipe, s);
+		cam_ext_sink = NULL;
+		if (cam_stream_active) {
+			cam_stop_req = 1;
+			(void)tx_semaphore_put(&cam_stream_sem);
+		}
+	}
+	/* else: an async teardown (OVR) already released ownership -- do nothing, so
+	   a delayed `off` cannot stop a different stream started since. */
+	op_unlock();
+	return inflight;
+}
+
+void camera_frame_put(struct frame_sink *s, const struct frame_desc *f)
+{
+	frame_pipeline_put(&cam_pipe, s, f);
 }
 
 int camera_stream_stop(void)
@@ -1132,6 +1218,10 @@ int camera_stream_stop(void)
 
 	if (rc != 0)
 		return rc;
+	if (cam_ext_sink != NULL) {        /* owned by the GUIX live preview (#56) */
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
 	if (cam_stream_active) {
 		cam_stop_req = 1;
 		(void)tx_semaphore_put(&cam_stream_sem);  /* producer tears down */
@@ -1155,6 +1245,7 @@ int camera_stream_stats(struct camera_stream_info *out)
 	out->err        = cam_stream_err;
 	out->dcmi_ovr   = cam_stream_ovr;
 	out->ring_ovr   = cam_ring_ovr;
+	out->dma_fe     = cam_stream_fe;
 	out->elapsed_ms = cam_stream_active ? (HAL_GetTick() - cam_start_tick)
 	                                    : cam_elapsed_ms;
 	/* Coherent snapshot of the pipeline-owned counters (the producer writes them
@@ -1266,7 +1357,11 @@ int camera_init(void)
 	/* DMA2 Stream1/Ch1: DCMI -> memory, single-shot per frame (DMA_NORMAL).
 	   32-bit words both sides (the DCMI DR packs four 8-bit pixels), FIFO on
 	   with INC4 memory bursts; the peripheral side stays single-beat reads
-	   of the one DR register. */
+	   of the one DR register.  NB: streaming arms this in double-buffer mode,
+	   which (unlike the snapshot HAL_DMA_Start_IT) enables the DMA FIFO-error
+	   interrupt; FE/DME are non-fatal (RM0385 8.5.5 -- they do not disable the
+	   stream) and transient under SDRAM contention, so cam_stream_dma_err_cb
+	   treats only a transfer error (TE) as terminal (#56). */
 	hdma_dcmi.Instance                 = DMA2_Stream1;
 	hdma_dcmi.Init.Channel             = DMA_CHANNEL_1;
 	hdma_dcmi.Init.Direction           = DMA_PERIPH_TO_MEMORY;
