@@ -86,6 +86,7 @@ nav:
       - rtos/filesystem.md
       - rtos/logging.md
       - rtos/iwdg.md
+      - rtos/guix.md
 
 markdown_extensions:
   - admonition

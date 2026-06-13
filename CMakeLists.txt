@@ -12,12 +12,13 @@
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
-# Fetch HAL/CMSIS/CoreMark/ThreadX/FileX/LevelX/OV5640 submodules if any is
-# missing (the filex/ov5640 checks also re-fetch existing checkouts that
-# predate issues #30 / #39).
+# Fetch HAL/CMSIS/CoreMark/ThreadX/FileX/LevelX/OV5640/GUIX submodules if any is
+# missing (the filex/ov5640/guix checks also re-fetch existing checkouts that
+# predate issues #30 / #39 / #55).
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32f7xx_hal_driver/Src/stm32f7xx_hal.c"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/filex/common/src/fx_media_open.c"
-   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/ov5640/ov5640.c")
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/ov5640/ov5640.c"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/guix/common/src/gx_system_initialize.c")
     message(STATUS "Initializing git submodules ...")
     execute_process(
         COMMAND git submodule update --init --recursive
@@ -171,6 +172,17 @@ list(FILTER FX_CORE EXCLUDE REGEX "simulat")            # RAM-disk demo drivers
 file(GLOB LX_CORE "${LX_DIR}/common/src/*.c")
 list(FILTER LX_CORE EXCLUDE REGEX "lx_nand|simulat")    # NOR only
 
+# --- Eclipse ThreadX GUIX (display GUI framework, issue #55 / epic #48) -----
+# Same pattern as ThreadX/FileX: GLOB the core, configure via port/guix/gx_user.h
+# (GX_INCLUDE_USER_DEFINE_FILE below).  The Cortex-M7/GNU port is header-only
+# (ports/cortex_m7/gnu/inc/gx_port.h) -- GUIX binds to ThreadX, so there is no
+# port asm/src to compile.  binres (binary-resource loaders) are excluded: this
+# firmware links its widgets/fonts statically, and gc-sections drops the rest of
+# the unused GUIX feature paths from the image.
+set(GX_DIR "${CMAKE_SOURCE_DIR}/lib/guix")
+file(GLOB GX_CORE "${GX_DIR}/common/src/*.c")
+list(FILTER GX_CORE EXCLUDE REGEX "gx_binres")          # no binary resource loader
+
 # --- App: threadx (the interactive ThreadX CLI shell) ----------------------
 # The single firmware: the ThreadX CLI shell over the USART1 VCP.  Uses the
 # ThreadX core/port set up above and omits src/stm32f7xx_it.c because ThreadX
@@ -247,6 +259,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_camera.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_lcd.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_touch.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_gui.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_xfer.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sdram.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/fs_cmd_core.c"
@@ -256,6 +269,10 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/port/ltdc/ltdc_display.c"
     "${CMAKE_SOURCE_DIR}/port/touch/touch.c"
     "${CMAKE_SOURCE_DIR}/port/sdram/sdram.c"
+    "${CMAKE_SOURCE_DIR}/port/guix/guix_display.c"
+    "${CMAKE_SOURCE_DIR}/port/guix/guix_touch.c"
+    "${CMAKE_SOURCE_DIR}/port/guix/guix_app.c"
+    "${CMAKE_SOURCE_DIR}/port/guix/guix_glue.c"
     "${CMAKE_SOURCE_DIR}/lib/ov5640/ov5640.c"
     "${CMAKE_SOURCE_DIR}/lib/ov5640/ov5640_reg.c"
     "${CMAKE_SOURCE_DIR}/port/levelx/lx_nor_qspi_driver.c"
@@ -268,7 +285,8 @@ add_executable(threadx
     ${TX_CORE}
     ${TX_ASM}
     ${FX_CORE}
-    ${LX_CORE})
+    ${LX_CORE}
+    ${GX_CORE})
 target_link_libraries(threadx PRIVATE common shell_obj coremark_obj svc_obj)
 target_include_directories(threadx PRIVATE
     "${TX_DIR}/common/inc" "${TX_PORT}/inc"
@@ -283,8 +301,10 @@ target_include_directories(threadx PRIVATE
     "${CMAKE_SOURCE_DIR}/lib/ov5640"
     "${FX_DIR}/common/inc" "${FX_DIR}/ports/cortex_m7/gnu/inc"
     "${LX_DIR}/common/inc"
+    "${GX_DIR}/common/inc" "${GX_DIR}/ports/cortex_m7/gnu/inc"
     "${CMAKE_SOURCE_DIR}/port/filex"
     "${CMAKE_SOURCE_DIR}/port/levelx"
+    "${CMAKE_SOURCE_DIR}/port/guix"
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
     "${CMAKE_SOURCE_DIR}/shell/backend"   # CLI_BACKEND_*_DEFINE macros
@@ -292,6 +312,7 @@ target_include_directories(threadx PRIVATE
 target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE
     FX_INCLUDE_USER_DEFINE_FILE           # port/filex/fx_user.h  (issue #30)
     LX_INCLUDE_USER_DEFINE_FILE           # port/levelx/lx_user.h (issue #30)
+    GX_INCLUDE_USER_DEFINE_FILE           # port/guix/gx_user.h   (issue #55)
     CLI_ENABLE_DANGEROUS_CMDS=$<BOOL:${CLI_ENABLE_DANGEROUS_CMDS}>
     CLI_DEVMEM_DUMP_MAX_LEN=${CLI_DEVMEM_DUMP_MAX_LEN}
     CLI_INSTANCE_STACK_SIZE=4096          # headroom: coremark runs in this thread

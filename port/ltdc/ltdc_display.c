@@ -74,6 +74,7 @@ static uint8_t      ltdc_front;       /* index (0/1) of the displayed buffer  */
 static bool         ltdc_up;          /* init succeeded                       */
 static bool         ltdc_tried;       /* init ran (idempotence latch)         */
 static bool         ltdc_fault;       /* reload stuck -> display latched down */
+static bool         ltdc_gui_owned;   /* GUIX owns the display (#55)          */
 static TX_SEMAPHORE ltdc_reload_sem;  /* posted by the reload-ready IRQ       */
 static TX_MUTEX     ltdc_lock;        /* serializes drawing + flip            */
 
@@ -105,6 +106,25 @@ void ltdc_lock_frame(void)
 void ltdc_unlock_frame(void)
 {
 	(void)tx_mutex_put(&ltdc_lock);
+}
+
+/* GUIX ownership (#55).  Set/clear under ltdc_lock so the flag flip is atomic
+   against an in-flight draw helper: take() cannot complete while a helper holds
+   the lock mid-draw, and once owned every public draw/flip path (which re-reads
+   ltdc_gui_owned under the same lock) becomes a no-op/refusal. */
+bool ltdc_gui_take(bool on)
+{
+	if (!ltdc_is_up())
+		return false;
+	ltdc_lock_frame();
+	ltdc_gui_owned = on;
+	ltdc_unlock_frame();
+	return true;
+}
+
+bool ltdc_gui_owns(void)
+{
+	return ltdc_gui_owned;
 }
 
 uint32_t ltdc_pixel_clock_hz(void)
@@ -401,6 +421,10 @@ void ltdc_fill(uint16_t rgb565)
 	if (!ltdc_is_up())
 		return;       /* no-op when down (lock/objects may not exist) */
 	ltdc_lock_frame();
+	if (ltdc_gui_owned) {        /* GUIX owns the display: shell draw is a no-op */
+		ltdc_unlock_frame();
+		return;
+	}
 	back = ltdc_back_buffer();
 	if (back != NULL)
 		ltdc_dma2d_fill(back, rgb565, LTDC_LCD_WIDTH, LTDC_LCD_HEIGHT, 0);
@@ -416,6 +440,10 @@ void ltdc_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
 	if (!ltdc_is_up())
 		return;       /* no-op when down (lock/objects may not exist) */
 	ltdc_lock_frame();
+	if (ltdc_gui_owned) {        /* GUIX owns the display: shell draw is a no-op */
+		ltdc_unlock_frame();
+		return;
+	}
 	back = ltdc_back_buffer();
 	if (back == NULL || x >= LTDC_LCD_WIDTH || y >= LTDC_LCD_HEIGHT) {
 		ltdc_unlock_frame();
@@ -443,6 +471,10 @@ void ltdc_blit(const uint16_t *src, uint16_t x, uint16_t y,
 	if (!ltdc_is_up())
 		return;       /* no-op when down (lock/objects may not exist) */
 	ltdc_lock_frame();
+	if (ltdc_gui_owned) {        /* GUIX owns the display: shell draw is a no-op */
+		ltdc_unlock_frame();
+		return;
+	}
 	back = ltdc_back_buffer();
 	if (back == NULL || src == NULL || x >= LTDC_LCD_WIDTH ||
 	    y >= LTDC_LCD_HEIGHT) {
@@ -475,6 +507,10 @@ void ltdc_colorbar(void)
 	if (!ltdc_is_up())
 		return;       /* no-op when down (lock/objects may not exist) */
 	ltdc_lock_frame();
+	if (ltdc_gui_owned) {        /* GUIX owns the display: shell draw is a no-op */
+		ltdc_unlock_frame();
+		return;
+	}
 	back = ltdc_back_buffer();
 	if (back == NULL) {
 		ltdc_unlock_frame();
@@ -500,6 +536,10 @@ void ltdc_blit_demo(void)
 	if (!ltdc_is_up())
 		return;       /* no-op when down (lock/objects may not exist) */
 	ltdc_lock_frame();
+	if (ltdc_gui_owned) {        /* GUIX owns the display: shell draw is a no-op */
+		ltdc_unlock_frame();
+		return;
+	}
 	back = ltdc_back_buffer();
 	if (back == NULL) {
 		ltdc_unlock_frame();
@@ -521,6 +561,10 @@ void ltdc_gradient(void)
 	if (!ltdc_is_up())
 		return;       /* no-op when down (lock/objects may not exist) */
 	ltdc_lock_frame();
+	if (ltdc_gui_owned) {        /* GUIX owns the display: shell draw is a no-op */
+		ltdc_unlock_frame();
+		return;
+	}
 	back = ltdc_back_buffer();
 	if (back == NULL) {
 		ltdc_unlock_frame();
@@ -546,19 +590,15 @@ void ltdc_gradient(void)
  * after the register reload commits at the next vertical blanking (RM0385
  * §18.7.6).  The reload-ready IRQ just wakes us; we still poll VBR to confirm.
  */
-int ltdc_flip(void)
+/* Raw tear-free present; caller MUST hold ltdc_lock.  Shared by the public
+   ltdc_flip() (ownership-gated) and the owner-only ltdc_gui_flip(). */
+static int ltdc_flip_locked(void)
 {
 	uint8_t back;
 	int rc = LTDC_OK;
 
-	if (!ltdc_is_up())
-		return LTDC_ERR_STATE;   /* down: lock/objects may not exist */
-	ltdc_lock_frame();
-
-	if (!ltdc_up || ltdc_fault) {
-		ltdc_unlock_frame();
+	if (!ltdc_up || ltdc_fault)
 		return LTDC_ERR_STATE;
-	}
 
 	back = (uint8_t)!ltdc_front;
 
@@ -593,7 +633,35 @@ int ltdc_flip(void)
 		LOG_ERR("LTDC reload stuck (VBR), display down");
 		rc = LTDC_ERR_HAL;
 	}
+	return rc;
+}
 
+int ltdc_flip(void)
+{
+	int rc;
+
+	if (!ltdc_is_up())
+		return LTDC_ERR_STATE;   /* down: lock/objects may not exist */
+	ltdc_lock_frame();
+	/* While GUIX owns the display the shell must not move ltdc_front (it would
+	   strand GUIX's canvas on the wrong buffer); refuse under the lock. */
+	if (ltdc_gui_owned) {
+		ltdc_unlock_frame();
+		return LTDC_ERR_STATE;
+	}
+	rc = ltdc_flip_locked();
+	ltdc_unlock_frame();
+	return rc;
+}
+
+int ltdc_gui_flip(void)
+{
+	int rc;
+
+	if (!ltdc_is_up())
+		return LTDC_ERR_STATE;
+	ltdc_lock_frame();
+	rc = ltdc_flip_locked();
 	ltdc_unlock_frame();
 	return rc;
 }

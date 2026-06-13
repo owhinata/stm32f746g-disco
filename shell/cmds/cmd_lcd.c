@@ -95,11 +95,26 @@ static int parse_color(const char *s, uint16_t *out)
 	return -1;
 }
 
-/* Shared guard for the drawing/backlight commands. */
+/* Shared guard for the drawing/backlight/info commands. */
 static int lcd_ready(struct cli_instance *sh)
 {
 	if (!ltdc_is_up()) {
 		cli_error(sh, "lcd: display not initialized\r\n");
+		return 0;
+	}
+	return 1;
+}
+
+/* Guard for the *drawing* commands: additionally refuse while GUIX owns the
+   display (#55).  The draw helpers / ltdc_flip() are no-ops under GUIX ownership
+   anyway, but failing up-front with a clear message is friendlier.  Backlight
+   (on/off) and info do NOT use this -- they are harmless while GUIX runs. */
+static int lcd_can_draw(struct cli_instance *sh)
+{
+	if (!lcd_ready(sh))
+		return 0;
+	if (ltdc_gui_owns()) {
+		cli_error(sh, "lcd: display owned by gui; run 'gui stop' first\r\n");
 		return 0;
 	}
 	return 1;
@@ -141,7 +156,7 @@ static int cmd_lcd_fill(struct cli_instance *sh, int argc, char **argv)
 	uint16_t color;
 
 	(void)argc;
-	if (!lcd_ready(sh))
+	if (!lcd_can_draw(sh))
 		return 1;
 	if (parse_color(argv[1], &color) != 0) {
 		cli_error(sh, "lcd: bad colour '%s' "
@@ -159,7 +174,7 @@ static int cmd_lcd_bar(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
-	if (!lcd_ready(sh))
+	if (!lcd_can_draw(sh))
 		return 1;
 	ltdc_lock_frame();
 	ltdc_colorbar();
@@ -172,7 +187,7 @@ static int cmd_lcd_grad(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
-	if (!lcd_ready(sh))
+	if (!lcd_can_draw(sh))
 		return 1;
 	ltdc_lock_frame();
 	ltdc_gradient();
@@ -185,7 +200,7 @@ static int cmd_lcd_clear(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
-	if (!lcd_ready(sh))
+	if (!lcd_can_draw(sh))
 		return 1;
 	ltdc_lock_frame();
 	ltdc_fill(LTDC_RGB565_BLACK);
@@ -207,11 +222,17 @@ static int cmd_lcd_anim(struct cli_instance *sh, int argc, char **argv)
 
 	(void)argc;
 	(void)argv;
-	if (!lcd_ready(sh))
+	if (!lcd_can_draw(sh))
 		return 1;
 
 	for (;;) {
 		int rc;
+
+		/* If `gui start` takes the display mid-animation (this command may run
+		   as a background job), stop -- the draw/flip below would no-op/refuse
+		   anyway, but exiting cleanly avoids a spurious "present failed". */
+		if (ltdc_gui_owns())
+			break;
 
 		ltdc_lock_frame();
 		ltdc_fill(0x0008u);                              /* dim background */
@@ -245,7 +266,7 @@ static int cmd_lcd_blit(struct cli_instance *sh, int argc, char **argv)
 
 	(void)argc;
 	(void)argv;
-	if (!lcd_ready(sh))
+	if (!lcd_can_draw(sh))
 		return 1;
 
 	ltdc_lock_frame();

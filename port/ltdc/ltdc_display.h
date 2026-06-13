@@ -151,6 +151,31 @@ void ltdc_unlock_frame(void);
  */
 int ltdc_flip(void);
 
+/* ---- Display ownership interlock for GUIX (#55) -----------------------------
+ * GUIX (port/guix) drives the same double buffer as the `lcd` command.  The
+ * ltdc_lock mutex only serializes *individual* draws/flips; it does not stop the
+ * shell from swapping ltdc_front out from under GUIX (whose canvas is bound to
+ * ltdc_back_buffer()).  So while GUIX runs it *takes ownership*: with ownership
+ * held, the public draw helpers (ltdc_fill/.../ltdc_gradient) and the public
+ * ltdc_flip() become no-ops/refusals -- a backgrounded `lcd anim &` that takes
+ * the lock after ownership was taken finds both its draw and its flip disabled,
+ * so ltdc_front cannot move.  GUIX presents through the owner-only ltdc_gui_flip()
+ * instead.  The flag is set/cleared under ltdc_lock, so it is atomic against an
+ * in-flight draw helper (take() blocks until that helper releases the lock). */
+
+/** Take (on=true) or release (on=false) GUIX ownership of the display.  Atomic
+ *  with ltdc_lock.  Returns false if the display is down (nothing to own). */
+bool ltdc_gui_take(bool on);
+
+/** Nonzero while GUIX owns the display (the `lcd` draw/flip path is disabled). */
+bool ltdc_gui_owns(void);
+
+/** Owner-only tear-free present: same as ltdc_flip() but NOT gated on ownership
+ *  (the public ltdc_flip() refuses while GUIX owns).  GUIX's buffer-toggle uses
+ *  this.  Thread-context only; takes ltdc_lock (recursive, so safe when the
+ *  caller already holds it). */
+int ltdc_gui_flip(void);
+
 /** Pixel clock actually programmed (LTDC_PIXEL_CLOCK_HZ); 0 when down. */
 uint32_t ltdc_pixel_clock_hz(void);
 

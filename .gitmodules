@@ -23,3 +23,6 @@
 [submodule "lib/ov5640"]
 	path = lib/ov5640
 	url = https://github.com/STMicroelectronics/stm32-ov5640
+[submodule "lib/guix"]
+	path = lib/guix
+	url = https://github.com/eclipse-threadx/guix
