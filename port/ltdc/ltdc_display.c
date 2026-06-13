@@ -4,7 +4,7 @@
  */
 /**
  * @file    ltdc_display.c
- * @brief   RK043FN48H LCD bring-up via LTDC (issue #52).
+ * @brief   RK043FN48H LCD bring-up via LTDC (issue #52/#53).
  *
  * See ltdc_display.h for the API contract and the clock/memory rationale.
  * Hardware setup, mirroring the ST BSP (stm32746g_discovery_lcd.c) / RM0385:
@@ -20,12 +20,22 @@
  *     PK0/1/2/4/5/6/7 (UM1907 / ST BSP).  LCD_DISP (PI12) and LCD_BL_CTRL (PK3)
  *     are plain GPIO outputs driven manually.
  *   - One RGB565 layer covering the full 480x272 window, source = the `.sdram`
- *     frame buffer below.
+ *     frame buffers below (two of them, double-buffered).
  *
- * Phase 1 draws with the CPU only (the `.sdram` region is MPU non-cacheable, so
- * writes are immediately visible to the LTDC read DMA -- no cache maintenance).
- * DMA2D and double buffering arrive in #53.  No LTDC interrupt is used; the
- * FIFO-underrun / transfer-error flags are polled via ltdc_errors().
+ * Drawing is DMA2D-accelerated (#53): the Chrom-ART engine does register-to-
+ * memory fills (ltdc_dma2d_fill) and memory-to-memory blits (ltdc_dma2d_blit),
+ * polled to completion.  DMA2D, the CPU and the LTDC read DMA all touch the same
+ * MPU non-cacheable `.sdram` region, so they are coherent with no cache work.
+ *
+ * Double buffer + tear-free flip (#53): drawing targets the back buffer;
+ * ltdc_flip() stages it via HAL_LTDC_SetAddress_NoReload() then HAL_LTDC_Reload
+ * (VERTICAL_BLANKING) and waits for the hardware reload.  SRCR.VBR is the
+ * authoritative signal -- it self-clears only after the HW commits the reload at
+ * the next vertical blanking (RM0385 §18.7.6) -- and the reload-ready IRQ
+ * (LTDC_IRQHandler -> HAL_LTDC_ReloadEventCallback -> ltdc_reload_sem) is just a
+ * wake-up hint.  fail-closed: a stuck reload latches ltdc_fault and leaves the
+ * front buffer untouched.  ltdc_lock serializes all drawing + flips.  The
+ * FIFO-underrun / transfer-error flags are still polled via ltdc_errors().
  *
  * Clean-room implementation; ST BSP / RM0385 §18 used as reference only.
  */
@@ -33,6 +43,7 @@
 #include "sdram.h"
 
 #include "stm32f7xx_hal.h"
+#include "tx_api.h"
 
 #define LOG_TAG "ltdc"
 #include "log.h"
@@ -51,23 +62,49 @@
 #define RK_VBP     2u
 #define RK_VFP     2u
 
-/* Frame buffer: 480 x 272 x RGB565 = 261120 B, in the non-cacheable SDRAM. */
-static uint16_t ltdc_fb[LTDC_LCD_WIDTH * LTDC_LCD_HEIGHT]
+/* Double buffer: two 480 x 272 RGB565 frames = 2 x 261120 B in non-cacheable
+   SDRAM.  ltdc_front selects the displayed one; the other is the draw target. */
+static uint16_t ltdc_fb[2][LTDC_LCD_WIDTH * LTDC_LCD_HEIGHT]
 	__attribute__((aligned(32), section(".sdram")));
 
-static LTDC_HandleTypeDef hltdc;
+static LTDC_HandleTypeDef  hltdc;
+static DMA2D_HandleTypeDef hdma2d;
 
-static bool ltdc_up;       /* init succeeded               */
-static bool ltdc_tried;    /* init ran (idempotence latch) */
+static uint8_t      ltdc_front;       /* index (0/1) of the displayed buffer  */
+static bool         ltdc_up;          /* init succeeded                       */
+static bool         ltdc_tried;       /* init ran (idempotence latch)         */
+static bool         ltdc_fault;       /* reload stuck -> display latched down */
+static TX_SEMAPHORE ltdc_reload_sem;  /* posted by the reload-ready IRQ       */
+static TX_MUTEX     ltdc_lock;        /* serializes drawing + flip            */
 
 bool ltdc_is_up(void)
 {
-	return ltdc_up;
+	return ltdc_up && !ltdc_fault;
 }
 
 uint16_t *ltdc_framebuffer(void)
 {
-	return ltdc_up ? ltdc_fb : NULL;
+	return ltdc_is_up() ? &ltdc_fb[ltdc_front][0] : NULL;
+}
+
+uint16_t *ltdc_back_buffer(void)
+{
+	return ltdc_is_up() ? &ltdc_fb[!ltdc_front][0] : NULL;
+}
+
+uint8_t ltdc_active_buffer(void)
+{
+	return ltdc_front;
+}
+
+void ltdc_lock_frame(void)
+{
+	(void)tx_mutex_get(&ltdc_lock, TX_WAIT_FOREVER);
+}
+
+void ltdc_unlock_frame(void)
+{
+	(void)tx_mutex_put(&ltdc_lock);
 }
 
 uint32_t ltdc_pixel_clock_hz(void)
@@ -98,6 +135,72 @@ uint32_t ltdc_errors(bool clear)
 		__HAL_LTDC_CLEAR_FLAG(&hltdc, LTDC_FLAG_TE);
 	}
 	return mask;
+}
+
+/* ---- DMA2D (Chrom-ART) draw primitives (ST BSP LL_FillBuffer / -------------
+ * LL_ConvertLineToARGB8888 idiom: per-op Init + ConfigLayer + Start + poll). */
+
+/* Expand an RGB565 colour to ARGB8888 (0x00RRGGBB).  R2M fills MUST pass this
+   to HAL_DMA2D_Start(): the F7 HAL takes the R2M "color" argument as an
+   ARGB8888 value and re-packs it to the output format (stm32f7xx_hal_dma2d.c
+   DMA2D_SetConfig, RM0385 §9), so a raw RGB565 word would render as a wrong
+   colour.  The 5/6/5 -> 8/8/8 expansion replicates the high bits into the low
+   ones, and the HAL truncates straight back to the original 5/6/5. */
+static uint32_t rgb565_to_argb8888(uint16_t c)
+{
+	uint32_t r = (uint32_t)(c >> 11) & 0x1Fu;
+	uint32_t g = (uint32_t)(c >> 5) & 0x3Fu;
+	uint32_t b = (uint32_t)c & 0x1Fu;
+
+	r = (r << 3) | (r >> 2);          /* 5 -> 8 */
+	g = (g << 2) | (g >> 4);          /* 6 -> 8 */
+	b = (b << 3) | (b >> 2);          /* 5 -> 8 */
+	return (r << 16) | (g << 8) | b;
+}
+
+/* Register-to-memory single-colour fill of a w x h RGB565 block, @p line_off
+   u16 of padding skipped at each row end (= dst stride - w). */
+static void ltdc_dma2d_fill(uint16_t *dst, uint16_t color, uint32_t w,
+                            uint32_t h, uint32_t line_off)
+{
+	if (w == 0u || h == 0u)
+		return;       /* a zero-size DMA2D transfer is not meaningful */
+
+	hdma2d.Instance         = DMA2D;
+	hdma2d.Init.Mode        = DMA2D_R2M;
+	hdma2d.Init.ColorMode   = DMA2D_OUTPUT_RGB565;
+	hdma2d.Init.OutputOffset = line_off;
+
+	if (HAL_DMA2D_Init(&hdma2d) == HAL_OK &&
+	    HAL_DMA2D_ConfigLayer(&hdma2d, 1) == HAL_OK &&
+	    HAL_DMA2D_Start(&hdma2d, rgb565_to_argb8888(color),
+	                    (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
+		HAL_DMA2D_PollForTransfer(&hdma2d, 30);
+}
+
+/* Memory-to-memory copy of a w x h RGB565 block, with separate u16 row offsets
+   for destination (@p dst_off) and source (@p src_off). */
+static void ltdc_dma2d_blit(uint16_t *dst, const uint16_t *src, uint32_t w,
+                            uint32_t h, uint32_t dst_off, uint32_t src_off)
+{
+	if (w == 0u || h == 0u)
+		return;       /* a zero-size DMA2D transfer is not meaningful */
+
+	hdma2d.Instance          = DMA2D;
+	hdma2d.Init.Mode         = DMA2D_M2M;
+	hdma2d.Init.ColorMode    = DMA2D_OUTPUT_RGB565;
+	hdma2d.Init.OutputOffset = dst_off;
+
+	hdma2d.LayerCfg[1].AlphaMode      = DMA2D_NO_MODIF_ALPHA;
+	hdma2d.LayerCfg[1].InputAlpha     = 0xFF;
+	hdma2d.LayerCfg[1].InputColorMode = DMA2D_INPUT_RGB565;
+	hdma2d.LayerCfg[1].InputOffset    = src_off;
+
+	if (HAL_DMA2D_Init(&hdma2d) == HAL_OK &&
+	    HAL_DMA2D_ConfigLayer(&hdma2d, 1) == HAL_OK &&
+	    HAL_DMA2D_Start(&hdma2d, (uint32_t)(uintptr_t)src,
+	                    (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
+		HAL_DMA2D_PollForTransfer(&hdma2d, 30);
 }
 
 /* PLLSAI -> LCD_CLK = 9.6 MHz (see file header / RM0385 §5.3.24/25). */
@@ -202,7 +305,7 @@ static int ltdc_controller_init(void)
 	layer.Alpha0          = 0;
 	layer.BlendingFactor1 = LTDC_BLENDING_FACTOR1_CA;
 	layer.BlendingFactor2 = LTDC_BLENDING_FACTOR2_CA;
-	layer.FBStartAdress   = (uint32_t)(uintptr_t)ltdc_fb;
+	layer.FBStartAdress   = (uint32_t)(uintptr_t)&ltdc_fb[0][0];
 	layer.ImageWidth      = LTDC_LCD_WIDTH;
 	layer.ImageHeight     = LTDC_LCD_HEIGHT;
 	layer.Backcolor.Red   = 0;
@@ -231,58 +334,132 @@ int ltdc_init(void)
 		return LTDC_ERR_STATE;
 	}
 
+	/* ThreadX objects for the tear-free flip (the reload-ready IRQ posts the
+	   semaphore; the mutex serializes drawing + flip).  Created before the
+	   controller comes up so the IRQ has somewhere to post once enabled. */
+	if (tx_semaphore_create(&ltdc_reload_sem, "ltdc_rl", 0) != TX_SUCCESS) {
+		LOG_ERR("ltdc reload semaphore create failed");
+		return LTDC_ERR_STATE;
+	}
+	if (tx_mutex_create(&ltdc_lock, "ltdc", TX_INHERIT) != TX_SUCCESS) {
+		LOG_ERR("ltdc lock create failed");
+		tx_semaphore_delete(&ltdc_reload_sem);
+		return LTDC_ERR_STATE;
+	}
+
 	rc = ltdc_clock_init();
 	if (rc != LTDC_OK)
-		return rc;
+		goto fail_obj;
 
 	__HAL_RCC_LTDC_CLK_ENABLE();
+	__HAL_RCC_DMA2D_CLK_ENABLE();    /* Chrom-ART for the draw primitives */
 	ltdc_gpio_init();
 
-	/* `.sdram` is NOLOAD (undefined at reset): clear to black BEFORE the layer
-	   is configured and the backlight comes on, so no garbage frame shows. */
-	for (uint32_t i = 0; i < LTDC_LCD_WIDTH * LTDC_LCD_HEIGHT; i++)
-		ltdc_fb[i] = LTDC_RGB565_BLACK;
+	/* `.sdram` is NOLOAD (undefined at reset): clear BOTH buffers to black
+	   BEFORE the layer is configured and the backlight comes on, so neither a
+	   garbage front frame nor a garbage first flip ever shows. */
+	for (uint32_t b = 0; b < 2u; b++)
+		for (uint32_t i = 0; i < LTDC_LCD_WIDTH * LTDC_LCD_HEIGHT; i++)
+			ltdc_fb[b][i] = LTDC_RGB565_BLACK;
+
+	ltdc_front = 0;
+	ltdc_fault = false;
 
 	rc = ltdc_controller_init();
 	if (rc != LTDC_OK) {
 		ltdc_backlight(false);
 		(void)HAL_LTDC_DeInit(&hltdc);
+		__HAL_RCC_DMA2D_CLK_DISABLE();
 		__HAL_RCC_LTDC_CLK_DISABLE();
-		return rc;     /* ltdc_up stays false */
+		goto fail_obj;     /* ltdc_up stays false */
 	}
+
+	/* Reload-ready IRQ: below DCMI/DMA2 (8), above SD (6-7) / USART (5).  The
+	   handler only fires after HAL_LTDC_Reload() arms LTDC_IT_RR in ltdc_flip. */
+	HAL_NVIC_SetPriority(LTDC_IRQn, 9, 0);
+	HAL_NVIC_EnableIRQ(LTDC_IRQn);
 
 	ltdc_backlight(true);
 
 	ltdc_up = true;
-	LOG_INF("RK043FN48H up: 480x272 RGB565, LCD_CLK 9.6 MHz, FB @0x%08lx",
-	        (unsigned long)(uintptr_t)ltdc_fb);
+	LOG_INF("RK043FN48H up: 480x272 RGB565 double-buffered, LCD_CLK 9.6 MHz, "
+	        "FB0 @0x%08lx FB1 @0x%08lx",
+	        (unsigned long)(uintptr_t)&ltdc_fb[0][0],
+	        (unsigned long)(uintptr_t)&ltdc_fb[1][0]);
 	return LTDC_OK;
+
+fail_obj:
+	tx_mutex_delete(&ltdc_lock);
+	tx_semaphore_delete(&ltdc_reload_sem);
+	return rc;
 }
 
 void ltdc_fill(uint16_t rgb565)
 {
-	if (!ltdc_up)
-		return;
-	for (uint32_t i = 0; i < LTDC_LCD_WIDTH * LTDC_LCD_HEIGHT; i++)
-		ltdc_fb[i] = rgb565;
+	uint16_t *back;
+
+	if (!ltdc_is_up())
+		return;       /* no-op when down (lock/objects may not exist) */
+	ltdc_lock_frame();
+	back = ltdc_back_buffer();
+	if (back != NULL)
+		ltdc_dma2d_fill(back, rgb565, LTDC_LCD_WIDTH, LTDC_LCD_HEIGHT, 0);
+	ltdc_unlock_frame();
 }
 
 void ltdc_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                     uint16_t rgb565)
 {
+	uint16_t *back;
 	uint32_t x1, y1;
 
-	if (!ltdc_up || x >= LTDC_LCD_WIDTH || y >= LTDC_LCD_HEIGHT)
+	if (!ltdc_is_up())
+		return;       /* no-op when down (lock/objects may not exist) */
+	ltdc_lock_frame();
+	back = ltdc_back_buffer();
+	if (back == NULL || x >= LTDC_LCD_WIDTH || y >= LTDC_LCD_HEIGHT) {
+		ltdc_unlock_frame();
 		return;
+	}
 	x1 = (uint32_t)x + w;
 	y1 = (uint32_t)y + h;
 	if (x1 > LTDC_LCD_WIDTH)
 		x1 = LTDC_LCD_WIDTH;
 	if (y1 > LTDC_LCD_HEIGHT)
 		y1 = LTDC_LCD_HEIGHT;
-	for (uint32_t row = y; row < y1; row++)
-		for (uint32_t col = x; col < x1; col++)
-			ltdc_fb[row * LTDC_LCD_WIDTH + col] = rgb565;
+	w = (uint16_t)(x1 - x);
+	h = (uint16_t)(y1 - y);
+	ltdc_dma2d_fill(back + (uint32_t)y * LTDC_LCD_WIDTH + x, rgb565, w, h,
+	                LTDC_LCD_WIDTH - w);
+	ltdc_unlock_frame();
+}
+
+void ltdc_blit(const uint16_t *src, uint16_t x, uint16_t y,
+               uint16_t w, uint16_t h)
+{
+	uint16_t *back;
+	uint32_t x1, y1;
+
+	if (!ltdc_is_up())
+		return;       /* no-op when down (lock/objects may not exist) */
+	ltdc_lock_frame();
+	back = ltdc_back_buffer();
+	if (back == NULL || src == NULL || x >= LTDC_LCD_WIDTH ||
+	    y >= LTDC_LCD_HEIGHT) {
+		ltdc_unlock_frame();
+		return;
+	}
+	x1 = (uint32_t)x + w;
+	y1 = (uint32_t)y + h;
+	if (x1 > LTDC_LCD_WIDTH)
+		x1 = LTDC_LCD_WIDTH;
+	if (y1 > LTDC_LCD_HEIGHT)
+		y1 = LTDC_LCD_HEIGHT;
+	/* src stride stays the full requested w; the clipped width is x1-x. */
+	ltdc_dma2d_blit(back + (uint32_t)y * LTDC_LCD_WIDTH + x, src,
+	                x1 - x, y1 - y,
+	                LTDC_LCD_WIDTH - (x1 - x), w - (x1 - x));
+	ltdc_unlock_frame();
 }
 
 void ltdc_colorbar(void)
@@ -292,25 +469,155 @@ void ltdc_colorbar(void)
 		LTDC_RGB565_GREEN, LTDC_RGB565_MAGENTA, LTDC_RGB565_RED,
 		LTDC_RGB565_BLUE, LTDC_RGB565_BLACK,
 	};
+	uint16_t *back;
+	uint32_t bar_w = LTDC_LCD_WIDTH / 8u;   /* 60 */
 
-	if (!ltdc_up)
+	if (!ltdc_is_up())
+		return;       /* no-op when down (lock/objects may not exist) */
+	ltdc_lock_frame();
+	back = ltdc_back_buffer();
+	if (back == NULL) {
+		ltdc_unlock_frame();
 		return;
-	for (uint32_t row = 0; row < LTDC_LCD_HEIGHT; row++)
-		for (uint32_t col = 0; col < LTDC_LCD_WIDTH; col++)
-			ltdc_fb[row * LTDC_LCD_WIDTH + col] =
-				bars[col * 8u / LTDC_LCD_WIDTH];
+	}
+	/* One DMA2D R2M fill per bar; the last bar absorbs the remainder so the
+	   eight bars cover the full width exactly. */
+	for (uint32_t i = 0; i < 8u; i++) {
+		uint32_t x0 = i * bar_w;
+		uint32_t w  = (i == 7u) ? (LTDC_LCD_WIDTH - x0) : bar_w;
+
+		ltdc_dma2d_fill(back + x0, bars[i], w, LTDC_LCD_HEIGHT,
+		                LTDC_LCD_WIDTH - w);
+	}
+	ltdc_unlock_frame();
+}
+
+void ltdc_blit_demo(void)
+{
+	uint16_t *back;
+	uint32_t half = LTDC_LCD_WIDTH / 2u;   /* 240 */
+
+	if (!ltdc_is_up())
+		return;       /* no-op when down (lock/objects may not exist) */
+	ltdc_lock_frame();
+	back = ltdc_back_buffer();
+	if (back == NULL) {
+		ltdc_unlock_frame();
+		return;
+	}
+	/* M2M copy of the left half (src) over the right half (dst), both within
+	   the same back buffer.  Each half is `half` px wide but lives in a
+	   full-width (W) frame buffer, so both src and dst skip W-half u16 per row
+	   (this is exactly the strided case ltdc_blit() cannot express). */
+	ltdc_dma2d_blit(back + half, back, half, LTDC_LCD_HEIGHT,
+	                LTDC_LCD_WIDTH - half, LTDC_LCD_WIDTH - half);
+	ltdc_unlock_frame();
 }
 
 void ltdc_gradient(void)
 {
-	if (!ltdc_up)
+	uint16_t *back;
+
+	if (!ltdc_is_up())
+		return;       /* no-op when down (lock/objects may not exist) */
+	ltdc_lock_frame();
+	back = ltdc_back_buffer();
+	if (back == NULL) {
+		ltdc_unlock_frame();
 		return;
+	}
+	/* Per-column colour, so the CPU draws this one straight into the
+	   non-cacheable back buffer (no DMA2D acceleration possible). */
 	for (uint32_t col = 0; col < LTDC_LCD_WIDTH; col++) {
 		uint32_t lum = col * 255u / (LTDC_LCD_WIDTH - 1u);
 		uint16_t px = (uint16_t)(((lum >> 3) << 11) |   /* R5 */
 		                         ((lum >> 2) << 5) |    /* G6 */
 		                          (lum >> 3));           /* B5 */
 		for (uint32_t row = 0; row < LTDC_LCD_HEIGHT; row++)
-			ltdc_fb[row * LTDC_LCD_WIDTH + col] = px;
+			back[row * LTDC_LCD_WIDTH + col] = px;
 	}
+	ltdc_unlock_frame();
+}
+
+/*
+ * Tear-free present (see file/header doc).  ltdc_lock is held across the whole
+ * sequence; every return path releases it.  SRCR.VBR is authoritative: it is
+ * set by HAL_LTDC_Reload(VERTICAL_BLANKING) and self-cleared by hardware only
+ * after the register reload commits at the next vertical blanking (RM0385
+ * §18.7.6).  The reload-ready IRQ just wakes us; we still poll VBR to confirm.
+ */
+int ltdc_flip(void)
+{
+	uint8_t back;
+	int rc = LTDC_OK;
+
+	if (!ltdc_is_up())
+		return LTDC_ERR_STATE;   /* down: lock/objects may not exist */
+	ltdc_lock_frame();
+
+	if (!ltdc_up || ltdc_fault) {
+		ltdc_unlock_frame();
+		return LTDC_ERR_STATE;
+	}
+
+	back = (uint8_t)!ltdc_front;
+
+	/* Drain any stale reload posts from a previous flip so the wait below
+	   blocks on THIS reload, not a leftover one. */
+	while (tx_semaphore_get(&ltdc_reload_sem, TX_NO_WAIT) == TX_SUCCESS)
+		;
+
+	(void)HAL_LTDC_SetAddress_NoReload(&hltdc,
+	                                   (uint32_t)(uintptr_t)&ltdc_fb[back][0],
+	                                   0);
+	(void)HAL_LTDC_Reload(&hltdc, LTDC_RELOAD_VERTICAL_BLANKING);
+
+	/* Wake-up hint (the IRQ posts on reload-ready); the truth is VBR below.
+	   A frame is ~16.9 ms (59.3 Hz), so 100 ms is many frames of slack. */
+	(void)tx_semaphore_get(&ltdc_reload_sem, 100);
+
+	/* Authoritative confirmation: wait (up to ~100 ms total) for the hardware
+	   to actually clear VBR.  Poll at 1 ms (1 tick) intervals. */
+	for (uint32_t i = 0; i < 100u; i++) {
+		if ((hltdc.Instance->SRCR & LTDC_SRCR_VBR) == 0u)
+			break;
+		tx_thread_sleep(1);
+	}
+
+	if ((hltdc.Instance->SRCR & LTDC_SRCR_VBR) == 0u) {
+		ltdc_front = back;            /* swap committed */
+	} else {
+		/* fail-closed: the reload never landed -- leave the front buffer
+		   as-is and latch the display down (recovery is a system reset). */
+		ltdc_fault = true;
+		LOG_ERR("LTDC reload stuck (VBR), display down");
+		rc = LTDC_ERR_HAL;
+	}
+
+	ltdc_unlock_frame();
+	return rc;
+}
+
+/* ---- LTDC reload-ready IRQ (only armed transiently by HAL_LTDC_Reload). ----
+ * Wrapped in the ThreadX execution-profile enter/exit exactly like the camera /
+ * SD drivers' ISRs.  HAL_LTDC_IRQHandler() clears the RR flag, disables the RR
+ * interrupt and dispatches HAL_LTDC_ReloadEventCallback() below. */
+void LTDC_IRQHandler(void)
+{
+#if defined(TX_EXECUTION_PROFILE_ENABLE)
+	{ uint32_t pm = __get_PRIMASK(); __disable_irq();
+	  _tx_execution_isr_enter(); __set_PRIMASK(pm); }
+#endif
+	HAL_LTDC_IRQHandler(&hltdc);
+#if defined(TX_EXECUTION_PROFILE_ENABLE)
+	{ uint32_t pm = __get_PRIMASK(); __disable_irq();
+	  _tx_execution_isr_exit(); __set_PRIMASK(pm); }
+#endif
+}
+
+/* Reload-ready: wake ltdc_flip() promptly (it still re-checks VBR). */
+void HAL_LTDC_ReloadEventCallback(LTDC_HandleTypeDef *hltdc_cb)
+{
+	if (hltdc_cb == &hltdc)
+		(void)tx_semaphore_put(&ltdc_reload_sem);
 }

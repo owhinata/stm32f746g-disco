@@ -4,14 +4,33 @@
  */
 /**
  * @file    ltdc_display.h
- * @brief   On-board RK043FN48H LCD bring-up via LTDC (issue #52, Epic #48).
+ * @brief   On-board RK043FN48H LCD bring-up via LTDC (issue #52/#53, Epic #48).
  *
  * Drives the board's 4.3" 480x272 RGB panel (Rocktech RK043FN48H-CT, UM1907
- * §6.10) through the STM32F746 LTDC controller.  Phase 1 of #48: a single
- * layer, RGB565, statically displayed from a SDRAM frame buffer -- enough to
- * verify the LCD wiring, RGB channel order and pixel clock with the `lcd`
- * command before adding DMA2D / double-buffering (#53), touch (#54) and GUIX
- * (#55/#56).
+ * §6.10) through the STM32F746 LTDC controller.  Phase 1 of #48 (#52) brought
+ * up a single RGB565 layer statically displayed from a SDRAM frame buffer to
+ * verify the LCD wiring, RGB channel order and pixel clock; Phase 2 (#53) adds
+ * DMA2D-accelerated drawing and a tear-free double buffer.  Touch (#54) and
+ * GUIX (#55/#56) follow.
+ *
+ * Double buffer (#53): two RGB565 frame buffers live in SDRAM.  Drawing always
+ * targets the *back* buffer (ltdc_back_buffer()); ltdc_flip() then makes it the
+ * front (displayed) one with a tear-free swap -- HAL_LTDC_SetAddress_NoReload()
+ * stages the new CFBAR, HAL_LTDC_Reload(VERTICAL_BLANKING) requests the
+ * register reload at the next VSYNC, and the swap is committed only after the
+ * hardware has actually reloaded (SRCR.VBR reads back 0, RM0385 §18.7.6 -- VBR
+ * self-clears after the HW reload).  A reload-ready IRQ (LTDC_IRQHandler ->
+ * HAL_LTDC_ReloadEventCallback) wakes ltdc_flip() promptly; the VBR poll is the
+ * authoritative truth.  If the reload never lands within the timeout the
+ * display is latched faulted (fail-closed): the front buffer is left unchanged
+ * and ltdc_is_up() goes false.
+ *
+ * Drawing acceleration (#53): DMA2D (Chrom-ART) does register-to-memory fills
+ * (ltdc_fill / ltdc_fill_rect / ltdc_colorbar) and memory-to-memory blits
+ * (ltdc_blit).  DMA2D is an AHB master writing the same MPU non-cacheable SDRAM
+ * as the CPU and the LTDC read DMA, so all three are coherent by construction.
+ * The drawing + flip APIs serialize through ltdc_lock (a ThreadX mutex), so
+ * concurrent callers never tear each other's frames.
  *
  * Clock: the LTDC pixel clock comes from PLLSAI, which is otherwise unused.
  * PLLSAI shares the main PLL's input divider M (=25), so VCO_in = HSE/M =
@@ -28,12 +47,15 @@
  * it returns LTDC_ERR_STATE otherwise (the caller must not invoke it when the
  * FMC is down -- touching 0xC0000000 would fault).
  *
- * ltdc_init() polls (HAL register waits, PLLSAI lock) and uses no interrupts or
- * ThreadX objects, so it may run from tx_application_define() before the
- * scheduler starts.  (The HAL PLLSAI lock wait is HAL_GetTick()-based, and the
- * SysTick handler increments the HAL tick unconditionally -- tx_glue.c -- so
- * the timeout works there too.)  Idempotent; later calls return the first
- * result.  Phase 1 uses no LTDC interrupt (static display).
+ * ltdc_init() only polls (HAL register waits, PLLSAI lock) -- it touches no
+ * interrupt at run time -- and the only ThreadX work it does is *creating* the
+ * flip semaphore + lock, which is exactly what tx_application_define() is for.
+ * So it may still run from tx_application_define() before the scheduler starts.
+ * (The HAL PLLSAI lock wait is HAL_GetTick()-based, and the SysTick handler
+ * increments the HAL tick unconditionally -- tx_glue.c -- so the timeout works
+ * there too.)  It enables the LTDC reload-ready IRQ (NVIC), but that vector
+ * only fires once HAL_LTDC_Reload() arms it inside ltdc_flip() (post-scheduler).
+ * Idempotent; later calls return the first result.
  *
  * Clean-room implementation; the ST BSP (stm32746g_discovery_lcd.c,
  * rk043fn48h.h) and RM0385 §18 (LTDC) / §5 (RCC/PLLSAI) were used as a
@@ -76,23 +98,58 @@ extern "C" {
 #define LTDC_ERRFLAG_TRANSFER_ERROR 0x2u   /* TERRIF */
 
 /**
- * One-time bring-up: PLLSAI -> LCD_CLK, LTDC + GPIO (AF14, plus PG12=AF9 and
- * the manually-driven LCD_DISP/LCD_BL_CTRL outputs), one RGB565 layer pointed
- * at the SDRAM frame buffer, then assert display-enable and backlight.  The
- * frame buffer is cleared to black BEFORE the layer/backlight come on (the
- * `.sdram` section is NOLOAD = undefined at reset).  Requires sdram_is_up();
- * returns LTDC_ERR_STATE otherwise.  Polling only -- safe from
- * tx_application_define().  Idempotent; on failure it cleans up (display off,
- * HAL_LTDC_DeInit) and leaves ltdc_is_up() false.
+ * One-time bring-up: the flip semaphore + lock, PLLSAI -> LCD_CLK, LTDC + DMA2D
+ * clocks, GPIO (AF14, plus PG12=AF9 and the manually-driven
+ * LCD_DISP/LCD_BL_CTRL outputs), one RGB565 layer pointed at frame buffer 0, the
+ * reload-ready IRQ (NVIC), then assert display-enable and backlight.  BOTH frame
+ * buffers are cleared to black BEFORE the layer/backlight come on (the `.sdram`
+ * section is NOLOAD = undefined at reset).  Requires sdram_is_up(); returns
+ * LTDC_ERR_STATE otherwise.  Mostly polling -- safe from tx_application_define()
+ * (the IRQ stays dormant until the first ltdc_flip()).  Idempotent; on failure
+ * it cleans up (display off, HAL_LTDC_DeInit, objects deleted) and leaves
+ * ltdc_is_up() false.
  */
 int ltdc_init(void);
 
-/** Nonzero once ltdc_init() succeeded (the panel is live). */
+/** Nonzero once ltdc_init() succeeded AND the display has not latched a reload
+ *  fault (see ltdc_flip()).  False means drawing/flip are no-ops. */
 bool ltdc_is_up(void);
 
-/** Base of the active RGB565 frame buffer (LTDC_LCD_WIDTH*HEIGHT u16), or NULL
- *  when the display is down.  Row-major, one u16 per pixel, no padding. */
+/** Base of the currently displayed (front) RGB565 frame buffer
+ *  (LTDC_LCD_WIDTH*HEIGHT u16), or NULL when the display is down.  Row-major,
+ *  one u16 per pixel, no padding.  READ-ONLY -- do NOT draw here (the LTDC is
+ *  reading it); draw into ltdc_back_buffer() then ltdc_flip(). */
 uint16_t *ltdc_framebuffer(void);
+
+/** Base of the off-screen (back) RGB565 frame buffer to draw into, or NULL when
+ *  the display is down.  The returned pointer is only valid while the caller
+ *  holds ltdc_lock_frame() -- a flip from another thread swaps which buffer is
+ *  "back".  Pair drawing with ltdc_flip() to present it. */
+uint16_t *ltdc_back_buffer(void);
+
+/** Index (0/1) of the currently displayed front buffer -- diagnostic only. */
+uint8_t ltdc_active_buffer(void);
+
+/*
+ * Frame lock (ltdc_lock, a ThreadX mutex; recursive within one thread).  Hold
+ * it around a draw-then-flip sequence so the back buffer cannot be swapped out
+ * from under the caller and concurrent drawers do not tear each other.  The
+ * individual draw helpers and ltdc_flip() take it internally too (the mutex is
+ * reentrant), so a handler can wrap several of them in one lock for atomicity.
+ * Thread-context only (waits on a ThreadX mutex); never call from an ISR.
+ */
+void ltdc_lock_frame(void);
+void ltdc_unlock_frame(void);
+
+/**
+ * Tear-free present: stage the back buffer's address, request a vertical-
+ * blanking reload, and commit the swap only once the hardware has reloaded
+ * (SRCR.VBR reads 0).  Returns LTDC_OK on a successful swap; LTDC_ERR_STATE if
+ * the display is down; LTDC_ERR_HAL if the reload never landed within the
+ * timeout -- in which case the display is latched faulted (front unchanged,
+ * ltdc_is_up() false; recovery is a system reset).  Thread-context only.
+ */
+int ltdc_flip(void);
 
 /** Pixel clock actually programmed (LTDC_PIXEL_CLOCK_HZ); 0 when down. */
 uint32_t ltdc_pixel_clock_hz(void);
@@ -107,21 +164,37 @@ void ltdc_backlight(bool on);
  *  LTDC_ERRFLAG_*; when @p clear is true the flags are cleared afterwards. */
 uint32_t ltdc_errors(bool clear);
 
-/* ---- Phase 1 CPU-drawn test patterns (FB is non-cacheable; no DMA2D yet). -- */
+/* ---- Drawing into the back buffer (#53; DMA2D-accelerated where noted). -----
+ * All of these draw into the back buffer only; they do NOT present.  Call
+ * ltdc_flip() afterwards to make the result visible.  No-ops when down. */
 
-/** Fill the whole frame buffer with one RGB565 colour. */
+/** Fill the whole back buffer with one RGB565 colour (DMA2D R2M). */
 void ltdc_fill(uint16_t rgb565);
 
-/** Fill an axis-aligned rectangle (clipped to the panel) with one colour. */
+/** Fill an axis-aligned rectangle (clipped to the panel) with one RGB565 colour
+ *  in the back buffer (DMA2D R2M). */
 void ltdc_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                     uint16_t rgb565);
 
+/** Copy a tightly-packed RGB565 source bitmap (w*h u16) into the back buffer at
+ *  (x,y), clipped to the panel (DMA2D M2M). */
+void ltdc_blit(const uint16_t *src, uint16_t x, uint16_t y,
+               uint16_t w, uint16_t h);
+
 /** Eight vertical colour bars (white/yellow/cyan/green/magenta/red/blue/black)
- *  -- verifies the RGB channel wiring and RGB565 bit order. */
+ *  into the back buffer -- verifies the RGB channel wiring and RGB565 bit order
+ *  (DMA2D R2M per bar). */
 void ltdc_colorbar(void);
 
-/** Horizontal black-to-white gradient -- verifies pixel-clock/timing stability
- *  (banding or shimmer means a clock/porch problem). */
+/** DMA2D M2M self-copy demo: copy the back buffer's left half over its right
+ *  half (a strided memory-to-memory blit within one frame buffer).  Exercises
+ *  the M2M path on a non-tightly-packed source; draw a pattern (e.g.
+ *  ltdc_colorbar) into the back buffer first, then ltdc_flip() to present. */
+void ltdc_blit_demo(void);
+
+/** Horizontal black-to-white gradient into the back buffer -- verifies
+ *  pixel-clock/timing stability (banding or shimmer means a clock/porch
+ *  problem).  CPU-drawn (per-column colour). */
 void ltdc_gradient(void);
 
 #ifdef __cplusplus
