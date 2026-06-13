@@ -109,16 +109,50 @@ struct frame_sink {
 	struct frame_sink       *_next;
 	const struct frame_desc *_pending; /**< LATEST coalesce slot (pinned)         */
 	int                      _busy;     /**< a consume() for this sink is in flight */
+	int                      _pins;     /**< slots this sink currently holds (detach) */
+};
+
+/** Compile-time caps for the inline bookkeeping (issue #46 implementation).
+ *  A producer statically allocates one struct frame_pipeline; nslots <= MAX. */
+#ifndef FRAME_PIPELINE_MAX_SLOTS
+#define FRAME_PIPELINE_MAX_SLOTS 8u
+#endif
+#ifndef FRAME_PIPELINE_MAX_SINKS
+#define FRAME_PIPELINE_MAX_SINKS 4u
+#endif
+
+/** One ring slot: a descriptor over caller SDRAM plus its bookkeeping. */
+struct frame_slot {
+	struct frame_desc desc;     /**< .data fixed at init; geometry/gen at publish */
+	int               state;    /**< 0 = free, 1 = filling (acquired, pre-publish) */
+	int               refcount; /**< sink pins (0 = reusable when free)            */
+};
+
+/** Producer/pipeline counters (read via frame_pipeline_stats). */
+struct frame_stats {
+	uint32_t captured;  /**< frames the producer acquired/filled  */
+	uint32_t published; /**< frames published (== last gen)        */
+	uint32_t overruns;  /**< acquire() calls that found no free slot */
 };
 
 /**
- * Ring/dispatch engine, opaque here.  The concrete struct -- including a
- * compile-time maximum slot count for its inline per-slot bookkeeping -- is
- * defined by the implementation (#46) and statically allocated by the producer
- * (port/camera owns one instance, the way it owns cam_frame[] today).  Keeping
- * it opaque in this header lets svc/ callers depend only on the pointer.
+ * Ring/dispatch engine.  Statically allocated by the producer (port/camera owns
+ * one instance, the way it owns cam_frame[] today); pass its address to every
+ * call.  Fields are implementation-internal -- callers treat it as opaque and
+ * only keep the pointer.
  */
-struct frame_pipeline;
+struct frame_pipeline {
+	const struct frame_os *os;                          /* injected mutex          */
+	struct frame_sink     *sinks;                       /* attached-sink list head */
+	struct frame_slot      slots[FRAME_PIPELINE_MAX_SLOTS];
+	uint32_t               nslots;
+	uint32_t               slot_size;                   /* bytes per slot          */
+	int                    latest;                      /* last published idx, -1  */
+	uint32_t               gen;                          /* publish counter         */
+	enum frame_format      fmt;                          /* current format (open)   */
+	uint16_t               width, height;               /* current geometry (open) */
+	struct frame_stats     stats;
+};
 
 /* ---- producer side ------------------------------------------------------- */
 
@@ -152,6 +186,14 @@ void frame_pipeline_publish(struct frame_pipeline *p, struct frame_desc *f,
                             uint16_t w, uint16_t h, uint16_t stride);
 
 /* ---- sink registry ------------------------------------------------------- */
+
+/**
+ * Set the current frame format/geometry the producer will publish.  attach()
+ * passes these to a sink's open(); a producer calls this before attaching sinks
+ * (and, for #45, on a format change -- re-opening sinks is the caller's job).
+ */
+void frame_pipeline_set_format(struct frame_pipeline *p, enum frame_format fmt,
+                               uint16_t w, uint16_t h);
 
 /**
  * Register a push sink.  attach() calls s->open() with the pipeline's current
@@ -206,13 +248,7 @@ void frame_pipeline_put(struct frame_pipeline *p, struct frame_sink *s,
 int frame_pipeline_read_latest(struct frame_pipeline *p, uint32_t off,
                                void *dst, uint32_t len, uint32_t *gen);
 
-/* ---- statistics ---------------------------------------------------------- */
-
-struct frame_stats {
-	uint32_t captured;  /**< frames the producer acquired/filled  */
-	uint32_t published; /**< frames published (== last gen)        */
-	uint32_t overruns;  /**< publishes with no free slot to acquire */
-};
+/* ---- statistics (struct frame_stats defined above frame_pipeline) -------- */
 
 void frame_pipeline_stats(struct frame_pipeline *p, struct frame_stats *out);
 

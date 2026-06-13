@@ -185,6 +185,34 @@ type 'help camera set' for the list of settings
 
     **Tint effects (bw/sepia/blue/red/green) own `SDE_CTRL3/4` via fixed U/V**, which collides with saturation/hue, so saturation/hue are skipped while a tint effect is active (they have no visible effect while U/V is fixed anyway).
 
+## Continuous capture (streaming, #46)
+
+Where `camera capture` takes a single snapshot (`DCMI_MODE_SNAPSHOT` + `DMA_NORMAL`), `camera stream` captures continuously with **DCMI continuous + DMA double-buffer (DBM)**. Captured frames flow into the [frame pipeline](../architecture/frame-pipeline.md) (one source → many sinks, #47); the primary #46 deliverable is a display-independent **FPS / overrun measurement**. LTDC display and burst saving plug in later as sinks.
+
+### Ring and DBM
+
+An **N=4 ring** in `.sdram` (`cam_ring[4]`, separate from `cam_frame[]`) is injected into `frame_pipeline_init`. DBM always keeps two slots as DMA targets (M0AR/M1AR), one holds the latest published frame, and one is free to acquire (the N=4 rationale). The HAL's internal `HAL_DCMI_Start_DMA` DBM split only triggers for `Length>0xFFFF` and is *intra-frame* banding, so it is not used; instead the producer drives an *inter-frame* N-slot ring explicitly with **`HAL_DMAEx_MultiBufferStart_IT` + `HAL_DMAEx_ChangeMemory`**.
+
+### Threading (the ISR only notifies)
+
+| Layer | Role |
+|---|---|
+| DMA TC ISR (`DMA2_Stream1`, prio 8) | posts `cam_stream_sem` only; never touches the ring / CT |
+| **producer thread (prio 10, dedicated)** | identifies the completed buffer via `CT` → `acquire`s a free slot → repoints the completed M-register (`HAL_DMAEx_ChangeMemory`) → **then publishes**. Also owns auto-stop (--frames/--secs/OVR) and teardown |
+| CLI command (prio 16) | issues `start`/`stop`/`stats` and returns at once; never touches a frame |
+
+**Tear-free invariant**: the "acquire → repoint → publish" order means a slot handed to a sink is never a live DMA target. With no free slot the frame is dropped, not published (`ring_ovr`).
+
+### Commands (non-blocking)
+
+```
+camera stream start [test] [--frames N] [--secs S]   returns at once (capture runs in the background)
+camera stream stop                                    stop
+camera stream stats                                   FPS / frames / overruns
+```
+
+`start` returns immediately and never occupies the CLI prompt; the producer thread runs the capture and auto-stops on `--frames`/`--secs`, `stream stop`, or a DCMI overrun. **OVR is terminal**: a continuous-mode DCMI overrun makes the HAL abort the DMA, so it is counted, the stream stops, and it is reported by `stats` (it should be near zero given the FMC bandwidth for QVGA). Streaming and `camera capture` share one DCMI/DMA and are mutually exclusive (capture is rejected as busy while streaming).
+
 ## References
 
 - UM2779 — B-CAMS-OMV user manual (CN5 pinout, MB1379/X1 crystal, JP1)

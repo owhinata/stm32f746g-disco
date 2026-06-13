@@ -156,6 +156,39 @@ int camera_frame_read(uint32_t offset, void *dst, uint32_t len,
  */
 void camera_frame_invalidate(void);
 
+/** Nonzero while a stream is running (a destructive `.sdram` op must refuse:
+ *  the ring is a live DMA target).  See camera_stream_start() (#46). */
+int camera_streaming(void);
+
+/* ---- streaming (issue #46): DCMI continuous + DMA double-buffer ----------- */
+/** Live FPS / overrun snapshot for `camera stream stats`. */
+struct camera_stream_info {
+	int      active;     /* a stream is in progress                          */
+	int      err;        /* stopped by a DCMI overrun (terminal)             */
+	uint32_t frames;     /* frames published since start                     */
+	uint32_t delivered;  /* frames delivered to the stats sink               */
+	uint32_t dropped;    /* frames the sink dropped (busy)                   */
+	uint32_t dcmi_ovr;   /* DCMI FIFO overruns                               */
+	uint32_t ring_ovr;   /* ring exhaustion / lost completions               */
+	uint32_t elapsed_ms; /* run duration (live, or frozen at stop)           */
+};
+
+/**
+ * Start continuous capture into the SDRAM frame ring (DCMI continuous + DMA
+ * double-buffer).  **Non-blocking**: a dedicated producer thread runs the
+ * capture and this returns at once.  @p colorbar selects the OV5640 test
+ * pattern.  The stream auto-stops after @p frames frames or @p secs seconds
+ * (0 = unbounded); camera_stream_stop() or a DCMI overrun also stop it.
+ * Mutually exclusive with camera_capture() (both own the DCMI/DMA).
+ */
+int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs);
+
+/** Request the running stream to stop (non-blocking; the producer tears down). */
+int camera_stream_stop(void);
+
+/** Fill @p out with the current or last stream statistics (any time). */
+int camera_stream_stats(struct camera_stream_info *out);
+
 /** Copy the current quality settings into @p out (never touches the sensor). */
 int camera_get_settings(struct camera_settings *out);
 

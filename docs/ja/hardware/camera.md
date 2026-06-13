@@ -185,6 +185,34 @@ type 'help camera set' for the list of settings
 
     **tint 系 effect（bw/sepia/blue/red/green）は `SDE_CTRL3/4` を fixed U/V で占有**し saturation/hue と register が衝突するため、tint 適用中は saturation/hue を skip する（U/V 固定中はどのみち無効）。
 
+## 連続取り込み（streaming, #46）
+
+`camera capture` の単発 snapshot（`DCMI_MODE_SNAPSHOT` + `DMA_NORMAL`）に対し、`camera stream` は **DCMI continuous + DMA double-buffer(DBM)** で途切れなく取り込む。取り込んだフレームは [フレームパイプライン](../architecture/frame-pipeline.md)（1 ソース→マルチシンク, #47）へ流し、#46 の一次成果は表示非依存の **FPS / オーバーラン計測**。LTDC 表示や連続保存は後続のシンクとして差し込む。
+
+### リングと DBM
+
+`.sdram` に **N=4 面**のリング（`cam_ring[4]`、`cam_frame[]` とは別）を確保し、`frame_pipeline_init` に注入する。DBM は常に 2 面を DMA ターゲット（M0AR/M1AR）にし、1 面が最新 published、1 面が次に acquire 可能（N=4 の根拠）。`HAL_DCMI_Start_DMA` の内部 DBM 分割は `Length>0xFFFF` 時のみ・かつ**フレーム内**分割なので使わず、**`HAL_DMAEx_MultiBufferStart_IT` + `HAL_DMAEx_ChangeMemory`** で **フレーム間** N 面リングを producer が明示制御する。
+
+### スレッド構成（ISR は通知のみ）
+
+| 層 | 役割 |
+|---|---|
+| DMA TC ISR（`DMA2_Stream1`, prio 8） | `cam_stream_sem` を post するだけ。リング/CT には触れない |
+| **producer スレッド（prio 10, 専用）** | `CT` で完了面を特定 → 空きスロット `acquire` → 完了側 M-reg を `HAL_DMAEx_ChangeMemory` で張替え → **然る後 publish**。自動停止（--frames/--secs/OVR）と teardown も担う |
+| CLI コマンド（prio 16） | `start`/`stop`/`stats` を発行して即 return。フレーム処理には関与しない |
+
+**tear-free 不変条件**: 「acquire → repoint → publish」の順により、シンクに渡した面は決して live DMA ターゲットにならない。空きスロットが無ければ publish せず drop（`ring_ovr`）。
+
+### コマンド（非ブロック）
+
+```
+camera stream start [test] [--frames N] [--secs S]   即 return（裏で取り込み開始）
+camera stream stop                                    停止
+camera stream stats                                   FPS / frames / overrun
+```
+
+`start` は即座に戻り、CLI プロンプトを奪わない。取り込みは producer スレッドが回し、`--frames`/`--secs` 到達・`stream stop`・DCMI OVR のいずれかで自動停止する。**OVR は terminal**: continuous の DCMI オーバーラン時に HAL が DMA を abort するため、計数して停止し `stats` に出す（QVGA の FMC 帯域では本来 0 近傍）。stream と `camera capture` は同一 DCMI/DMA を共有するため**排他**（stream 中の capture は busy）。
+
 ## 参照
 
 - UM2779 — B-CAMS-OMV ユーザマニュアル（CN5 ピンアウト、MB1379/X1 クリスタル、JP1）

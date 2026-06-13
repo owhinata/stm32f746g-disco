@@ -621,6 +621,115 @@ CLI_SUBCMD_SET_CREATE(camera_set_subcmds,
 	CLI_CMD(default,    NULL, "reset all settings to neutral", cmd_set_default),
 	CLI_SUBCMD_SET_END);
 
+/* ---- streaming (issue #46): non-blocking start / stop / stats ------------ */
+
+static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
+{
+	int colorbar = 0;
+	uint32_t frames = 0, secs = 0;
+	int i, rc, n;
+
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "test") == 0) {
+			colorbar = 1;
+		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+			if (cam_parse_int(argv[++i], &n) != 0 || n <= 0) {
+				cli_error(sh, "camera: bad --frames '%s'\r\n", argv[i]);
+				return 1;
+			}
+			frames = (uint32_t)n;
+		} else if (strcmp(argv[i], "--secs") == 0 && i + 1 < argc) {
+			if (cam_parse_int(argv[++i], &n) != 0 || n <= 0) {
+				cli_error(sh, "camera: bad --secs '%s'\r\n", argv[i]);
+				return 1;
+			}
+			secs = (uint32_t)n;
+		} else {
+			cli_error(sh, "camera: bad option '%s' "
+			          "(test | --frames N | --secs S)\r\n", argv[i]);
+			return 1;
+		}
+	}
+
+	rc = camera_stream_start(colorbar, frames, secs);
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+		return 1;
+	}
+	cli_print(sh, "camera: streaming %s started",
+	          colorbar ? "colorbar" : "live");
+	if (frames)
+		cli_print(sh, ", %lu frames", (unsigned long)frames);
+	if (secs)
+		cli_print(sh, ", %lu s", (unsigned long)secs);
+	cli_print(sh, " (`camera stream stats` / `stop`)\r\n");
+	return 0;
+}
+
+static int cmd_stream_stop(struct cli_instance *sh, int argc, char **argv)
+{
+	int rc;
+	(void)argc;
+	(void)argv;
+
+	rc = camera_stream_stop();
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+		return 1;
+	}
+	cli_print(sh, "camera: stream stop requested\r\n");
+	return 0;
+}
+
+static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
+{
+	struct camera_stream_info si;
+	int rc;
+	(void)argc;
+	(void)argv;
+
+	rc = camera_stream_stats(&si);
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+		return 1;
+	}
+	cli_print(sh, "state:     %s\r\n",
+	          si.active ? "streaming"
+	                    : (si.err ? "stopped (overrun)" : "stopped"));
+	cli_print(sh, "frames:    %lu\r\n", (unsigned long)si.frames);
+	cli_print(sh, "elapsed:   %lu ms\r\n", (unsigned long)si.elapsed_ms);
+	if (si.elapsed_ms != 0) {
+		/* frames-per-second x10 (one decimal), no floating point */
+		uint32_t f10 = (uint32_t)((uint64_t)si.frames * 10000u /
+		                          si.elapsed_ms);
+
+		cli_print(sh, "fps:       %lu.%lu\r\n",
+		          (unsigned long)(f10 / 10u), (unsigned long)(f10 % 10u));
+	}
+	cli_print(sh, "delivered: %lu\r\n", (unsigned long)si.delivered);
+	cli_print(sh, "dropped:   %lu\r\n", (unsigned long)si.dropped);
+	cli_print(sh, "ovr dcmi:  %lu\r\n", (unsigned long)si.dcmi_ovr);
+	cli_print(sh, "ovr ring:  %lu\r\n", (unsigned long)si.ring_ovr);
+	return 0;
+}
+
+static int cmd_camera_stream(struct cli_instance *sh, int argc, char **argv)
+{
+	if (argc > 1)
+		cli_error(sh, "camera: unknown stream subcommand '%s'\r\n", argv[1]);
+	cli_print(sh, "usage: camera stream <start [test] [--frames N] [--secs S]"
+	          " | stop | stats>\r\n");
+	return argc > 1 ? 1 : 0;
+}
+
+CLI_SUBCMD_SET_CREATE(camera_stream_subcmds,
+	CLI_CMD_ARG(start, NULL,
+	            "begin continuous capture (test, --frames N, --secs S)",
+	            cmd_stream_start, 1, 5),
+	CLI_CMD(stop,  NULL, "stop the running stream", cmd_stream_stop),
+	CLI_CMD(stats, NULL, "FPS / frame / overrun counters", cmd_stream_stats),
+	CLI_SUBCMD_SET_END);
+
 CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD(probe, NULL, "power-cycle + read the OV5640 chip ID", cmd_camera_probe),
 	CLI_CMD(info,  NULL, "driver / sensor state", cmd_camera_info),
@@ -633,6 +742,9 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD_ARG(set,  camera_set_subcmds,
 	            "OV5640 image quality (no arg = show current)",
 	            cmd_camera_set, 1, 1),
+	CLI_CMD_ARG(stream, camera_stream_subcmds,
+	            "continuous capture (start/stop/stats)",
+	            cmd_camera_stream, 1, 1),
 	CLI_CMD(off,   NULL, "cut camera module power", cmd_camera_off),
 	CLI_SUBCMD_SET_END);
 

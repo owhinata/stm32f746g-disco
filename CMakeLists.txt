@@ -94,7 +94,8 @@ add_library(svc_obj OBJECT
     "${CMAKE_SOURCE_DIR}/svc/fmt.c"
     "${CMAKE_SOURCE_DIR}/svc/log.c"
     "${CMAKE_SOURCE_DIR}/svc/timebase.c"
-    "${CMAKE_SOURCE_DIR}/svc/ymodem.c")
+    "${CMAKE_SOURCE_DIR}/svc/ymodem.c"
+    "${CMAKE_SOURCE_DIR}/svc/frame_pipeline.c")
 target_link_libraries(svc_obj PUBLIC bsp_iface)
 target_compile_options(svc_obj PRIVATE -O2)
 

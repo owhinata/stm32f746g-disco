@@ -151,6 +151,11 @@ static int cmd_sdram_test(struct cli_instance *sh, int argc, char **argv)
 	}
 	words = bytes / 4u;
 
+	if (camera_streaming()) {
+		cli_error(sh, "sdram: camera is streaming into .sdram; "
+		              "run 'camera stream stop' first\r\n");
+		return 1;
+	}
 	cli_warn(sh, "sdram: DESTRUCTIVE test over %lu KB "
 	             "(clobbers .sdram contents, e.g. a captured frame)\r\n",
 	         (unsigned long)(bytes / 1024u));

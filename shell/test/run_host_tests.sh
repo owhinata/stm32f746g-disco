@@ -167,4 +167,13 @@ gcc $CFLAGS -I "$svc" \
     $LDFLAGS -o "$out/test_ymodem"
 "$out/test_ymodem"
 
+# #46/#47 -- camera frame pipeline core (svc/frame_pipeline.c): ring slot
+# acquire/publish, refcount pin/put, DROP/LATEST policy + pending transfer,
+# detach in-flight count, read_latest generation, and an N=4 ring cycling under
+# a counting sink.  Pure svc layer -- HAL/ThreadX/shell-free.
+gcc $CFLAGS -I "$svc" \
+    "$here/test_frame_pipeline.c" "$svc/frame_pipeline.c" \
+    $LDFLAGS -o "$out/test_frame_pipeline"
+"$out/test_frame_pipeline"
+
 echo "host tests passed"

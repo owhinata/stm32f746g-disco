@@ -50,6 +50,9 @@
 
 #include "ov5640.h"
 
+#include "frame.h"
+#include "frame_pipeline.h"
+
 #define LOG_TAG "camera"
 #include "log.h"
 
@@ -163,6 +166,46 @@ static int settings_dirty;
    cache maintenance because the region never allocates cache lines. */
 static uint16_t cam_frame[CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT]
 	__attribute__((aligned(32), section(".sdram")));
+
+/* ---- streaming (issue #46): DCMI continuous + DMA double-buffer ---------- */
+/*
+ * The continuous producer feeds a frame pipeline (svc/frame_pipeline.c, the #47
+ * design).  N ring slots live in .sdram next to cam_frame[]: at any instant the
+ * DMA double-buffer (DBM) targets two of them (M0AR/M1AR), one holds the latest
+ * published frame, and one is free to be acquired -- so N=4.  On each frame the
+ * dedicated cam_producer thread (NOT an ISR, NOT the shell thread) reads CT to
+ * find the just-completed buffer, acquires a free slot, repoints that buffer's
+ * M-register away (HAL_DMAEx_ChangeMemory) and only THEN publishes -- so a slot
+ * handed to a sink is never a live DMA target (tear-free).  The DMA TC ISR only
+ * posts cam_stream_sem.  Streaming and the snapshot path share hdcmi/hdma_dcmi
+ * and are mutually exclusive (cam_stream_active gate).
+ */
+#define CAM_RING_N         4u      /* 2 DBM targets + 1 latest + 1 free        */
+#define CAM_PRODUCER_PRIO  10u     /* below IWDG petter (5), like LED (10)      */
+#define CAM_PRODUCER_STACK 2048u
+#define CAM_PRODUCER_TICK  10u     /* bounded sem wait so --secs/stop fire even
+                                      when no frames arrive (sync lost), ms      */
+
+static uint8_t cam_ring[CAM_RING_N][CAMERA_FRAME_BYTES]
+	__attribute__((aligned(32), section(".sdram")));
+
+static struct frame_pipeline cam_pipe;
+static TX_MUTEX     cam_pipe_lock;        /* frame_os mutex for the pipeline    */
+static TX_SEMAPHORE cam_stream_sem;       /* DMA TC ISR -> producer thread      */
+static TX_THREAD    cam_producer;
+static UCHAR        cam_producer_stack[CAM_PRODUCER_STACK];
+static struct frame_sink cam_stat_sink;   /* counting sink (FPS / OVR source)   */
+
+static volatile int      cam_stream_active;  /* streaming mode gate             */
+static volatile int      cam_stop_req;       /* stop requested (producer drains)*/
+static volatile int      cam_stream_err;     /* DCMI OVR -> terminal stop       */
+static volatile uint32_t cam_stream_ovr;     /* DCMI overrun count              */
+static volatile uint32_t cam_ring_ovr;       /* free-slot exhaustion / lost     */
+static uint32_t cam_start_tick;              /* HAL tick at start (--secs)       */
+static uint32_t cam_target_frames;           /* 0 = unbounded                   */
+static uint32_t cam_target_secs;             /* 0 = unbounded                   */
+static uint32_t cam_last_ct;                 /* CT at last serviced completion  */
+static struct frame_desc *cam_m0, *cam_m1;   /* slots currently in M0AR/M1AR    */
 
 /* ---- locking ------------------------------------------------------------ */
 /* Public API entries take the mutex here; all real work below lives in
@@ -494,6 +537,9 @@ static int camera_capture_locked(int colorbar)
 	if (!sdram_is_up())
 		return CAM_ERR_STATE;
 
+	if (cam_stream_active)
+		return CAM_ERR_STATE;   /* streaming owns the DCMI/DMA (issue #46) */
+
 	if (!info.powered) {
 		rc = camera_probe_locked(NULL);
 		if (rc != 0)
@@ -604,11 +650,20 @@ void camera_frame_invalidate(void)
 	op_unlock();
 }
 
+int camera_streaming(void)
+{
+	return cam_stream_active;   /* volatile; a destructive .sdram op must refuse */
+}
+
 int camera_probe(uint32_t *chip_id)
 {
 	int rc = op_lock();
 	if (rc != 0)
 		return rc;
+	if (cam_stream_active) {          /* streaming owns the sensor/DCMI (#46) */
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
 	rc = camera_probe_locked(chip_id);
 	op_unlock();
 	return rc;
@@ -619,6 +674,10 @@ int camera_power_off(void)
 	int rc = op_lock();
 	if (rc != 0)
 		return rc;
+	if (cam_stream_active) {          /* cutting power mid-stream wrecks the HW */
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
 	power_off_locked();
 	op_unlock();
 	return 0;
@@ -797,6 +856,307 @@ int camera_set_defaults(void)
 	return rc;
 }
 
+/* ---- streaming producer (issue #46) -------------------------------------- */
+
+/* frame_os: the pipeline core's injected mutual exclusion (a TX_MUTEX, distinct
+   from the driver cam_lock).  The core is only ever entered from the producer
+   thread (and start/stats under cam_lock), never from an ISR. */
+static void cam_pipe_os_lock(void *ctx)
+{
+	(void)ctx;
+	(void)tx_mutex_get(&cam_pipe_lock, TX_WAIT_FOREVER);
+}
+
+static void cam_pipe_os_unlock(void *ctx)
+{
+	(void)ctx;
+	(void)tx_mutex_put(&cam_pipe_lock);
+}
+
+static const struct frame_os cam_pipe_os = {
+	NULL, cam_pipe_os_lock, cam_pipe_os_unlock
+};
+
+/* Counting sink: the display-independent FPS / throughput consumer.  DROP
+   policy and it returns each frame's pin immediately (no holding), so the
+   producer is never blocked -- exactly the #46 measurement target.  The core
+   keeps delivered/dropped. */
+static int cam_stat_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t h)
+{
+	(void)ctx;
+	if (fmt != FRAME_FMT_RGB565 || w != CAMERA_FRAME_WIDTH ||
+	    h != CAMERA_FRAME_HEIGHT)
+		return -1;
+	return 0;
+}
+
+static int cam_stat_consume(void *ctx, const struct frame_desc *f)
+{
+	(void)ctx;
+	frame_pipeline_put(&cam_pipe, &cam_stat_sink, f);
+	return 0;
+}
+
+/* DMA transfer-complete (ISR context): one ring buffer just filled.  Only wakes
+   the producer; it touches no ring / pipeline / CT state (the #47 ISR rule). */
+static void cam_stream_dma_cb(DMA_HandleTypeDef *h)
+{
+	(void)h;
+	if (!cam_stream_active)
+		return;
+	(void)tx_semaphore_put(&cam_stream_sem);
+}
+
+/* DMA transport error (TE/DME/FE): terminal, like a DCMI overrun. */
+static void cam_stream_dma_err_cb(DMA_HandleTypeDef *h)
+{
+	(void)h;
+	if (!cam_stream_active)
+		return;
+	cam_stream_err = 1;
+	(void)tx_semaphore_put(&cam_stream_sem);
+}
+
+static void drain_stream_sem(void)
+{
+	while (tx_semaphore_get(&cam_stream_sem, TX_NO_WAIT) == TX_SUCCESS)
+		;
+}
+
+static uint32_t cam_elapsed_ms;   /* frozen at teardown for post-stop `stats` */
+
+/* Stop the stream and restore a clean snapshot-ready DCMI/DMA.  Producer-thread
+   only (single owner): start / stop / auto-stop / OVR all converge here, so the
+   HW teardown never races the producer's repoint.  Short cam_lock for the state
+   transition (serialises with start / stats). */
+static void cam_stream_teardown(void)
+{
+	(void)tx_mutex_get(&cam_lock, TX_WAIT_FOREVER);
+	if (cam_stream_active) {
+		cam_stream_active = 0;
+		cam_elapsed_ms = HAL_GetTick() - cam_start_tick;
+		(void)HAL_DCMI_Stop(&hdcmi);          /* aborts the DMA internally */
+		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
+		drain_stream_sem();
+		/* HAL_DCMI_Stop leaves CR.DBM set on the stream; re-init the DMA so the
+		   next snapshot's HAL_DCMI_Start_DMA runs a plain single transfer. */
+		(void)HAL_DMA_DeInit(&hdma_dcmi);
+		hdma_dcmi.Init.Mode = DMA_NORMAL;
+		(void)HAL_DMA_Init(&hdma_dcmi);
+		__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
+		LOG_INF("stream stop (%lu frames, ovr dcmi=%lu ring=%lu)",
+		        (unsigned long)cam_pipe.stats.published,
+		        (unsigned long)cam_stream_ovr, (unsigned long)cam_ring_ovr);
+	}
+	(void)tx_mutex_put(&cam_lock);
+}
+
+/* Service one completed frame: find the completed buffer via CT, secure a free
+   slot, repoint the completed M-register away, THEN publish.  This ordering
+   keeps a published slot off the live DMA target list, so a sink never reads a
+   buffer the DMA is about to overwrite (tear-free).  No free slot -> drop. */
+static void cam_stream_service(int had_sem)
+{
+	uint32_t ct, seen, extra = 0;
+	struct frame_desc *done, *freed;
+	int published = 0;
+
+	/* Stop conditions (also handles the bounded-timeout wake with no frame). */
+	if (cam_stop_req || cam_stream_err ||
+	    (cam_target_frames && cam_pipe.stats.published >= cam_target_frames) ||
+	    (cam_target_secs &&
+	     (HAL_GetTick() - cam_start_tick) >= cam_target_secs * 1000u)) {
+		cam_stream_teardown();
+		return;
+	}
+
+	/* Completions observed this pass (one semaphore each): the wake plus any
+	   drained extras.  We publish at most the most-recent buffer flip; every
+	   other observed completion was overwritten -> ring overrun. */
+	while (tx_semaphore_get(&cam_stream_sem, TX_NO_WAIT) == TX_SUCCESS)
+		extra++;
+	seen = (had_sem ? 1u : 0u) + extra;
+
+	ct = (DMA2_Stream1->CR & DMA_SxCR_CT) ? 1u : 0u;
+	if (ct != cam_last_ct) {
+		cam_last_ct = ct;
+		/* CT==1 -> M0 just completed; CT==0 -> M1 just completed (the HAL
+		   HAL_DMA_IRQHandler DBM dispatch mirrors this). */
+		done = ct ? cam_m0 : cam_m1;
+		freed = frame_pipeline_acquire(&cam_pipe);
+		if (freed != NULL) {
+			if (ct) {
+				(void)HAL_DMAEx_ChangeMemory(&hdma_dcmi,
+				        (uint32_t)freed->data, MEMORY0);
+				cam_m0 = freed;
+			} else {
+				(void)HAL_DMAEx_ChangeMemory(&hdma_dcmi,
+				        (uint32_t)freed->data, MEMORY1);
+				cam_m1 = freed;
+			}
+			frame_pipeline_publish(&cam_pipe, done, CAMERA_FRAME_BYTES,
+			                       FRAME_FMT_RGB565, CAMERA_FRAME_WIDTH,
+			                       CAMERA_FRAME_HEIGHT,
+			                       CAMERA_FRAME_WIDTH * 2u);
+			published = 1;
+		}
+		/* freed == NULL: no free slot, drop (do not publish); the M-reg keeps
+		   pointing at `done`, so the DMA simply refills it next cycle. */
+	}
+	if (seen > (uint32_t)published)
+		cam_ring_ovr += seen - (uint32_t)published;
+}
+
+/* Dedicated producer (priority 10): a bounded wait so --secs / stop / OVR fire
+   even if frames stop arriving; when no stream is active it just polls the gate
+   (the real wakeup is a completion semaphore, posted only while active). */
+static void cam_producer_entry(ULONG arg)
+{
+	(void)arg;
+	for (;;) {
+		UINT got = tx_semaphore_get(&cam_stream_sem, CAM_PRODUCER_TICK);
+
+		if (!cam_stream_active)
+			continue;
+		cam_stream_service(got == TX_SUCCESS);
+	}
+}
+
+int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
+{
+	int rc = op_lock();
+
+	if (rc != 0)
+		return rc;
+	if (cam_stream_active) {
+		op_unlock();
+		return CAM_ERR_STATE;          /* already streaming */
+	}
+	if (!sdram_is_up()) {
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
+	if (!info.powered) {
+		rc = camera_probe_locked(NULL);
+		if (rc != 0) {
+			op_unlock();
+			return rc;
+		}
+	}
+	rc = camera_configure_locked(colorbar != 0);
+	if (rc != 0) {
+		op_unlock();
+		return rc;
+	}
+
+	/* Build the ring + pipeline fresh and attach the counting sink. */
+	if (frame_pipeline_init(&cam_pipe, &cam_pipe_os, cam_ring,
+	                        CAMERA_FRAME_BYTES, CAM_RING_N) != 0) {
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
+	frame_pipeline_set_format(&cam_pipe, FRAME_FMT_RGB565,
+	                          CAMERA_FRAME_WIDTH, CAMERA_FRAME_HEIGHT);
+	if (frame_pipeline_attach(&cam_pipe, &cam_stat_sink) != 0) {
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
+	cam_m0 = frame_pipeline_acquire(&cam_pipe);
+	cam_m1 = frame_pipeline_acquire(&cam_pipe);
+	if (cam_m0 == NULL || cam_m1 == NULL) {
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
+
+	cam_stream_ovr    = 0;
+	cam_ring_ovr      = 0;
+	cam_stream_err    = 0;
+	cam_stop_req      = 0;
+	cam_last_ct       = 0;
+	cam_elapsed_ms    = 0;
+	cam_start_tick    = HAL_GetTick();
+	cam_target_frames = frames;
+	cam_target_secs   = secs;
+	drain_stream_sem();
+
+	/* Manual DBM start (the HAL's own >64KB path is intra-frame banding, not
+	   inter-frame double buffering).  Order: callbacks -> DMA DBM start ->
+	   DCMI CM=0 (continuous, before enable) -> enable -> ERR/OVR IT -> CAPTURE. */
+	hdma_dcmi.XferCpltCallback   = cam_stream_dma_cb;
+	hdma_dcmi.XferM1CpltCallback = cam_stream_dma_cb;
+	hdma_dcmi.XferErrorCallback  = cam_stream_dma_err_cb;
+	__HAL_DCMI_CLEAR_FLAG(&hdcmi, DCMI_FLAG_ERRRI | DCMI_FLAG_OVRRI |
+	                              DCMI_FLAG_FRAMERI | DCMI_FLAG_LINERI |
+	                              DCMI_FLAG_VSYNCRI);
+
+	cam_stream_active = 1;             /* arm the ISR + producer */
+	if (HAL_DMAEx_MultiBufferStart_IT(&hdma_dcmi,
+	        (uint32_t)&hdcmi.Instance->DR,
+	        (uint32_t)cam_m0->data, (uint32_t)cam_m1->data,
+	        CAMERA_FRAME_BYTES / 4u) != HAL_OK) {
+		cam_stream_active = 0;
+		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
+		LOG_ERR("stream DMA start failed");
+		op_unlock();
+		return CAM_ERR_HAL;
+	}
+	hdcmi.Instance->CR &= ~DCMI_CR_CM;            /* continuous */
+	__HAL_DCMI_ENABLE(&hdcmi);
+	__HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_ERR | DCMI_IT_OVR);
+	hdcmi.Instance->CR |= DCMI_CR_CAPTURE;
+	hdcmi.State = HAL_DCMI_STATE_BUSY;
+
+	/* No kick needed: the producer's bounded wait picks up cam_stream_active,
+	   and the first frame's completion semaphore wakes it immediately. */
+	op_unlock();
+	LOG_INF("stream start (frames=%lu secs=%lu)",
+	        (unsigned long)frames, (unsigned long)secs);
+	return 0;
+}
+
+int camera_stream_stop(void)
+{
+	int rc = op_lock();
+
+	if (rc != 0)
+		return rc;
+	if (cam_stream_active) {
+		cam_stop_req = 1;
+		(void)tx_semaphore_put(&cam_stream_sem);  /* producer tears down */
+	}
+	op_unlock();
+	return 0;
+}
+
+int camera_stream_stats(struct camera_stream_info *out)
+{
+	int rc;
+
+	if (out == NULL)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	/* active / err / elapsed transition under cam_lock; the DCMI/ring overrun
+	   counters are volatile (atomic 32-bit reads). */
+	out->active     = cam_stream_active;
+	out->err        = cam_stream_err;
+	out->dcmi_ovr   = cam_stream_ovr;
+	out->ring_ovr   = cam_ring_ovr;
+	out->elapsed_ms = cam_stream_active ? (HAL_GetTick() - cam_start_tick)
+	                                    : cam_elapsed_ms;
+	/* Coherent snapshot of the pipeline-owned counters (the producer writes them
+	   under cam_pipe_lock).  Lock order is always cam_lock -> cam_pipe_lock
+	   (matching start / teardown), so this nesting cannot deadlock. */
+	(void)tx_mutex_get(&cam_pipe_lock, TX_WAIT_FOREVER);
+	out->frames    = cam_pipe.stats.published;
+	out->delivered = cam_stat_sink.delivered;
+	out->dropped   = cam_stat_sink.dropped;
+	(void)tx_mutex_put(&cam_pipe_lock);
+	op_unlock();
+	return 0;
+}
+
 int camera_init(void)
 {
 	GPIO_InitTypeDef g = {0};
@@ -808,6 +1168,19 @@ int camera_init(void)
 	if (tx_mutex_create(&cam_lock, "camera", TX_INHERIT) != TX_SUCCESS)
 		return CAM_ERR_STATE;
 	if (tx_semaphore_create(&cam_done, "cam_done", 0) != TX_SUCCESS) {
+		tx_mutex_delete(&cam_lock);
+		return CAM_ERR_STATE;
+	}
+	/* Streaming (issue #46): the pipeline's frame_os mutex and the DMA-TC ->
+	   producer wakeup semaphore.  The producer thread is created at the end. */
+	if (tx_mutex_create(&cam_pipe_lock, "campipe", TX_INHERIT) != TX_SUCCESS) {
+		tx_semaphore_delete(&cam_done);
+		tx_mutex_delete(&cam_lock);
+		return CAM_ERR_STATE;
+	}
+	if (tx_semaphore_create(&cam_stream_sem, "cam_strm", 0) != TX_SUCCESS) {
+		tx_mutex_delete(&cam_pipe_lock);
+		tx_semaphore_delete(&cam_done);
 		tx_mutex_delete(&cam_lock);
 		return CAM_ERR_STATE;
 	}
@@ -934,6 +1307,25 @@ int camera_init(void)
 		goto fail_i2c;
 	}
 
+	/* The streaming counting sink (issue #46) -- format-validated at attach. */
+	cam_stat_sink.name    = "stats";
+	cam_stat_sink.ctx     = NULL;
+	cam_stat_sink.policy  = FRAME_POLICY_DROP;
+	cam_stat_sink.open    = cam_stat_open;
+	cam_stat_sink.consume = cam_stat_consume;
+	cam_stat_sink.close   = NULL;
+
+	/* Dedicated producer thread: idles until a stream starts. */
+	if (tx_thread_create(&cam_producer, "cam_prod", cam_producer_entry, 0,
+	                     cam_producer_stack, sizeof cam_producer_stack,
+	                     CAM_PRODUCER_PRIO, CAM_PRODUCER_PRIO,
+	                     TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS) {
+		(void)HAL_DCMI_DeInit(&hdcmi);
+		(void)HAL_DMA_DeInit(&hdma_dcmi);
+		LOG_ERR("camera producer thread create failed");
+		goto fail_i2c;
+	}
+
 	cam_ready = 1;
 	LOG_INF("I2C1 + DCMI/DMA2-S1 up; sensor I/O is lazy");
 	return 0;
@@ -941,6 +1333,8 @@ int camera_init(void)
 fail_i2c:
 	(void)HAL_I2C_DeInit(&hcam_i2c);
 fail:
+	tx_semaphore_delete(&cam_stream_sem);
+	tx_mutex_delete(&cam_pipe_lock);
 	tx_semaphore_delete(&cam_done);
 	tx_mutex_delete(&cam_lock);
 	return CAM_ERR_HAL;
@@ -995,6 +1389,15 @@ void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *h)
 void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *h)
 {
 	(void)h;
+	/* Streaming (issue #46): a continuous-mode DCMI overrun is terminal -- the
+	   HAL DCMI IRQ has already aborted the DMA -- so flag it and wake the
+	   producer to tear down cleanly.  (Mode-exclusive with the snapshot gate.) */
+	if (cam_stream_active) {
+		cam_stream_err = 1;
+		cam_stream_ovr++;
+		(void)tx_semaphore_put(&cam_stream_sem);
+		return;
+	}
 	if (!cam_xfer_active)
 		return;
 	cam_xfer_err = 1;
