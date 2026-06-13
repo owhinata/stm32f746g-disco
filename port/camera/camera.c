@@ -191,7 +191,8 @@ static uint8_t cam_ring[CAM_RING_N][CAMERA_FRAME_BYTES]
 
 static struct frame_pipeline cam_pipe;
 static TX_MUTEX     cam_pipe_lock;        /* frame_os mutex for the pipeline    */
-static TX_SEMAPHORE cam_stream_sem;       /* DMA TC ISR -> producer thread      */
+static TX_SEMAPHORE cam_stream_sem;       /* DMA TC ISR -> producer (completions) */
+static TX_SEMAPHORE cam_start_sem;        /* start -> producer idle wakeup       */
 static TX_THREAD    cam_producer;
 static UCHAR        cam_producer_stack[CAM_PRODUCER_STACK];
 static struct frame_sink cam_stat_sink;   /* counting sink (FPS / OVR source)   */
@@ -921,6 +922,11 @@ static void drain_stream_sem(void)
 {
 	while (tx_semaphore_get(&cam_stream_sem, TX_NO_WAIT) == TX_SUCCESS)
 		;
+	/* A start kick that landed while the producer was already active lingers on
+	   cam_start_sem; clear it so a later idle wait blocks instead of spinning
+	   once. */
+	while (tx_semaphore_get(&cam_start_sem, TX_NO_WAIT) == TX_SUCCESS)
+		;
 }
 
 static uint32_t cam_elapsed_ms;   /* frozen at teardown for post-stop `stats` */
@@ -1007,17 +1013,22 @@ static void cam_stream_service(int had_sem)
 		cam_ring_ovr += seen - (uint32_t)published;
 }
 
-/* Dedicated producer (priority 10): a bounded wait so --secs / stop / OVR fire
-   even if frames stop arriving; when no stream is active it just polls the gate
-   (the real wakeup is a completion semaphore, posted only while active). */
+/* Dedicated producer (priority 10).  When no stream is running it sleeps
+   indefinitely (0 CPU) on the start semaphore; while active it bounded-waits on
+   the completion semaphore so --secs / stop / OVR fire even if frames stop
+   arriving.  The two signals are SEPARATE semaphores on purpose: the start
+   wakeup must never be consumed by the active bounded wait (it would be
+   miscounted as a frame completion -> a spurious ring overrun). */
 static void cam_producer_entry(ULONG arg)
 {
 	(void)arg;
 	for (;;) {
+		if (!cam_stream_active) {
+			(void)tx_semaphore_get(&cam_start_sem, TX_WAIT_FOREVER);
+			continue;
+		}
 		UINT got = tx_semaphore_get(&cam_stream_sem, CAM_PRODUCER_TICK);
 
-		if (!cam_stream_active)
-			continue;
 		cam_stream_service(got == TX_SUCCESS);
 	}
 }
@@ -1106,8 +1117,9 @@ int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 	hdcmi.Instance->CR |= DCMI_CR_CAPTURE;
 	hdcmi.State = HAL_DCMI_STATE_BUSY;
 
-	/* No kick needed: the producer's bounded wait picks up cam_stream_active,
-	   and the first frame's completion semaphore wakes it immediately. */
+	/* Wake the producer out of its idle FOREVER wait on the dedicated start
+	   semaphore -- never the completion semaphore, so it cannot be miscounted. */
+	(void)tx_semaphore_put(&cam_start_sem);
 	op_unlock();
 	LOG_INF("stream start (frames=%lu secs=%lu)",
 	        (unsigned long)frames, (unsigned long)secs);
@@ -1179,6 +1191,13 @@ int camera_init(void)
 		return CAM_ERR_STATE;
 	}
 	if (tx_semaphore_create(&cam_stream_sem, "cam_strm", 0) != TX_SUCCESS) {
+		tx_mutex_delete(&cam_pipe_lock);
+		tx_semaphore_delete(&cam_done);
+		tx_mutex_delete(&cam_lock);
+		return CAM_ERR_STATE;
+	}
+	if (tx_semaphore_create(&cam_start_sem, "cam_strt", 0) != TX_SUCCESS) {
+		tx_semaphore_delete(&cam_stream_sem);
 		tx_mutex_delete(&cam_pipe_lock);
 		tx_semaphore_delete(&cam_done);
 		tx_mutex_delete(&cam_lock);
@@ -1333,6 +1352,7 @@ int camera_init(void)
 fail_i2c:
 	(void)HAL_I2C_DeInit(&hcam_i2c);
 fail:
+	tx_semaphore_delete(&cam_start_sem);
 	tx_semaphore_delete(&cam_stream_sem);
 	tx_mutex_delete(&cam_pipe_lock);
 	tx_semaphore_delete(&cam_done);
