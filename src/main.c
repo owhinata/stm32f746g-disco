@@ -40,6 +40,7 @@
 #include "sd_fs_glue.h"
 #include "sdram.h"
 #include "camera.h"
+#include "ltdc_display.h"
 #include "iwdg.h"
 
 #include <stddef.h>
@@ -176,8 +177,18 @@ void tx_application_define(void *first_unused_memory)
 	 * sequence (polling only, ~sub-ms).  Before camera_init() -- the camera
 	 * frame buffer (#41) lives in SDRAM.  On failure the `sdram`/`camera
 	 * capture` commands report it; nothing else stops. */
-	if (sdram_init() != 0)
+	if (sdram_init() != 0) {
 		printf("sdram: init failed (sdram/camera capture disabled)\r\n");
+	} else {
+		/* LTDC display bring-up (issue #52): PLLSAI -> LCD_CLK + one RGB565
+		 * layer from a SDRAM frame buffer.  Gated on sdram_init() success --
+		 * the frame buffer lives in .sdram, so it must NOT run with the FMC
+		 * down (touching 0xC0000000 would fault).  Polling only (PLLSAI lock /
+		 * HAL register waits), so it is safe before the scheduler starts.  On
+		 * failure the `lcd` command reports it; nothing else stops. */
+		if (ltdc_init() != 0)
+			printf("ltdc: init failed (lcd command disabled)\r\n");
+	}
 
 	/* Camera bring-up (issue #39): PWR_EN GPIO (parked off), I2C1 and the
 	 * operation mutex only -- no sensor I/O, so it is safe before the scheduler

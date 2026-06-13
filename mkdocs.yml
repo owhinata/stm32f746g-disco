@@ -58,6 +58,7 @@ nav:
       - hardware/sdmmc.md
       - hardware/sdram.md
       - hardware/camera.md
+      - hardware/display.md
   - ビルド:
       - build/cmake.md
   - RTOS:
