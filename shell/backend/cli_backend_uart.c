@@ -319,6 +319,13 @@ int _write(int file, char *ptr, int len)
 	if (len <= 0)
 		return len;
 
+	/* During a raw binary transfer (issue #50) this UART is owned by the YMODEM
+	 * byte stream; drop printf output -- it would otherwise reach g_uart_console
+	 * unlocked (from a non-shell thread / ISR) and corrupt the transfer.  The
+	 * transfer's own bytes go via the transport write() path, not _write. */
+	if (cli_xfer_active)
+		return len;
+
 	if (u == NULL)
 		u = g_uart_console;   /* ISR / pre-kernel / non-shell thread / non-UART */
 	else

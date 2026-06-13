@@ -157,4 +157,14 @@ gcc $CFLAGS -DCLI_USE_COLOR=0 -DCLI_CMD_BUFFER_SIZE=8 -DTEST_COMPLETE_SMALL_BUF 
     $LDFLAGS -o "$out/test_complete_smallbuf"
 "$out/test_complete_smallbuf"
 
+# #50 -- clean-room YMODEM-CRC sender (svc/ymodem.c): CRC-16/CCITT vectors, block
+# framing (block 0 name+size, STX/SOH, 0x1A short-block padding, seq/~seq, CRC),
+# NAK resend, CAN abort + teardown, seq wrap mod 256, and a 1-byte-at-a-time
+# source filling full blocks.  Pure svc layer -- HAL/ThreadX/shell-free, so it
+# builds with the host gcc and needs only the svc include dir for the header.
+gcc $CFLAGS -I "$svc" \
+    "$here/test_ymodem.c" "$svc/ymodem.c" \
+    $LDFLAGS -o "$out/test_ymodem"
+"$out/test_ymodem"
+
 echo "host tests passed"

@@ -183,6 +183,30 @@ int cli_hexdump_base(struct cli_instance *sh, const void *data, size_t len,
 bool cli_cancel_requested(struct cli_instance *sh);
 int  cli_sleep(struct cli_instance *sh, unsigned ticks);
 
+/*
+ * Raw binary console transfer (issue #50).  A command that streams binary data
+ * over the same UART as the shell (e.g. a YMODEM send) takes over the console for
+ * the duration of the transfer, bypassing the line editor / echo / Ctrl+C poll.
+ *
+ * cli_console_claim(): hold the output lock for the whole transfer (so background
+ *   output cannot interleave into the byte stream) and enter raw mode (printf
+ *   output is dropped; cli_tx_send_blocking stops draining RX).  Returns 0 on
+ *   success, -2 if called from a background job (a transfer must run in the
+ *   foreground -- it owns the shared RX), -1 if the lock could not be acquired.
+ *   Pair with cli_console_release().  cli_write() is still the binary-raw,
+ *   flow-controlled TX path to use for protocol bytes (the lock is reentrant).
+ * cli_read_byte(): timed raw RX read -- returns 0..255 on a byte, -1 on timeout
+ *   (timeout_ms; 0 = poll once), -2 if the instance is stopping.  Does NOT treat
+ *   0x03 specially (the protocol decides what a Ctrl+C means).
+ * cli_rx_flush(): discard buffered RX (call before and after a transfer so stray
+ *   protocol bytes do not land on the prompt).
+ * Thread-context only; never call from an ISR.
+ */
+int  cli_console_claim(struct cli_instance *sh);
+void cli_console_release(struct cli_instance *sh);
+int  cli_read_byte(struct cli_instance *sh, unsigned timeout_ms);
+void cli_rx_flush(struct cli_instance *sh);
+
 /** Iterate every registered root command in .shell_root_cmds order. */
 #define CLI_ROOT_CMD_FOREACH(it) \
 	for (const struct cli_cmd *it = __cli_root_cmds_start; \

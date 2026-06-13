@@ -317,6 +317,94 @@ void cli_unlock(struct cli_instance *sh)
 	tx_mutex_put(&cli_out_target(sh)->tx_lock);
 }
 
+/* Set for the duration of a raw binary transfer (issue #50); see cli_internal.h. */
+volatile uint8_t cli_xfer_active;
+
+/*
+ * Console hand-over for a binary transfer (issue #50).  Take the output lock for
+ * the WHOLE transfer (so a background job's output cannot interleave into the
+ * YMODEM byte stream -- it blocks and, per #25, drops on its wedge deadline) and
+ * raise cli_xfer_active so cli_tx_send_blocking stops draining RX and _write drops
+ * printf output.  Returns 0 on success, -2 if called from a background job, -1 if
+ * the lock could not be acquired.
+ *
+ * A bg-job worker (sh->fg != NULL) is REFUSED: the RX ring is a strict SPSC pipe
+ * owned by the foreground thread, and the USART RX ISR posts CLI_EVT_RX to the
+ * FOREGROUND's event group (u->sh == fg), not the worker's -- so a worker's
+ * cli_read_byte() would never wake on an ACK while the foreground line editor
+ * drains the bytes.  A binary transfer must run in the foreground (#50/#25).
+ */
+int cli_console_claim(struct cli_instance *sh)
+{
+	if (sh->fg != NULL)
+		return -2;
+	if (cli_lock(sh) != 0)
+		return -1;
+	cli_xfer_active = 1;
+	return 0;
+}
+
+void cli_console_release(struct cli_instance *sh)
+{
+	cli_xfer_active = 0;
+	cli_unlock(sh);
+}
+
+/* Discard any bytes buffered in the transport RX ring (issue #50): used before a
+ * transfer (drop the rest of the command line / type-ahead) and after (drop a
+ * trailing 'O'/'C' or other protocol tail) so the shell prompt resumes clean. */
+void cli_rx_flush(struct cli_instance *sh)
+{
+	struct cli_transport *tr = sh->tr;
+	uint8_t b;
+	while (tr->api->read(tr, &b, 1) > 0)
+		;
+}
+
+/*
+ * Timed raw RX read for a binary transfer (issue #50).  Returns 0..255 on a
+ * received byte, -1 on timeout (timeout_ms elapsed with none), -2 on kill
+ * (CLI_EVT_KILL).  Unlike cli_cancel_poll()/cli_sleep() it does NOT interpret
+ * 0x03 -- Ctrl+C is returned as the byte 3 like any other, so YMODEM control
+ * bytes are never consumed by a cancel check.  timeout_ms == 0 polls once
+ * (non-blocking).  Deliberately does NOT route through cli_wait() (which maps 0
+ * to TX_WAIT_FOREVER).  Modelled on cli_sleep()'s deadline wait, but returns the
+ * byte.  Thread-context only.
+ */
+int cli_read_byte(struct cli_instance *sh, unsigned timeout_ms)
+{
+	struct cli_transport *tr    = sh->tr;
+	ULONG                 start = tx_time_get();
+	uint8_t               b;
+
+	for (;;) {
+		ULONG elapsed, remaining, flags;
+		UINT  st;
+
+		/* Drain the ring first: the main loop's TX_OR_CLEAR may already have
+		 * consumed the RX flag for a byte still sitting in the ring (#16 inv 2). */
+		if (tr->api->read(tr, &b, 1) > 0)
+			return (int)b;
+		if (timeout_ms == 0u)
+			return -1;                          /* non-blocking poll: empty */
+
+		elapsed = (ULONG)(tx_time_get() - start);   /* wrap-safe */
+		if (elapsed >= (ULONG)timeout_ms)
+			return -1;                          /* timed out */
+		remaining = (ULONG)timeout_ms - elapsed;
+
+		st = tx_event_flags_get(&sh->events, CLI_EVT_RX | CLI_EVT_KILL,
+		                        TX_OR_CLEAR, &flags, remaining);
+		if (st != TX_SUCCESS)
+			return -1;                          /* TX_NO_EVENTS == timed out */
+		if (flags & CLI_EVT_KILL) {
+			tx_event_flags_set(&sh->events, CLI_EVT_KILL, TX_OR); /* re-post */
+			return -2;                          /* instance stopping */
+		}
+		/* CLI_EVT_RX: loop and drain the ring (or re-wait the remainder). */
+	}
+}
+
 /*
  * Push len bytes to the transport, realising req §11's "blocking until sent"
  * semantics.  MUST be called with the output lock held (see cli_lock).  write()
@@ -391,10 +479,14 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 		 * the RX flag for a 0x03 still sitting in the ring, so poll the ring
 		 * BEFORE waiting (issue #16 invariant 2). */
 		ULONG flags;
+		/* During a raw binary transfer (issue #50) the RX ring belongs to the
+		 * YMODEM protocol, so do NOT wake on / drain it for a Ctrl+C here -- that
+		 * would eat an ACK/'C'/NAK.  Wait only on TX space / kill. */
+		int   raw  = cli_xfer_active;
 		ULONG mask = CLI_EVT_TX | CLI_EVT_KILL |
-		             (sh->dispatching ? CLI_EVT_RX : 0u);
+		             ((sh->dispatching && !raw) ? CLI_EVT_RX : 0u);
 
-		if (sh->dispatching && cli_cancel_poll(sh))
+		if (sh->dispatching && !raw && cli_cancel_poll(sh))
 			return -1;
 
 		if (tx_event_flags_get(&sh->events, mask, TX_OR_CLEAR, &flags,
@@ -407,7 +499,7 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 			sh->tx_dropped += (uint32_t)(len - sent);
 			return -1;
 		}
-		if ((flags & CLI_EVT_RX) && cli_cancel_poll(sh))
+		if (!raw && (flags & CLI_EVT_RX) && cli_cancel_poll(sh))
 			return -1;
 		/* else CLI_EVT_TX (space freed) or a non-cancel RX byte: retry write */
 	}

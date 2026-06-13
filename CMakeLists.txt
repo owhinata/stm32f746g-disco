@@ -93,7 +93,8 @@ target_compile_options(common PRIVATE -O2)
 add_library(svc_obj OBJECT
     "${CMAKE_SOURCE_DIR}/svc/fmt.c"
     "${CMAKE_SOURCE_DIR}/svc/log.c"
-    "${CMAKE_SOURCE_DIR}/svc/timebase.c")
+    "${CMAKE_SOURCE_DIR}/svc/timebase.c"
+    "${CMAKE_SOURCE_DIR}/svc/ymodem.c")
 target_link_libraries(svc_obj PUBLIC bsp_iface)
 target_compile_options(svc_obj PRIVATE -O2)
 
@@ -243,6 +244,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_fs.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sd.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_camera.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_xfer.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sdram.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/fs_cmd_core.c"
     "${CMAKE_SOURCE_DIR}/port/qspi/qspi_flash.c"
@@ -278,7 +280,8 @@ target_include_directories(threadx PRIVATE
     "${CMAKE_SOURCE_DIR}/port/levelx"
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
-    "${CMAKE_SOURCE_DIR}/shell/backend")  # CLI_BACKEND_*_DEFINE macros
+    "${CMAKE_SOURCE_DIR}/shell/backend"   # CLI_BACKEND_*_DEFINE macros
+    "${CMAKE_SOURCE_DIR}/svc")            # svc/ymodem.h (cmd_xfer.c, cmd_camera.c)
 target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE
     FX_INCLUDE_USER_DEFINE_FILE           # port/filex/fx_user.h  (issue #30)
     LX_INCLUDE_USER_DEFINE_FILE           # port/levelx/lx_user.h (issue #30)

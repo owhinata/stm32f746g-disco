@@ -185,6 +185,17 @@ void cli_unlock(struct cli_instance *sh);
 int  cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t len);
 
 /*
+ * Raw binary transfer in progress (issue #50): set by cli_console_claim() for the
+ * whole duration of a YMODEM send and cleared by cli_console_release().  Two
+ * effects: (1) cli_tx_send_blocking() stops draining RX / polling for Ctrl+C while
+ * blocked on a full TX ring, so the transfer's own ACK/'C'/NAK bytes are never
+ * eaten; (2) the _write retarget drops printf output (which would otherwise reach
+ * g_uart_console unlocked from a non-shell thread / ISR and corrupt the stream).
+ * Single global -- transfers are serialised by the output lock the claim holds.
+ */
+extern volatile uint8_t cli_xfer_active;
+
+/*
  * Output bracket (issue #5 lock + issue #25 bg line-break).  cli_out_begin takes
  * the output lock (the FOREGROUND's for a bg-job worker, so its output serialises
  * against the fg line editor) and, for a job's FIRST output since the prompt was

@@ -10,6 +10,7 @@
  *   camera info             driver / sensor state
  *   camera capture [test]   snapshot one QVGA RGB565 frame (test = colorbar)
  *   camera save <sd|fs> <p> write the captured frame to a file, raw RGB565
+ *   camera send [name]      stream the frame to the PC over YMODEM (#50)
  *   camera off              cut module power
  *
  * `capture` prints per-channel min/max/mean statistics plus a first-pixels
@@ -28,6 +29,7 @@
 #include "cli.h"
 #include "camera.h"
 #include "fs_cmd_core.h"
+#include "cmd_xfer.h"
 
 #include <string.h>
 
@@ -381,6 +383,62 @@ static int cmd_camera_save(struct cli_instance *sh, int argc, char **argv)
 	return rc;
 }
 
+/*
+ * Source adapter that streams the captured frame straight from SDRAM (no FS) for
+ * `camera send`.  Mirrors save_body's generation check: a concurrent capture
+ * between reads re-validates the buffer with NEW pixels, so a changed generation
+ * fails the read (-> YM_ERR_SOURCE) rather than silently mixing two frames.
+ */
+struct cam_send_ctx {
+	uint32_t off;
+	uint32_t gen0;
+	int      have_gen0;
+};
+
+static int cam_send_read(void *ctx, uint8_t *dst, uint32_t want, uint32_t *got)
+{
+	struct cam_send_ctx *cc = (struct cam_send_ctx *)ctx;
+	uint32_t rem, n, gen;
+	int rc;
+
+	if (cc->off >= CAMERA_FRAME_BYTES) {
+		*got = 0;
+		return 0;                       /* EOF */
+	}
+	rem = (uint32_t)CAMERA_FRAME_BYTES - cc->off;
+	n = (want < rem) ? want : rem;
+	rc = camera_frame_read(cc->off, dst, n, &gen);
+	if (rc != 0)
+		return -1;
+	if (!cc->have_gen0) {
+		cc->gen0 = gen;
+		cc->have_gen0 = 1;
+	} else if (gen != cc->gen0) {
+		return -1;                      /* frame changed mid-send */
+	}
+	cc->off += n;
+	*got = n;
+	return 0;
+}
+
+static int cmd_camera_send(struct cli_instance *sh, int argc, char **argv)
+{
+	struct camera_info ci;
+	struct cam_send_ctx cc = { 0, 0, 0 };
+	struct ym_source src;
+
+	if (camera_get_info(&ci) != 0 || !ci.frame_valid) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(CAM_ERR_NO_FRAME));
+		return 1;
+	}
+
+	src.ctx  = &cc;
+	src.name = (argc >= 2) ? argv[1] : "frame.raw";
+	src.size = (uint32_t)CAMERA_FRAME_BYTES;
+	src.read = cam_send_read;
+	return xfer_send_source(sh, &src);
+}
+
 static int cmd_camera_off(struct cli_instance *sh, int argc, char **argv)
 {
 	int rc;
@@ -570,6 +628,8 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	            cmd_camera_capture, 1, 1),
 	CLI_CMD_ARG(save, NULL, "write frame as raw RGB565 <sd|fs> <path>",
 	            cmd_camera_save, 3, 0),
+	CLI_CMD_ARG(send, NULL, "stream the frame to the PC over YMODEM [name]",
+	            cmd_camera_send, 1, 1),
 	CLI_CMD_ARG(set,  camera_set_subcmds,
 	            "OV5640 image quality (no arg = show current)",
 	            cmd_camera_set, 1, 1),

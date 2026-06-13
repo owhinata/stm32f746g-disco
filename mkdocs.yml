@@ -79,6 +79,7 @@ nav:
       - rtos/shell-sleep-watch.md
       - rtos/shell-jobs.md
       - rtos/shell-fs.md
+      - rtos/shell-xfer.md
       - rtos/filesystem.md
       - rtos/logging.md
       - rtos/iwdg.md
