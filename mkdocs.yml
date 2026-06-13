@@ -59,6 +59,7 @@ nav:
       - hardware/sdram.md
       - hardware/camera.md
       - hardware/display.md
+      - hardware/touch.md
   - ビルド:
       - build/cmake.md
   - RTOS:

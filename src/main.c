@@ -41,6 +41,7 @@
 #include "sdram.h"
 #include "camera.h"
 #include "ltdc_display.h"
+#include "touch.h"
 #include "iwdg.h"
 
 #include <stddef.h>
@@ -196,6 +197,13 @@ void tx_application_define(void *first_unused_memory)
 	 * initialized"; nothing else stops. */
 	if (camera_init() != 0)
 		printf("camera: init failed (camera command disabled)\r\n");
+
+	/* FT5336 touch bring-up (issue #54): I2C3 (PH7/PH8) + the operation mutex
+	 * only -- no bus I/O, so it is safe before the scheduler starts.  SDRAM
+	 * independent (separate I2C3 bus from the camera's I2C1).  On failure the
+	 * `touch` command reports it; nothing else stops. */
+	if (touch_init() != 0)
+		printf("touch: init failed (touch command disabled)\r\n");
 
 #if BSP_ENABLE_IWDG
 	/* IWDG last (issue #38).  Order here is deliberate and must stay
