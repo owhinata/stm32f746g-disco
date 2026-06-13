@@ -164,6 +164,19 @@ bool guix_is_up(void)
 	return guix_active;
 }
 
+int guix_post_root_event(unsigned long type)
+{
+	GX_EVENT ev;
+
+	if (!guix_active)
+		return GUIX_ERR;                 /* nothing to draw into */
+	memset(&ev, 0, sizeof ev);
+	ev.gx_event_type           = (ULONG)type;
+	ev.gx_event_target         = (GX_WIDGET *)&guix_root;   /* root handler */
+	ev.gx_event_display_handle = guix_display.gx_display_handle;
+	return (gx_system_event_send(&ev) == GX_SUCCESS) ? GUIX_OK : GUIX_ERR;
+}
+
 void guix_get_info(struct guix_info *info)
 {
 	if (info == NULL)

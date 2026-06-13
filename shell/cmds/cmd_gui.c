@@ -22,6 +22,9 @@
  */
 #include "cli.h"
 #include "guix_glue.h"
+#include "guix_camera.h"
+
+#include <string.h>
 
 static int cmd_gui_start(struct cli_instance *sh, int argc, char **argv)
 {
@@ -46,6 +49,8 @@ static int cmd_gui_stop(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
+	(void)guix_camera_off();   /* stop any live preview first (#56): otherwise the
+	                              stream + preview ownership would outlive the UI */
 	(void)guix_stop();
 	cli_print(sh, "gui: stopped (display returned to 'lcd')\r\n");
 	return 0;
@@ -70,11 +75,38 @@ static int cmd_gui_info(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+static int cmd_gui_camera(struct cli_instance *sh, int argc, char **argv)
+{
+	if (argc < 2) {                       /* parser enforces mandatory=2 */
+		cli_error(sh, "gui: usage: gui camera on|off\r\n");
+		return 1;
+	}
+	if (strcmp(argv[1], "on") == 0) {
+		if (guix_camera_on() != GUIX_OK) {
+			cli_error(sh, "gui: camera preview start failed "
+			              "(camera busy / no sensor / display down?)\r\n");
+			return 1;
+		}
+		cli_print(sh, "gui: camera preview on -- 320x240 native; "
+		              "'gui camera off' or tap Back to stop\r\n");
+		return 0;
+	}
+	if (strcmp(argv[1], "off") == 0) {
+		(void)guix_camera_off();
+		cli_print(sh, "gui: camera preview off\r\n");
+		return 0;
+	}
+	cli_error(sh, "gui: unknown option '%s' (try: on | off)\r\n", argv[1]);
+	return 1;
+}
+
 CLI_SUBCMD_SET_CREATE(gui_subcmds,
 	CLI_CMD(start, NULL, "start/resume the GUIX UI (takes over LCD + touch)",
 	        cmd_gui_start),
 	CLI_CMD(stop, NULL, "stop the UI and hand the LCD back to 'lcd'",
 	        cmd_gui_stop),
+	CLI_CMD_ARG(camera, NULL, "live camera preview: on | off (native QVGA)",
+	            cmd_gui_camera, 2, 0),
 	CLI_CMD(info, NULL, "GUIX state / thread / display / canvas", cmd_gui_info),
 	CLI_SUBCMD_SET_END);
 

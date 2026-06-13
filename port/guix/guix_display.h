@@ -40,6 +40,13 @@ UINT guix_display_driver_setup(GX_DISPLAY *display);
  *  ltdc_fill() is a no-op while GUIX owns the display. */
 void guix_display_fill_back(uint16_t rgb565);
 
+/** DMA2D M2M copy of a @p w x @p h RGB565 block (u16 row offsets @p dst_off /
+ *  @p src_off), serialized on ltdc_lock.  Returns 0 on success, -1 on failure.
+ *  Used by the camera live-preview sink (#56) to copy a ring slot into its
+ *  private view buffer; both must be DMA2D-coherent (non-cacheable SDRAM). */
+int guix_display_copy_rgb565(uint16_t *dst, const uint16_t *src, uint32_t w,
+                             uint32_t h, uint32_t dst_off, uint32_t src_off);
+
 #ifdef __cplusplus
 }
 #endif

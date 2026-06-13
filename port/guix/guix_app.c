@@ -7,6 +7,7 @@
  * @brief   Hand-coded two-screen GUIX demo UI (issue #55).  See guix_app.h.
  */
 #include "guix_app.h"
+#include "guix_camera.h"         /* camera preview screen: pixmap, events, off() */
 #include "ltdc_display.h"        /* LTDC_LCD_WIDTH / HEIGHT */
 
 #include "gx_api.h"
@@ -42,11 +43,14 @@ static GX_CONST GX_FONT *guix_font_table[] = {
 };
 
 /* ---- Widget IDs. ---- */
-#define ID_SCREEN0   0x10u
-#define ID_SCREEN1   0x11u
-#define ID_BTN_NEXT  0x20u
-#define ID_BTN_BACK  0x21u
-#define ID_ICON      0x30u
+#define ID_SCREEN0      0x10u
+#define ID_SCREEN1      0x11u
+#define ID_SCREEN2      0x12u
+#define ID_BTN_NEXT     0x20u
+#define ID_BTN_BACK     0x21u
+#define ID_BTN_CAM_BACK 0x22u
+#define ID_ICON         0x30u
+#define ID_CAM_ICON     0x31u
 
 /* ---- Demo pixelmap (exercises the DMA2D pixelmap_draw path, #55 full DMA2D).
  * A small RGB565 image generated at startup into MPU non-cacheable SDRAM (so it
@@ -56,16 +60,17 @@ static GX_CONST GX_FONT *guix_font_table[] = {
 #define DEMO_W      96
 #define DEMO_H      72
 #define PIX_DEMO    1u
+#define PIX_CAMERA  2u    /* camera live-preview view buffer (guix_camera.c) */
 static uint16_t guix_demo_img[DEMO_W * DEMO_H]
 	__attribute__((aligned(32), section(".sdram")));
 static GX_PIXELMAP  guix_demo_pixmap;
-static GX_PIXELMAP *guix_pixelmap_table[2];
+static GX_PIXELMAP *guix_pixelmap_table[3];
 
 /* ---- Static widget instances. ---- */
-static GX_WINDOW      screen0, screen1;
-static GX_PROMPT      title0, sub0, title1, sub1;
-static GX_TEXT_BUTTON btn_next, btn_back;
-static GX_ICON        demo_icon;
+static GX_WINDOW      screen0, screen1, screen2;
+static GX_PROMPT      title0, sub0, title1, sub1, title2;
+static GX_TEXT_BUTTON btn_next, btn_back, btn_cam_back;
+static GX_ICON        demo_icon, cam_icon;
 
 /* Build the demo image: eight vertical RGB565 colour bars inside a white frame.
    M2M pixelmap draw copies RGB565 verbatim, so the on-screen result equals this
@@ -109,12 +114,13 @@ static void rect_set(GX_RECTANGLE *r, INT l, INT t, INT rt, INT b)
 
 static void guix_app_select_screen(int n)
 {
-	if (n == 1) {
-		gx_widget_hide(&screen0);
-		gx_widget_show(&screen1);
-	} else {
-		gx_widget_hide(&screen1);
-		gx_widget_show(&screen0);
+	gx_widget_hide(&screen0);
+	gx_widget_hide(&screen1);
+	gx_widget_hide(&screen2);
+	switch (n) {
+	case 1:  gx_widget_show(&screen1); break;
+	case 2:  gx_widget_show(&screen2); break;
+	default: gx_widget_show(&screen0); break;
 	}
 }
 
@@ -143,6 +149,47 @@ static UINT screen1_event(GX_WIDGET *widget, GX_EVENT *event_ptr)
 	return gx_window_event_process((GX_WINDOW *)widget, event_ptr);
 }
 
+/* Camera screen: the Back button stops the live preview and returns to screen 0
+   (guix_camera_off does a bounded drain only, safe to call from the GUIX thread). */
+static UINT screen2_event(GX_WIDGET *widget, GX_EVENT *event_ptr)
+{
+	if (event_ptr->gx_event_type ==
+	    GX_SIGNAL(ID_BTN_CAM_BACK, GX_EVENT_CLICKED)) {
+		(void)guix_camera_off();
+		return GX_SUCCESS;
+	}
+	return gx_window_event_process((GX_WINDOW *)widget, event_ptr);
+}
+
+/*
+ * Root event handler (#56): catches the camera-preview control events the
+ * producer/shell post via guix_post_root_event() and runs them ON the GUIX
+ * thread -- screen show/hide and dirty marking must not be done from another
+ * thread.  GX_EVENT_CAMERA_FRAME repaints the live image (the sink already
+ * copied it into the view buffer); SHOW/HIDE switch screens.  Everything else
+ * defers to the default root processing so normal pen/draw routing is intact
+ * (the demo buttons notify their own screen window, not the root, so this
+ * override does not affect the Next/Back flow).
+ */
+static UINT guix_root_event(GX_WIDGET *widget, GX_EVENT *event_ptr)
+{
+	switch (event_ptr->gx_event_type) {
+	case GX_EVENT_CAMERA_FRAME:
+		guix_camera_mark_drawn();
+		gx_system_dirty_mark((GX_WIDGET *)&cam_icon);
+		return GX_SUCCESS;
+	case GX_EVENT_CAMERA_SHOW:
+		guix_app_select_screen(2);
+		return GX_SUCCESS;
+	case GX_EVENT_CAMERA_HIDE:
+		guix_app_select_screen(0);
+		return GX_SUCCESS;
+	default:
+		return gx_window_root_event_process((GX_WINDOW_ROOT *)widget,
+		                                    event_ptr);
+	}
+}
+
 #define PROMPT_STYLE  (GX_STYLE_TRANSPARENT | GX_STYLE_ENABLED | \
                        GX_STYLE_HALIGN_CENTER | GX_STYLE_VALIGN_CENTER)
 #define BUTTON_STYLE  (GX_STYLE_BORDER_RAISED | GX_STYLE_ENABLED | \
@@ -158,6 +205,7 @@ UINT guix_app_create(GX_DISPLAY *display, GX_WINDOW_ROOT *root)
 	gx_display_font_table_set(display, (GX_FONT **)guix_font_table,
 	    (UINT)(sizeof guix_font_table / sizeof guix_font_table[0]));
 	guix_make_demo_image();
+	guix_pixelmap_table[PIX_CAMERA] = guix_camera_pixmap();   /* live preview (#56) */
 	gx_display_pixelmap_table_set(display, guix_pixelmap_table,
 	    (UINT)(sizeof guix_pixelmap_table / sizeof guix_pixelmap_table[0]));
 
@@ -244,6 +292,51 @@ UINT guix_app_create(GX_DISPLAY *display, GX_WINDOW_ROOT *root)
 	gx_text_button_text_color_set(&btn_back, C_BTN_TEXT, C_BTN_TEXT, C_BTN_TEXT);
 	btn_back.gx_widget_normal_fill_color   = C_BTN;
 	btn_back.gx_widget_selected_fill_color = C_ACCENT;
+
+	/* ---------------- Screen 2 (camera live preview, #56) ---------------- */
+	rect_set(&size, 0, 0, (INT)LTDC_LCD_WIDTH - 1, (INT)LTDC_LCD_HEIGHT - 1);
+	status = gx_window_create(&screen2, "screen2", root,
+	                          GX_STYLE_BORDER_NONE | GX_STYLE_ENABLED,
+	                          ID_SCREEN2, &size);
+	if (status != GX_SUCCESS)
+		return status;
+	screen2.gx_widget_normal_fill_color      = C_BG;
+	screen2.gx_widget_event_process_function = screen2_event;
+
+	/* QVGA camera image, drawn native 1:1 (no scaling) centred on 480x272.
+	   BORDER_NONE (not ENABLED) so it is not selectable and never steals the
+	   touch meant for the Back button.  Its pixelmap is the view buffer that the
+	   preview sink refreshes in place (guix_camera.c). */
+	status = gx_icon_create(&cam_icon, "cam", &screen2, PIX_CAMERA,
+	                        GX_STYLE_BORDER_NONE, ID_CAM_ICON,
+	                        CAM_VIEW_X, CAM_VIEW_Y);
+	if (status != GX_SUCCESS)
+		return status;
+
+	rect_set(&size, 2, 110, 78, 150);
+	status = gx_prompt_create(&title2, "title2", &screen2, 0, PROMPT_STYLE, 0,
+	                          &size);
+	if (status != GX_SUCCESS)
+		return status;
+	gx_prompt_text_set(&title2, "Camera");
+	gx_prompt_font_set(&title2, F_TEXT);
+	gx_prompt_text_color_set(&title2, C_TEXT, C_TEXT, C_TEXT);
+
+	rect_set(&size, 402, 110, 477, 155);
+	status = gx_text_button_create(&btn_cam_back, "camback", &screen2, 0,
+	                               BUTTON_STYLE, ID_BTN_CAM_BACK, &size);
+	if (status != GX_SUCCESS)
+		return status;
+	gx_text_button_text_set(&btn_cam_back, "Back");
+	gx_text_button_font_set(&btn_cam_back, F_TEXT);
+	gx_text_button_text_color_set(&btn_cam_back, C_BTN_TEXT, C_BTN_TEXT,
+	                              C_BTN_TEXT);
+	btn_cam_back.gx_widget_normal_fill_color   = C_BTN;
+	btn_cam_back.gx_widget_selected_fill_color = C_ACCENT;
+
+	/* Route the camera-preview control events (#56) through the root handler so
+	   show/hide/dirty run on the GUIX thread. */
+	root->gx_widget_event_process_function = guix_root_event;
 
 	/* Visibility is NOT set here.  The canonical GUIX flow is: build the tree,
 	   then the caller does gx_widget_show(root) -- which cascades GX_EVENT_SHOW

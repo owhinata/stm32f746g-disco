@@ -107,12 +107,16 @@ static void guix_dma2d_fill(uint16_t *dst, uint16_t color, uint32_t w,
 
 /* DMA2D memory-to-memory copy of a w x h RGB565 block with separate u16 row
    offsets for dst/src.  Source and destination must NOT overlap.  Serialized on
-   ltdc_lock. */
-static void guix_dma2d_blit(uint16_t *dst, const uint16_t *src, uint32_t w,
-                            uint32_t h, uint32_t dst_off, uint32_t src_off)
+   ltdc_lock.  Returns 0 on a completed transfer, -1 on bad args or any DMA2D
+   failure (init/config/start/poll) -- the camera preview sink needs the status
+   to keep the last good frame on failure; the GUIX draw paths ignore it. */
+static int guix_dma2d_blit(uint16_t *dst, const uint16_t *src, uint32_t w,
+                           uint32_t h, uint32_t dst_off, uint32_t src_off)
 {
+	int rc = -1;
+
 	if (dst == NULL || src == NULL || w == 0u || h == 0u)
-		return;
+		return -1;
 
 	ltdc_lock_frame();
 	hdma2d_gui.Instance          = DMA2D;
@@ -127,8 +131,9 @@ static void guix_dma2d_blit(uint16_t *dst, const uint16_t *src, uint32_t w,
 	    HAL_DMA2D_ConfigLayer(&hdma2d_gui, 1) == HAL_OK &&
 	    HAL_DMA2D_Start(&hdma2d_gui, (uint32_t)(uintptr_t)src,
 	                    (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
-		HAL_DMA2D_PollForTransfer(&hdma2d_gui, 30);
+		rc = (HAL_DMA2D_PollForTransfer(&hdma2d_gui, 30) == HAL_OK) ? 0 : -1;
 	ltdc_unlock_frame();
+	return rc;
 }
 
 /* DMA2D memory-to-memory-with-blending of a w x h block over an RGB565
@@ -174,6 +179,12 @@ void guix_display_fill_back(uint16_t rgb565)
 
 	if (back != NULL)
 		guix_dma2d_fill(back, rgb565, LTDC_LCD_WIDTH, LTDC_LCD_HEIGHT, 0u);
+}
+
+int guix_display_copy_rgb565(uint16_t *dst, const uint16_t *src, uint32_t w,
+                             uint32_t h, uint32_t dst_off, uint32_t src_off)
+{
+	return guix_dma2d_blit(dst, src, w, h, dst_off, src_off);
 }
 
 /*

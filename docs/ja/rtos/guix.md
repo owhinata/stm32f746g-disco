@@ -101,7 +101,30 @@ UI（`port/guix/guix_app.c`）は GUIX Studio を使わず手書き。色/フォ
 |------|------|------|
 | FLASH | ~107 KB（170→277 KB / 1 MB の 26.5%） | GUIX core（gc-sections + binres 除外後） |
 | RAM | GUIX スレッド stack 8 KB + 入力 stack 1 KB + GUIX 内部 static | 256 KB 中 ~32% |
-| SDRAM | 増分なし | canvas は既存 LTDC ダブルバッファを流用 |
+| SDRAM | canvas は増分なし（既存 LTDC ダブルバッファを流用） | カメラプレビュー（#56）は view バッファ +150 KB（320×240×2） |
+
+## カメラライブプレビュー（#56）
+
+`port/guix/guix_camera.c`。DCMI ストリーミング producer（#46, `port/camera`）が `frame_pipeline` に publish する QVGA RGB565 フレームを、GUIX 画面に **等倍（スケールなし）** でライブ表示する。
+
+データフロー:
+
+1. **push sink**（`guix_cam_sink`, `FRAME_POLICY_DROP`）を `camera_preview_start()` で pipeline に attach。producer スレッド（prio 10）上で `consume()` が呼ばれる。
+2. `consume()` は ring slot を **DMA2D M2M でプライベート view バッファ `cam_view_buf`（320×240, `.sdram` 非キャッシュ）へコピー**（`guix_display_copy_rgb565`, ltdc_lock 下）し、slot を即 `put`（同期完結 — pin をスレッド跨ぎ保持しない）。コピー成功時のみ coalesce フラグを立て `GX_EVENT_CAMERA_FRAME` を root へ post（`gx_system_event_send`, スレッドセーフ）。送信失敗時はフラグを立てず次フレームで再試行（freeze 回避）。
+3. GUIX システムスレッド（prio 14）の **root イベントハンドラ**が `GX_EVENT_CAMERA_FRAME` を受け、`gx_system_dirty_mark(cam_icon)`（dirty 操作は GUIX スレッド限定 — 他スレッドからは event 送信のみ）。
+4. `cam_icon`（`GX_ICON`, 画面 2, 配置 (80,16)）の再描画が `guix_pixelmap_draw` を呼び、view バッファを **DMA2D M2M で後段バッファへ等倍 blit** → `guix_buffer_toggle` が SRCR.VBR で tear-free present。
+
+**view バッファを 1 枚挟む**ことで、GUIX の再描画（タッチ・画面遷移・初回 show）が ring slot のライフタイムから分離される。slot→view と view→後段 の両 blit は **ltdc_lock 直列**の DMA2D なので、producer（prio 10）が GUIX（prio 14）をプリエンプトしても 1 フレーム内 tear は起きない（ltdc_lock は TX_INHERIT で優先度逆転も防ぐ）。
+
+**所有権モデル**（`ltdc_gui_take` と同型）: preview 稼働中は `cam_ext_sink` がセットされ、公開 `camera stream start/stop` は `CAM_ERR_STATE` で拒否。逆に plain `camera stream` 稼働中は `gui camera on` が失敗する。DCMI overrun 等の **非同期 teardown** も `cam_ext_sink` を detach + 解放するので、次の `frame_pipeline_init` が稼働中 sink を memset することはない。`gui camera off`（または画面 2 の Back ボタン）は stream 停止（owner 一致時のみ）→ in-flight `consume()` を bounded drain、の順。
+
+制御は shell から:
+
+- `gui camera on` … GUIX 未起動なら自動で `gui start` → streaming 開始 + sink attach → 画面 2 に切替（probe/configure を伴うため shell スレッドで実行）。
+- `gui camera off` … 画面 0 へ復帰 → stream 停止 + sink detach/drain。
+- 画面 2 の **Back ボタン**でも停止+復帰（`guix_camera_off` は bounded drain のみなので GUIX スレッドから呼んでも安全）。
+
+**帯域**: QVGA でも LTDC 連続 read + DCMI write + DMA2D 3 blit/表示フレーム（slot→view, view→後段, toggle copy-forward）が SDRAM（16bit FMC@108MHz）に同時に乗る。平均は帯域内だが、実機では `camera stream stats` の `dcmi_ovr` / `cam_ring_ovr` と LTDC underrun を監視し 0 維持を確認すること。
 
 ## 使い方
 
@@ -110,6 +133,8 @@ sh> lcd info          # 起動直後は従来どおり LCD テストが使える
 sh> gui start         # GUIX UI を表示（LCD + タッチを占有）
 sh> gui info          # 状態
 # 画面の「Next >」をタップ → 画面 2 へ。「< Back」で戻る。
+sh> gui camera on     # カメラライブプレビュー（320x240 等倍）。GUIX 未起動なら自動 start
+sh> gui camera off    # プレビュー停止（画面 2 の Back ボタンでも可）
 sh> lcd fill red      # GUIX 稼働中は拒否される（display owned by gui）
 sh> gui stop          # 画面を消して LCD を lcd コマンドへ返す
 ```

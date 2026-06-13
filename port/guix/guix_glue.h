@@ -45,6 +45,15 @@ int guix_stop(void);
 /** Nonzero while the GUIX UI is running (started and not stopped). */
 bool guix_is_up(void);
 
+/** Post a user event (gx_event_type = @p type) to the GUIX root window from any
+ *  thread.  The camera live preview (#56) uses this from the producer/shell
+ *  threads to drive screen show/hide and per-frame icon repaints -- target is
+ *  always the root because a NULL-target custom event is not routed to the root
+ *  handler.  @p type is unsigned long to hold GX_FIRST_USER_EVENT-based ids
+ *  without forcing GUIX headers on callers.  Returns GUIX_OK, or GUIX_ERR when
+ *  the UI is not running or the GUIX event queue is full (caller may retry). */
+int guix_post_root_event(unsigned long type);
+
 /** Diagnostic snapshot for `gui info`. */
 struct guix_info {
 	bool      inited;        /* GUIX initialised at least once       */

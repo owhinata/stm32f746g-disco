@@ -273,6 +273,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/port/guix/guix_touch.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_app.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_glue.c"
+    "${CMAKE_SOURCE_DIR}/port/guix/guix_camera.c"
     "${CMAKE_SOURCE_DIR}/lib/ov5640/ov5640.c"
     "${CMAKE_SOURCE_DIR}/lib/ov5640/ov5640_reg.c"
     "${CMAKE_SOURCE_DIR}/port/levelx/lx_nor_qspi_driver.c"
