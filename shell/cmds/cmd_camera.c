@@ -66,6 +66,18 @@ static const struct cam_named flip_names[] = {
 	{ "flip", CAM_FLIP_FLIP }, { "both", CAM_FLIP_BOTH }, { NULL, 0 }
 };
 
+/* Resolution / pixel-format names for `camera res` / `camera format` (#45).
+   RGB888 is unsupported; JPEG is snapshot-only and gated to <= VGA. */
+static const struct cam_named res_names[] = {
+	{ "qqvga", CAM_RES_QQVGA }, { "qvga", CAM_RES_QVGA },
+	{ "480x272", CAM_RES_480x272 }, { "vga", CAM_RES_VGA },
+	{ "wvga", CAM_RES_WVGA }, { NULL, 0 }
+};
+static const struct cam_named format_names[] = {
+	{ "rgb565", CAM_FMT_RGB565 }, { "yuv422", CAM_FMT_YUV422 },
+	{ "y8", CAM_FMT_Y8 }, { "jpeg", CAM_FMT_JPEG }, { NULL, 0 }
+};
+
 static int cam_lookup(const struct cam_named *t, const char *s, int *out)
 {
 	for (; t->name != NULL; t++) {
@@ -149,6 +161,7 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 {
 	struct camera_info ci;
 	struct camera_settings cs;
+	struct camera_mode cm;
 	int rc;
 
 	(void)argc;
@@ -170,6 +183,15 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "configured: %s\r\n", ci.configured ? "yes" : "no");
 	cli_print(sh, "frame:      %s\r\n", ci.frame_valid ? "valid" : "none");
 
+	if (camera_get_mode(&cm) == 0) {
+		cli_print(sh, "mode:       %ux%u %s\r\n", (unsigned)cm.width,
+		          (unsigned)cm.height, cam_name_of(format_names, cm.format));
+		cli_print(sh, "fps target: %lu.%lu%s\r\n",
+		          (unsigned long)(cm.fps_target_x10 / 10u),
+		          (unsigned long)(cm.fps_target_x10 % 10u),
+		          cm.streamable ? "" : "  (capture only -- too large to stream)");
+	}
+
 	if (camera_get_settings(&cs) == 0) {
 		cli_print(sh, "-- settings (camera set) --\r\n");
 		print_settings(sh, &cs);
@@ -182,16 +204,22 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
  * camera_frame_read (the driver mutex serializes against a concurrent
  * capture).  Sums fit comfortably: 76800 px * max 63 < 2^23.
  */
+/* Bounded scratch for the per-format pixel statistics and the `save` streaming:
+   the shell thread has a 2 KB stack, so the frame is walked in fixed chunks
+   rather than full rows (a WVGA row is 1600 B).  512 is even, so RGB565/YUV422
+   two-byte pixels never straddle a chunk boundary. */
+#define CAM_IO_CHUNK 512u
+
 static int cmd_camera_capture(struct cli_instance *sh, int argc, char **argv)
 {
-	uint16_t row[CAMERA_FRAME_WIDTH];
-	uint32_t rmin = 31, rmax = 0, rsum = 0;
-	uint32_t gmin = 63, gmax = 0, gsum = 0;
-	uint32_t bmin = 31, bmax = 0, bsum = 0;
-	uint32_t npx = CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT;
-	uint32_t gen0 = 0, gen;
-	int colorbar = 0;
-	int rc;
+	struct camera_mode m;
+	uint8_t buf[CAM_IO_CHUNK];
+	uint32_t rmin = 255, rmax = 0, rsum = 0;
+	uint32_t gmin = 255, gmax = 0, gsum = 0;
+	uint32_t bmin = 255, bmax = 0, bsum = 0;   /* RGB565: R5 / G6 / B5     */
+	uint32_t ymin = 255, ymax = 0, ysum = 0;   /* luma for YUV422 / Y8     */
+	uint32_t gen0 = 0, gen, off, npx;
+	int colorbar = 0, rc;
 
 	if (argc > 1) {
 		if (strcmp(argv[1], "test") != 0) {
@@ -209,84 +237,213 @@ static int cmd_camera_capture(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
 		return 1;
 	}
+	if (camera_get_mode(&m) != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(CAM_ERR_STATE));
+		return 1;
+	}
 
-	for (uint32_t y = 0; y < CAMERA_FRAME_HEIGHT; y++) {
-		rc = camera_frame_read(y * sizeof row, row, sizeof row, &gen);
+	/* JPEG: variable length, no raster pixels -- report the stream length and
+	   the SOI/EOI markers (the driver already verified them on capture). */
+	if (m.format == CAM_FMT_JPEG) {
+		struct camera_info ci;
+		uint8_t tail[2] = { 0, 0 };
+		uint32_t head = 0;
+
+		if (camera_get_info(&ci) != 0) {
+			cli_error(sh, "camera: %s\r\n", cam_strerror(CAM_ERR_STATE));
+			return 1;
+		}
+		cli_print(sh, "frame: %ux%u JPEG (%lu bytes)\r\n", (unsigned)m.width,
+		          (unsigned)m.height, (unsigned long)ci.frame_bytes);
+		head = (ci.frame_bytes < 32u) ? ci.frame_bytes : 32u;
+		if (head >= 2u && camera_frame_read(0, buf, head, &gen) == 0) {
+			cli_print(sh, "SOI: %s\r\n",
+			          (buf[0] == 0xFFu && buf[1] == 0xD8u) ? "ok (FFD8)"
+			                                               : "MISSING");
+			cli_print(sh, "bytes[0..%lu]:\r\n", (unsigned long)(head - 1u));
+			cli_hexdump(sh, buf, head);
+		}
+		if (ci.frame_bytes >= 2u &&
+		    camera_frame_read(ci.frame_bytes - 2u, tail, 2u, &gen) == 0)
+			cli_print(sh, "EOI: %s\r\n",
+			          (tail[0] == 0xFFu && tail[1] == 0xD9u) ? "ok (FFD9)"
+			                                                 : "MISSING");
+		return 0;
+	}
+
+	npx = (uint32_t)m.width * m.height;
+
+	/* Walk the frame in fixed chunks, accumulating per-format statistics.  A
+	   generation change between chunks means a concurrent capture replaced the
+	   pixels (frame_valid alone cannot detect that -- only the generation). */
+	for (off = 0; off < m.frame_bytes; ) {
+		uint32_t n = (m.frame_bytes - off < CAM_IO_CHUNK)
+		             ? m.frame_bytes - off : CAM_IO_CHUNK;
+
+		rc = camera_frame_read(off, buf, n, &gen);
 		if (rc != 0) {
 			cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
 			return 1;
 		}
-		if (y == 0)
+		if (off == 0)
 			gen0 = gen;
 		else if (gen != gen0) {
 			cli_error(sh, "camera: frame changed mid-read "
 			              "(concurrent capture)\r\n");
 			return 1;
 		}
-		for (uint32_t x = 0; x < CAMERA_FRAME_WIDTH; x++) {
-			uint32_t p = row[x];
-			uint32_t r = (p >> 11) & 0x1Fu;
-			uint32_t gg = (p >> 5) & 0x3Fu;
-			uint32_t b = p & 0x1Fu;
+		if (m.format == CAM_FMT_RGB565) {
+			for (uint32_t i = 0; i + 1u < n; i += 2u) {
+				uint32_t p = (uint32_t)buf[i] |
+				             ((uint32_t)buf[i + 1u] << 8);
+				uint32_t r = (p >> 11) & 0x1Fu;
+				uint32_t gg = (p >> 5) & 0x3Fu;
+				uint32_t b = p & 0x1Fu;
 
-			if (r < rmin) rmin = r;
-			if (r > rmax) rmax = r;
-			rsum += r;
-			if (gg < gmin) gmin = gg;
-			if (gg > gmax) gmax = gg;
-			gsum += gg;
-			if (b < bmin) bmin = b;
-			if (b > bmax) bmax = b;
-			bsum += b;
+				if (r < rmin) rmin = r;
+				if (r > rmax) rmax = r;
+				rsum += r;
+				if (gg < gmin) gmin = gg;
+				if (gg > gmax) gmax = gg;
+				gsum += gg;
+				if (b < bmin) bmin = b;
+				if (b > bmax) bmax = b;
+				bsum += b;
+			}
+		} else if (m.format == CAM_FMT_YUV422) {
+			/* YUYV groups Y0 U Y1 V; off is a multiple of 4, so a group never
+			   straddles a chunk.  Y -> luma; U -> r*, V -> g* accumulators. */
+			for (uint32_t i = 0; i + 3u < n; i += 4u) {
+				uint32_t y0 = buf[i], uu = buf[i + 1u];
+				uint32_t y1 = buf[i + 2u], vv = buf[i + 3u];
+
+				if (y0 < ymin) ymin = y0;
+				if (y0 > ymax) ymax = y0;
+				if (y1 < ymin) ymin = y1;
+				if (y1 > ymax) ymax = y1;
+				ysum += y0 + y1;
+				if (uu < rmin) rmin = uu;
+				if (uu > rmax) rmax = uu;
+				rsum += uu;
+				if (vv < gmin) gmin = vv;
+				if (vv > gmax) gmax = vv;
+				gsum += vv;
+			}
+		} else {   /* Y8: one luma byte per pixel */
+			for (uint32_t i = 0; i < n; i++) {
+				uint32_t yv = buf[i];
+
+				if (yv < ymin) ymin = yv;
+				if (yv > ymax) ymax = yv;
+				ysum += yv;
+			}
 		}
+		off += n;
 		if (cli_cancel_requested(sh))
 			return 1;
 	}
 
-	cli_print(sh, "frame: %ux%u RGB565 (%lu bytes)\r\n",
-	          (unsigned)CAMERA_FRAME_WIDTH, (unsigned)CAMERA_FRAME_HEIGHT,
-	          (unsigned long)CAMERA_FRAME_BYTES);
-	cli_print(sh, "R5: min %2lu  max %2lu  mean %lu.%lu\r\n",
-	          (unsigned long)rmin, (unsigned long)rmax,
-	          (unsigned long)(rsum / npx),
-	          (unsigned long)((rsum % npx) * 10u / npx));
-	cli_print(sh, "G6: min %2lu  max %2lu  mean %lu.%lu\r\n",
-	          (unsigned long)gmin, (unsigned long)gmax,
-	          (unsigned long)(gsum / npx),
-	          (unsigned long)((gsum % npx) * 10u / npx));
-	cli_print(sh, "B5: min %2lu  max %2lu  mean %lu.%lu\r\n",
-	          (unsigned long)bmin, (unsigned long)bmax,
-	          (unsigned long)(bsum / npx),
-	          (unsigned long)((bsum % npx) * 10u / npx));
+	cli_print(sh, "frame: %ux%u %s (%lu bytes)\r\n", (unsigned)m.width,
+	          (unsigned)m.height, cam_name_of(format_names, m.format),
+	          (unsigned long)m.frame_bytes);
+	if (m.format == CAM_FMT_RGB565) {
+		cli_print(sh, "R5: min %2lu  max %2lu  mean %lu.%lu\r\n",
+		          (unsigned long)rmin, (unsigned long)rmax,
+		          (unsigned long)(rsum / npx),
+		          (unsigned long)((rsum % npx) * 10u / npx));
+		cli_print(sh, "G6: min %2lu  max %2lu  mean %lu.%lu\r\n",
+		          (unsigned long)gmin, (unsigned long)gmax,
+		          (unsigned long)(gsum / npx),
+		          (unsigned long)((gsum % npx) * 10u / npx));
+		cli_print(sh, "B5: min %2lu  max %2lu  mean %lu.%lu\r\n",
+		          (unsigned long)bmin, (unsigned long)bmax,
+		          (unsigned long)(bsum / npx),
+		          (unsigned long)((bsum % npx) * 10u / npx));
+	} else if (m.format == CAM_FMT_YUV422) {
+		uint32_t nc = npx / 2u;   /* one U and one V per two luma samples */
 
-	/* First 16 pixels of the top row, raw little-endian.  Only when still
-	   the same frame the stats above were computed over. */
-	if (camera_frame_read(0, row, 32, &gen) == 0 && gen == gen0) {
-		cli_print(sh, "row0[0..15]:\r\n");
-		cli_hexdump(sh, row, 32);
+		cli_print(sh, "Y:  min %3lu  max %3lu  mean %lu.%lu\r\n",
+		          (unsigned long)ymin, (unsigned long)ymax,
+		          (unsigned long)(ysum / npx),
+		          (unsigned long)((ysum % npx) * 10u / npx));
+		cli_print(sh, "Cb: min %3lu  max %3lu  mean %lu.%lu  (U)\r\n",
+		          (unsigned long)rmin, (unsigned long)rmax,
+		          (unsigned long)(rsum / nc),
+		          (unsigned long)((rsum % nc) * 10u / nc));
+		cli_print(sh, "Cr: min %3lu  max %3lu  mean %lu.%lu  (V)\r\n",
+		          (unsigned long)gmin, (unsigned long)gmax,
+		          (unsigned long)(gsum / nc),
+		          (unsigned long)((gsum % nc) * 10u / nc));
+	} else {   /* Y8 */
+		cli_print(sh, "Y:  min %3lu  max %3lu  mean %lu.%lu\r\n",
+		          (unsigned long)ymin, (unsigned long)ymax,
+		          (unsigned long)(ysum / npx),
+		          (unsigned long)((ysum % npx) * 10u / npx));
+	}
+
+	/* First 32 raw bytes -- a quick eyeball check, same frame as the stats. */
+	if (camera_frame_read(0, buf, 32, &gen) == 0 && gen == gen0) {
+		cli_print(sh, "bytes[0..31]:\r\n");
+		cli_hexdump(sh, buf, 32);
 	}
 	return 0;
 }
 
+/* Print the PC-side conversion hint for the saved/sent frame's format (#45). */
+static void cam_convert_hint(struct cli_instance *sh, const struct camera_mode *m,
+                            const char *path)
+{
+	switch (m->format) {
+	case CAM_FMT_YUV422:
+		cli_print(sh, "PC: python3 scripts/yuv422_to_png.py --width %u "
+		          "--height %u %s out.png\r\n",
+		          (unsigned)m->width, (unsigned)m->height, path);
+		break;
+	case CAM_FMT_Y8:
+		cli_print(sh, "PC: python3 scripts/y8_to_png.py --width %u "
+		          "--height %u %s out.png\r\n",
+		          (unsigned)m->width, (unsigned)m->height, path);
+		break;
+	case CAM_FMT_JPEG:
+		cli_print(sh, "PC: %s is a JPEG stream -- open it directly\r\n", path);
+		break;
+	default:   /* RGB565 */
+		cli_print(sh, "PC: python3 scripts/rgb565_to_png.py --width %u "
+		          "--height %u %s out.png\r\n",
+		          (unsigned)m->width, (unsigned)m->height, path);
+		break;
+	}
+}
+
 /*
- * Write the captured frame to <path> on the chosen medium, raw little-endian
- * RGB565, streamed row by row (640 B) so no full-frame staging buffer is
- * needed.  Runs under the medium's shared op slot (same gate as the fs/sd
- * command bodies); the camera driver mutex inside camera_frame_read
- * serializes each row against a concurrent capture.
+ * Write the captured frame to <path> on the chosen medium, raw in the current
+ * pixel format (RGB565/YUV422/Y8 little-endian, or a JPEG stream), streamed in
+ * fixed CAM_IO_CHUNK chunks so no full-frame staging buffer is needed.  Runs
+ * under the medium's shared op slot (same gate as the fs/sd command bodies); the
+ * camera driver mutex inside camera_frame_read serializes each chunk against a
+ * concurrent capture, and the generation check fails the save rather than mixing
+ * two frames.  The valid length comes from camera_get_info (JPEG is variable).
  */
 static int save_body(const struct fs_device *dev, struct cli_instance *sh,
                      const char *path)
 {
-	uint8_t row[CAMERA_FRAME_WIDTH * 2];
+	uint8_t buf[CAM_IO_CHUNK];
+	struct camera_mode m;
+	struct camera_info ci;
 	FX_MEDIA *media = fs_core_mount(dev, sh);
 	FX_FILE file;
-	uint32_t gen0 = 0, gen;
+	uint32_t total, off, gen0 = 0, gen;
 	UINT status;
 	int rc;
 
 	if (media == NULL)
 		return 1;
+	if (camera_get_mode(&m) != 0 || camera_get_info(&ci) != 0 ||
+	    !ci.frame_valid) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(CAM_ERR_NO_FRAME));
+		return 1;
+	}
+	total = ci.frame_bytes;
 
 	status = fx_file_create(media, (CHAR *)path);
 	if (status != FX_SUCCESS && status != FX_ALREADY_CREATED) {
@@ -302,19 +459,21 @@ static int save_body(const struct fs_device *dev, struct cli_instance *sh,
 	}
 
 	status = fx_file_truncate(&file, 0);
-	for (uint32_t y = 0; status == FX_SUCCESS && y < CAMERA_FRAME_HEIGHT;
-	     y++) {
-		rc = camera_frame_read(y * sizeof row, row, sizeof row, &gen);
+	for (off = 0; status == FX_SUCCESS && off < total; ) {
+		uint32_t n = (total - off < CAM_IO_CHUNK) ? total - off
+		                                          : CAM_IO_CHUNK;
+
+		rc = camera_frame_read(off, buf, n, &gen);
 		if (rc != 0) {
 			(void)fx_file_close(&file);
 			cli_error(sh, "camera: %s (file left partial)\r\n",
 			          cam_strerror(rc));
 			return 1;
 		}
-		/* Generation check: a concurrent capture between rows replaces
-		   the pixels and re-validates the buffer -- without this the
-		   file would silently mix two frames. */
-		if (y == 0) {
+		/* Generation check: a concurrent capture between chunks replaces the
+		   pixels and re-validates the buffer -- without this the file would
+		   silently mix two frames. */
+		if (off == 0) {
 			gen0 = gen;
 		} else if (gen != gen0) {
 			(void)fx_file_close(&file);
@@ -322,7 +481,8 @@ static int save_body(const struct fs_device *dev, struct cli_instance *sh,
 			              "concurrent capture (file left partial)\r\n");
 			return 1;
 		}
-		status = fx_file_write(&file, row, sizeof row);
+		status = fx_file_write(&file, buf, n);
+		off += n;
 		if (cli_cancel_requested(sh)) {
 			(void)fx_file_close(&file);
 			cli_error(sh, "camera: cancelled (file left partial)\r\n");
@@ -338,11 +498,10 @@ static int save_body(const struct fs_device *dev, struct cli_instance *sh,
 		          fs_strerror(status), status);
 		return 1;
 	}
-	cli_print(sh, "wrote %lu bytes (%ux%u RGB565 raw) to %s:%s\r\n",
-	          (unsigned long)CAMERA_FRAME_BYTES,
-	          (unsigned)CAMERA_FRAME_WIDTH, (unsigned)CAMERA_FRAME_HEIGHT,
-	          dev->name, path);
-	cli_print(sh, "PC: python3 scripts/rgb565_to_png.py <file> out.png\r\n");
+	cli_print(sh, "wrote %lu bytes (%ux%u %s) to %s:%s\r\n",
+	          (unsigned long)total, (unsigned)m.width, (unsigned)m.height,
+	          cam_name_of(format_names, m.format), dev->name, path);
+	cam_convert_hint(sh, &m, path);
 	return 0;
 }
 
@@ -391,6 +550,7 @@ static int cmd_camera_save(struct cli_instance *sh, int argc, char **argv)
  */
 struct cam_send_ctx {
 	uint32_t off;
+	uint32_t size;       /* valid captured length (raster size or JPEG stream) */
 	uint32_t gen0;
 	int      have_gen0;
 };
@@ -401,11 +561,11 @@ static int cam_send_read(void *ctx, uint8_t *dst, uint32_t want, uint32_t *got)
 	uint32_t rem, n, gen;
 	int rc;
 
-	if (cc->off >= CAMERA_FRAME_BYTES) {
+	if (cc->off >= cc->size) {
 		*got = 0;
 		return 0;                       /* EOF */
 	}
-	rem = (uint32_t)CAMERA_FRAME_BYTES - cc->off;
+	rem = cc->size - cc->off;
 	n = (want < rem) ? want : rem;
 	rc = camera_frame_read(cc->off, dst, n, &gen);
 	if (rc != 0)
@@ -424,17 +584,18 @@ static int cam_send_read(void *ctx, uint8_t *dst, uint32_t want, uint32_t *got)
 static int cmd_camera_send(struct cli_instance *sh, int argc, char **argv)
 {
 	struct camera_info ci;
-	struct cam_send_ctx cc = { 0, 0, 0 };
+	struct cam_send_ctx cc = { 0, 0, 0, 0 };
 	struct ym_source src;
 
 	if (camera_get_info(&ci) != 0 || !ci.frame_valid) {
 		cli_error(sh, "camera: %s\r\n", cam_strerror(CAM_ERR_NO_FRAME));
 		return 1;
 	}
+	cc.size = ci.frame_bytes;
 
 	src.ctx  = &cc;
 	src.name = (argc >= 2) ? argv[1] : "frame.raw";
-	src.size = (uint32_t)CAMERA_FRAME_BYTES;
+	src.size = cc.size;
 	src.read = cam_send_read;
 	return xfer_send_source(sh, &src);
 }
@@ -621,6 +782,40 @@ CLI_SUBCMD_SET_CREATE(camera_set_subcmds,
 	CLI_CMD(default,    NULL, "reset all settings to neutral", cmd_set_default),
 	CLI_SUBCMD_SET_END);
 
+/* ---- resolution / pixel format (issue #45) ------------------------------- */
+/* Each leaf changes one axis and keeps the other; camera_set_format re-programs
+   the sensor (resolution/format scalers + the per-mode HTS/VTS/PCLK fps table)
+   and is refused while a stream or GUIX preview owns the DCMI. */
+static int cmd_camera_res(struct cli_instance *sh, int argc, char **argv)
+{
+	struct camera_mode m;
+	int n;
+
+	(void)argc;
+	if (cam_lookup(res_names, argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	if (camera_get_mode(&m) != 0)
+		return set_report(sh, argv[0], argv[1], CAM_ERR_STATE);
+	return set_report(sh, argv[0], argv[1],
+	                  camera_set_format((enum camera_res)n,
+	                                    (enum camera_format)m.format));
+}
+
+static int cmd_camera_format(struct cli_instance *sh, int argc, char **argv)
+{
+	struct camera_mode m;
+	int n;
+
+	(void)argc;
+	if (cam_lookup(format_names, argv[1], &n) != 0)
+		return set_reject(sh, argv[0], argv[1]);
+	if (camera_get_mode(&m) != 0)
+		return set_report(sh, argv[0], argv[1], CAM_ERR_STATE);
+	return set_report(sh, argv[0], argv[1],
+	                  camera_set_format((enum camera_res)m.res,
+	                                    (enum camera_format)n));
+}
+
 /* ---- streaming (issue #46): non-blocking start / stop / stats ------------ */
 
 static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
@@ -647,6 +842,20 @@ static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
 		} else {
 			cli_error(sh, "camera: bad option '%s' "
 			          "(test | --frames N | --secs S)\r\n", argv[i]);
+			return 1;
+		}
+	}
+
+	/* Clearer message than the generic CAM_ERR_STATE: large modes and JPEG are
+	   capture-only (the ring slot / one DMA NDTR cannot hold the frame). */
+	{
+		struct camera_mode m;
+
+		if (camera_get_mode(&m) == 0 && !m.streamable) {
+			cli_error(sh, "camera: %ux%u %s is capture-only -- too large to "
+			          "stream; use a smaller resolution\r\n",
+			          (unsigned)m.width, (unsigned)m.height,
+			          cam_name_of(format_names, m.format));
 			return 1;
 		}
 	}
@@ -734,9 +943,14 @@ CLI_SUBCMD_SET_CREATE(camera_stream_subcmds,
 CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD(probe, NULL, "power-cycle + read the OV5640 chip ID", cmd_camera_probe),
 	CLI_CMD(info,  NULL, "driver / sensor state", cmd_camera_info),
-	CLI_CMD_ARG(capture, NULL, "snapshot QVGA RGB565 + stats ('test' = colorbar)",
+	CLI_CMD_ARG(res, NULL, "set resolution <qqvga|qvga|480x272|vga|wvga>",
+	            cmd_camera_res, 2, 0),
+	CLI_CMD_ARG(format, NULL,
+	            "set pixel format <rgb565|yuv422|y8|jpeg> (jpeg: snapshot <=VGA)",
+	            cmd_camera_format, 2, 0),
+	CLI_CMD_ARG(capture, NULL, "snapshot the current mode + stats ('test' = colorbar)",
 	            cmd_camera_capture, 1, 1),
-	CLI_CMD_ARG(save, NULL, "write frame as raw RGB565 <sd|fs> <path>",
+	CLI_CMD_ARG(save, NULL, "write frame raw <sd|fs> <path> (format per mode)",
 	            cmd_camera_save, 3, 0),
 	CLI_CMD_ARG(send, NULL, "stream the frame to the PC over YMODEM [name]",
 	            cmd_camera_send, 1, 1),

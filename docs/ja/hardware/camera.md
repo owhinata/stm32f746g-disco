@@ -78,9 +78,11 @@ TIMINGR は **PCLK1 = 54 MHz** 用に再計算した値を使う（RM0385 §30.4
 
 ```
 camera probe             電源サイクル + OV5640 chip ID 読出し（~1 s）
-camera info              ドライバ / センサ状態 + 現在の画質設定を表示
-camera capture [test]    QVGA RGB565 を 1 フレーム snapshot（test = colorbar パターン）
-camera save <sd|fs> <p>  キャプチャ済みフレームを raw RGB565 でファイル保存
+camera info              ドライバ / センサ状態 + 現在のモード / 画質設定を表示
+camera res <解像度>      解像度切替 qqvga|qvga|480x272|vga|wvga（#45）
+camera format <fmt>      ピクセルフォーマット切替 rgb565|yuv422|y8|jpeg（#45）
+camera capture [test]    現在モードを 1 フレーム snapshot（test = colorbar パターン）
+camera save <sd|fs> <p>  キャプチャ済みフレームを raw（モードのフォーマット）で保存
 camera set [<name> <値>] OV5640 画質設定（引数なしで一覧表示）
 camera off               モジュール電源 OFF
 ```
@@ -107,7 +109,7 @@ frame: 320x240 RGB565 (153600 bytes)
 
 ## ファイル保存と PC での画像確認（#42）
 
-`camera save <sd|fs> <path>` は、キャプチャ済みフレームを **raw little-endian RGB565（153,600 B）のまま**選択した媒体（`sd` = microSD FAT32、`fs` = QSPI NOR）へ書き出す。行単位（640 B × 240 行）で `camera_frame_read` → FileX write のストリーム書きなので追加バッファ不要。fs/sd コマンドと同じ **shared op slot** 下で動くため、保存中に `sd format`/`umount` が媒体を奪うことはない。Ctrl+C で中断可（部分ファイルが残る旨を表示）。
+`camera save <sd|fs> <path>` は、キャプチャ済みフレームを**現在モードのフォーマットの raw のまま**（RGB565/YUV422/Y8 raster、または JPEG ストリーム）選択した媒体（`sd` = microSD FAT32、`fs` = QSPI NOR）へ書き出す。固定チャンク（512 B、shell の 2 KB スタックに収める）で `camera_frame_read` → FileX write のストリーム書きなので追加バッファ不要。有効長は `camera_get_info` の `frame_bytes`（JPEG は EOI まで切り詰めた可変長）。fs/sd コマンドと同じ **shared op slot** 下で動くため、保存中に `sd format`/`umount` が媒体を奪うことはない。Ctrl+C で中断可（部分ファイルが残る旨を表示）。フォーマット別の PC 変換は下記「解像度 / ピクセルフォーマット / フレームレート（#45）」節を参照。
 
 PC 側では microSD をカードリーダで読む（または `sd cat` 以外の転送手段）か、そのまま付属スクリプトで PNG に変換する:
 
@@ -185,6 +187,77 @@ type 'help camera set' for the list of settings
 
     **tint 系 effect（bw/sepia/blue/red/green）は `SDE_CTRL3/4` を fixed U/V で占有**し saturation/hue と register が衝突するため、tint 適用中は saturation/hue を skip する（U/V 固定中はどのみち無効）。
 
+## 解像度 / ピクセルフォーマット / フレームレート（#45）
+
+`camera res` / `camera format` でキャプチャモードを切り替える。ドライバ内部の唯一の真実 `struct camera_mode`（`port/camera/camera.c`）が geometry / format / timing を保持し、`camera_set_format()` が OV5640 を再プログラム（解像度・フォーマットスケーラ + per-mode の HTS/VTS/PCLK fps 表）して反映する。`camera info` に現在の `WxH`・フォーマット・目標 fps・stream 可否を表示。
+
+| 軸 | 値 |
+|----|----|
+| 解像度 | `qqvga`(160x120) / `qvga`(320x240) / `480x272` / `vga`(640x480) / `wvga`(800x480) |
+| フォーマット | `rgb565`(2B/px) / `yuv422`(2B/px, YUYV) / `y8`(1B/px, グレースケール) / `jpeg`(可変長) |
+
+### snapshot と stream の非対称（HW 制約由来）
+
+- **snapshot は全モード可**: VGA/WVGA は 1 フレームが DMA NDTR 上限（65535 words）を超えるが、`HAL_DCMI_Start_DMA` が単一連続バッファへ **intra-frame DBM banding**（VGA=4×38400w, WVGA=4×48000w）して取り込む。FRAME はバンド最終で 1 回発火。
+- **stream は frame_words ≤ 65535 のモードのみ**（QQVGA/QVGA/480x272 の RGB565・YUV422 等）。producer の手動 DBM は各 M-reg が full-slot を NDTR で指すため、これを超えるモードは `camera info` で `capture only` と表示し `camera stream start` を拒否する。
+- **JPEG は snapshot-only・解像度 ≤ VGA**。可変長リング管理は別系統のため stream には載せない。
+
+### フレームレート（per-mode HTS/VTS、~15fps）
+
+OV5640 の `lib/ov5640` 共通テーブルは HTS=1936/VTS=1088 を**全解像度共通**・PCLK 24MHz 固定で設定するため既定は **~11fps**。`camera res` で適用される **fps 表**（`mode_fps[]`）は、stream 対象の小モードに HTS/VTS 縮小（1600/1000 → **~15fps**、実機 14.9fps）を、snapshot 専用の VGA/WVGA に従来のタイミング（1936/1088, ~11fps）を与える。`fps = PCLK/(HTS×VTS)`。
+
+**PCLK は全モード 24MHz 据え置き**: 30fps は PCLK 48MHz が必要だが、48MHz は peak DCMI バーストレートを倍化し、LTDC がフレームバッファを常時リードする 16-bit SDRAM 競合下で **DCMI を即 OVR**（GUIX プレビューが frame0 で停止）させる。これは #59 の帯域問題。15fps は実証済 11fps プレビューと **peak レートが同一**（HTS/VTS 縮小は blanking を削るだけ）なので OVR 安全。**30fps（48MHz + FIFO threshold/FMC アービトレーション調整）は #59** の本題。
+
+!!! warning "VTS と AEC 最大露光のクランプ"
+    VTS が AEC 最大露光行数（`0x3A02/03` と `0x3A14/15`、既定 0x3D8=984）を下回ると露光がクリップして暗化/バンディングする。`camera_set_format` は **設定再適用（night mode が AEC を書換える）後**に両系統を read-back し、`VTS ≥ max + margin` を保証する（不足なら VTS を引き上げ、fps は目標を下回る）。fps 表の値は**実機 `camera stream stats` で要調整**の出発点である（帯域競合下の最適化は #59）。
+
+実行例:
+
+```
+sh> camera res vga
+camera: res = vga
+sh> camera format yuv422
+camera: format = yuv422
+sh> camera info
+...
+mode:       640x480 yuv422
+fps target: 11.4  (capture only -- too large to stream)
+sh> camera capture
+frame: 640x480 yuv422 (614400 bytes)
+Y:  min   3  max 251  mean 120.4
+sh> camera save fs /shot.raw
+wrote 614400 bytes (640x480 yuv422) to fs:/shot.raw
+PC: python3 scripts/yuv422_to_png.py --width 640 --height 480 /shot.raw out.png
+```
+
+JPEG は可変長ストリームをそのまま保存する（変換不要、`.jpg` として開ける）:
+
+```
+sh> camera format jpeg
+sh> camera capture
+frame: 320x240 JPEG (12784 bytes)
+SOI: ok (FFD8)
+EOI: ok (FFD9)
+sh> camera save sd /shot.jpg
+wrote 12784 bytes (320x240 jpeg) to sd:/shot.jpg
+PC: /shot.jpg is a JPEG stream -- open it directly
+```
+
+### PC 変換スクリプト
+
+| フォーマット | 変換 |
+|------|------|
+| RGB565 | `python3 scripts/rgb565_to_png.py --width W --height H in.raw out.png` |
+| YUV422 | `python3 scripts/yuv422_to_png.py --width W --height H in.raw out.png` |
+| Y8 | `python3 scripts/y8_to_png.py --width W --height H in.raw out.png` |
+| JPEG | 変換不要（`.jpg` を直接開く） |
+
+`camera save` / `camera capture` の出力に、現在モードに応じた変換コマンドが表示される。
+
+### SDRAM 予算
+
+最大固定フォーマット WVGA RGB565（768,000 B）を `cam_frame` に連続確保（JPEG budget も流用）、stream リングは 480x272 RGB565 を内包する 256 KB スロット × 4 = 1 MB。`.sdram` 計 2.39 MB / 8 MB。リンカに `ASSERT(_esdram-_ssdram <= 0x800000)` を追加。
+
 ## 連続取り込み（streaming, #46）
 
 `camera capture` の単発 snapshot（`DCMI_MODE_SNAPSHOT` + `DMA_NORMAL`）に対し、`camera stream` は **DCMI continuous + DMA double-buffer(DBM)** で途切れなく取り込む。取り込んだフレームは [フレームパイプライン](../architecture/frame-pipeline.md)（1 ソース→マルチシンク, #47）へ流し、#46 の一次成果は表示非依存の **FPS / オーバーラン計測**。LTDC 表示や連続保存は後続のシンクとして差し込む。
@@ -217,7 +290,7 @@ camera stream stats                                   FPS / frames / overrun
 
 ### GUIX ライブプレビュー（#56）
 
-`gui camera on` はこの streaming パイプラインに GUIX の push sink を attach し、QVGA を **等倍のまま** LTDC 画面（GUIX）に表示する。プレビュー所有中は `camera stream start/stop` が拒否される。詳細は [GUIX のカメラライブプレビュー節](../rtos/guix.md) を参照。
+`gui camera on` はこの streaming パイプラインに GUIX の push sink を attach し、QVGA を **等倍のまま** LTDC 画面（GUIX）に表示する。プレビュー開始時に **QVGA RGB565 を強制**（`camera_preview_start` が同一 lock 下で `camera_set_format_locked(QVGA,RGB565)` を呼ぶ）するため、直前の `camera res/format` に依らず #56 の sink（QVGA RGB565 専用）と一致する（プレビュー後はモードが QVGA RGB565 に変わる）。プレビュー所有中は `camera stream start/stop` と `camera res/format` が拒否される。詳細は [GUIX のカメラライブプレビュー節](../rtos/guix.md) を参照。
 
 ## 参照
 

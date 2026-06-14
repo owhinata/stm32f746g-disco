@@ -78,9 +78,11 @@ Sensor setup is lazy, at capture time: probe if needed → `OV5640_Init` (once p
 
 ```
 camera probe             power cycle + read the OV5640 chip ID (~1 s)
-camera info              driver / sensor state + current quality settings
-camera capture [test]    snapshot one QVGA RGB565 frame (test = colorbar pattern)
-camera save <sd|fs> <p>  write the captured frame to a file, raw RGB565
+camera info              driver / sensor state + current mode / quality settings
+camera res <resolution>  switch resolution qqvga|qvga|480x272|vga|wvga (#45)
+camera format <fmt>      switch pixel format rgb565|yuv422|y8|jpeg (#45)
+camera capture [test]    snapshot one frame in the current mode (test = colorbar)
+camera save <sd|fs> <p>  write the captured frame to a file, raw (mode's format)
 camera set [<name> <v>]  OV5640 image-quality controls (no arg = show)
 camera off               cut module power
 ```
@@ -107,7 +109,7 @@ frame: 320x240 RGB565 (153600 bytes)
 
 ## Saving frames and viewing them on a PC (#42)
 
-`camera save <sd|fs> <path>` writes the captured frame **as raw little-endian RGB565 (153,600 B)** to the chosen medium (`sd` = microSD FAT32, `fs` = QSPI NOR), streaming row by row (640 B × 240 rows) through `camera_frame_read` into a FileX write -- no staging buffer. It runs under the same **shared op slot** as the fs/sd command bodies, so `sd format`/`umount` cannot yank the media mid-save. Ctrl+C cancels (a partial file is reported as such).
+`camera save <sd|fs> <path>` writes the captured frame **in the current mode's raw format** (RGB565/YUV422/Y8 raster, or a JPEG stream) to the chosen medium (`sd` = microSD FAT32, `fs` = QSPI NOR), streaming in fixed chunks (512 B, sized for the shell's 2 KB stack) through `camera_frame_read` into a FileX write -- no staging buffer. The valid length comes from `camera_get_info`'s `frame_bytes` (for JPEG the stream trimmed to the EOI). It runs under the same **shared op slot** as the fs/sd command bodies, so `sd format`/`umount` cannot yank the media mid-save. Ctrl+C cancels (a partial file is reported as such). Per-format PC conversion is in the [#45 section](#resolution-pixel-format-frame-rate-45).
 
 Read the microSD card on the PC (card reader) and convert with the bundled script:
 
@@ -185,6 +187,71 @@ type 'help camera set' for the list of settings
 
     **Tint effects (bw/sepia/blue/red/green) own `SDE_CTRL3/4` via fixed U/V**, which collides with saturation/hue, so saturation/hue are skipped while a tint effect is active (they have no visible effect while U/V is fixed anyway).
 
+## Resolution / pixel format / frame rate (#45)
+
+`camera res` / `camera format` switch the capture mode. The driver's single source of truth `struct camera_mode` (`port/camera/camera.c`) holds the geometry / format / timing, and `camera_set_format()` re-programs the OV5640 (resolution and format scalers + the per-mode HTS/VTS/PCLK fps table). `camera info` shows the current `WxH`, format, target fps and whether the mode is streamable.
+
+| Axis | Values |
+|------|--------|
+| Resolution | `qqvga`(160x120) / `qvga`(320x240) / `480x272` / `vga`(640x480) / `wvga`(800x480) |
+| Format | `rgb565`(2 B/px) / `yuv422`(2 B/px, YUYV) / `y8`(1 B/px greyscale) / `jpeg`(variable) |
+
+### Snapshot vs stream asymmetry (a hardware constraint)
+
+- **Snapshot supports every mode**: a VGA/WVGA frame exceeds the DMA NDTR limit (65535 words), but `HAL_DCMI_Start_DMA` transparently **bands it intra-frame** (DBM into one contiguous buffer: VGA = 4×38400w, WVGA = 4×48000w), firing FRAME once at the end.
+- **Streaming only supports modes with frame_words ≤ 65535** (QQVGA/QVGA/480x272 in RGB565/YUV422). The producer's manual DBM points each M-register at a whole slot via NDTR, so larger modes are flagged `capture only` in `camera info` and `camera stream start` is refused.
+- **JPEG is snapshot-only and gated to ≤ VGA** (variable-length ring management is a separate concern).
+
+### Frame rate (per-mode HTS/VTS, ~15fps)
+
+The `lib/ov5640` common table sets HTS=1936/VTS=1088 for **every** resolution at a fixed 24 MHz PCLK, so the default is **~11fps**. The fps table (`mode_fps[]`) applied by `camera res` gives the streamable small modes a tightened HTS/VTS (1600/1000 → **~15fps**, 14.9fps measured) and keeps the snapshot-only VGA/WVGA on the full common timing (1936/1088, ~11fps). `fps = PCLK/(HTS×VTS)`.
+
+**PCLK stays at 24 MHz for all modes**: reaching 30fps needs 48 MHz PCLK, but 48 MHz doubles the peak DCMI burst rate and overruns the 16-bit SDRAM the instant the LTDC also reads the framebuffer (the GUIX preview dies with a DCMI overrun at frame 0) -- that bandwidth fight is issue #59. 15fps shares the **same peak rate** as the proven 11fps preview (tightening HTS/VTS only removes blanking), so it is overrun-safe. **30fps (48 MHz + FIFO threshold / FMC arbitration tuning) belongs to #59.**
+
+!!! warning "VTS vs AEC max exposure clamp"
+    If VTS drops below the AEC max-exposure line count (`0x3A02/03` and `0x3A14/15`, default 0x3D8=984) the exposure clips and the frame darkens / bands. `camera_set_format` reads **both** max-exposure pairs back **after re-applying the quality settings** (night mode rewrites AEC) and guarantees `VTS ≥ max + margin`, raising VTS (and lowering fps below target) if needed. The fps table values are a **starting point to tune against on-hardware `camera stream stats`** (contention tuning is #59).
+
+```
+sh> camera res vga
+camera: res = vga
+sh> camera format yuv422
+camera: format = yuv422
+sh> camera info
+...
+mode:       640x480 yuv422
+fps target: 11.4  (capture only -- too large to stream)
+sh> camera save fs /shot.raw
+wrote 614400 bytes (640x480 yuv422) to fs:/shot.raw
+PC: python3 scripts/yuv422_to_png.py --width 640 --height 480 /shot.raw out.png
+```
+
+JPEG saves the variable-length stream as-is (no conversion -- open it as `.jpg`):
+
+```
+sh> camera format jpeg
+sh> camera capture
+frame: 320x240 JPEG (12784 bytes)
+SOI: ok (FFD8)
+EOI: ok (FFD9)
+sh> camera save sd /shot.jpg
+PC: /shot.jpg is a JPEG stream -- open it directly
+```
+
+### PC conversion scripts
+
+| Format | Conversion |
+|--------|------------|
+| RGB565 | `python3 scripts/rgb565_to_png.py --width W --height H in.raw out.png` |
+| YUV422 | `python3 scripts/yuv422_to_png.py --width W --height H in.raw out.png` |
+| Y8 | `python3 scripts/y8_to_png.py --width W --height H in.raw out.png` |
+| JPEG | none needed (open the `.jpg` directly) |
+
+`camera save` / `camera capture` print the right conversion command for the current mode.
+
+### SDRAM budget
+
+`cam_frame` is sized for the largest fixed format, WVGA RGB565 (768,000 B), as one contiguous region (also the JPEG budget buffer); the stream ring is a 256 KB slot (holding 480x272 RGB565) × 4 = 1 MB. Total `.sdram` is 2.39 MB / 8 MB, guarded by a linker `ASSERT(_esdram-_ssdram <= 0x800000)`.
+
 ## Continuous capture (streaming, #46)
 
 Where `camera capture` takes a single snapshot (`DCMI_MODE_SNAPSHOT` + `DMA_NORMAL`), `camera stream` captures continuously with **DCMI continuous + DMA double-buffer (DBM)**. Captured frames flow into the [frame pipeline](../architecture/frame-pipeline.md) (one source → many sinks, #47); the primary #46 deliverable is a display-independent **FPS / overrun measurement**. LTDC display and burst saving plug in later as sinks.
@@ -217,7 +284,7 @@ camera stream stats                                   FPS / frames / overruns
 
 ### GUIX live preview (#56)
 
-`gui camera on` attaches a GUIX push sink to this streaming pipeline and shows the QVGA frames **at native scale** on the LTDC (GUIX) screen. While the preview owns the stream, `camera stream start/stop` are refused. See [GUIX › Camera live preview](../rtos/guix.md#camera-live-preview-56) for details.
+`gui camera on` attaches a GUIX push sink to this streaming pipeline and shows the QVGA frames **at native scale** on the LTDC (GUIX) screen. Preview **forces QVGA RGB565** (`camera_preview_start` calls `camera_set_format_locked(QVGA,RGB565)` under the same lock), so it always matches the #56 sink (QVGA RGB565 only) regardless of the last `camera res/format` (the mode is left at QVGA RGB565 afterwards). While the preview owns the stream, `camera stream start/stop` and `camera res/format` are refused. See [GUIX › Camera live preview](../rtos/guix.md#camera-live-preview-56) for details.
 
 ## References
 

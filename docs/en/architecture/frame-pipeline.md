@@ -239,7 +239,14 @@ slot is not recycled mid-copy); a multi-call reader (row-by-row save) compares
   master reaches the FMC).
 - **DMA NDTR <= 65535**: QVGA (38400 words) fits a single transfer; VGA and above
   need band splitting / DBM (a #45/#46 producer-internal concern; `frame_desc`
-  and the ring are unchanged).
+  and the ring are unchanged).  **Implemented in #45**: snapshot covers every
+  resolution via `HAL_DCMI_Start_DMA` intra-frame banding; streaming is limited
+  to modes with `frame_words <= 65535` (the producer's manual DBM points each
+  M-register at a whole slot via NDTR), the ring slot stride is a fixed 256 KB
+  holding the largest streamable frame, and `frame_pipeline_init` is passed the
+  current mode's `frame_bytes` as slot_size (over a fixed 1 MB backing).  JPEG is
+  snapshot-only.  `frame_pipeline_publish` does not check `bytes <= slot_size`, so
+  the producer asserts that bound.
 - **DCMI mode**: snapshot auto-stops (today); continuous uses DBM/circular (#46).
   The inactive DBM `M0AR/M1AR` is repointed at the next free slot in the
   transfer-complete callback to form an N-slot ring (RM0385 8.3.10).  The

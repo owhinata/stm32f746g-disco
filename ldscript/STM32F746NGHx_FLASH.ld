@@ -195,6 +195,11 @@ SECTIONS
     _esdram = .;
   } >SDRAM
 
+  /* Guard against a future .sdram resident overflowing the 8 MB bank (issue #45
+   * grows the camera frame/ring buffers).  >SDRAM already errors on overflow,
+   * but this makes the intent and the headroom explicit. */
+  ASSERT(_esdram - _ssdram <= 0x800000, ".sdram exceeds the 8 MB SDRAM bank")
+
   /* Make sure there is room left for the heap and stack */
   ._user_heap_stack :
   {

@@ -161,10 +161,81 @@ static struct camera_settings settings = {
    so the cache and the sensor never silently diverge. */
 static int settings_dirty;
 
-/* Frame buffer in external SDRAM (.sdram: NOLOAD, MPU non-cacheable, #40).
-   DMA-written by DCMI, CPU-read by camera_frame_read -- coherent with no
+/* ---- capture mode: resolution / pixel format / fps (issue #45) ----------- */
+/*
+ * The single source of truth for the live capture geometry/format/timing.  The
+ * snapshot/stream paths read it instead of the old fixed CAMERA_FRAME_* macros;
+ * camera_set_format() re-programs the sensor and updates it.  Defaults to the
+ * power-on QVGA RGB565 mode so the driver behaves exactly as before #45 until a
+ * mode switch.  Timing (hts/vts/pclk) is the OV5640 common-table reality at
+ * power-on; the fps table (mode_fps[]) overrides it on a set_format. */
+static struct camera_mode mode = {
+	.res = CAM_RES_QVGA, .format = CAM_FMT_RGB565,
+	.hts = 1600u, .vts = 1000u, .pclk_hz = 24000000u,   /* QVGA fps-table base */
+};
+
+/* Pure geometry per resolution (independent of format/timing). */
+static const uint16_t res_wh[CAM_RES__COUNT][2] = {
+	{ 160u, 120u },   /* QQVGA   */
+	{ 320u, 240u },   /* QVGA    */
+	{ 480u, 272u },   /* 480x272 */
+	{ 640u, 480u },   /* VGA     */
+	{ 800u, 480u },   /* WVGA    */
+};
+
+/* JPEG single-shot capture budget: <= 65535 words so HAL_DCMI_Start_DMA runs a
+   plain (non-banded) DMA and the valid length is simply budget - NDTR (#45). */
+#define CAM_JPEG_BUDGET_WORDS  65535u
+#define CAM_JPEG_BUDGET_BYTES  (CAM_JPEG_BUDGET_WORDS * 4u)
+
+static uint32_t fmt_bytes_per_pixel(uint8_t fmt)
+{
+	switch (fmt) {
+	case CAM_FMT_RGB565:
+	case CAM_FMT_YUV422: return 2u;
+	case CAM_FMT_Y8:     return 1u;
+	default:             return 0u;   /* JPEG: variable */
+	}
+}
+
+/* Recompute the geometry-derived fields after a res/format change.  Timing
+   (hts/vts/pclk_hz) is set separately from the fps table; fps_target_x10 is the
+   theoretical target pclk/(hts*vts), not a measured rate. */
+static void mode_recompute(struct camera_mode *m)
+{
+	m->width  = res_wh[m->res][0];
+	m->height = res_wh[m->res][1];
+	m->is_jpeg = (m->format == CAM_FMT_JPEG) ? 1u : 0u;
+	m->bytes_per_pixel = (uint8_t)fmt_bytes_per_pixel(m->format);
+	if (m->is_jpeg) {
+		m->frame_bytes = CAM_JPEG_BUDGET_BYTES;
+		m->frame_words = CAM_JPEG_BUDGET_WORDS;
+		m->streamable  = 0u;        /* JPEG is snapshot-only */
+	} else {
+		/* All supported (even-width, even-height) raster modes give a frame_bytes
+		   that is a multiple of 4, so frame_words = frame_bytes/4 is exact and the
+		   HAL banding splits evenly -- keep that invariant if a mode is added. */
+		m->frame_bytes = (uint32_t)m->width * m->height * m->bytes_per_pixel;
+		m->frame_words = m->frame_bytes / 4u;
+		m->streamable  = (m->frame_words <= 65535u) ? 1u : 0u;
+	}
+	if (m->hts != 0u && m->vts != 0u)
+		m->fps_target_x10 = (uint16_t)((uint64_t)m->pclk_hz * 10u /
+		                               ((uint32_t)m->hts * m->vts));
+	else
+		m->fps_target_x10 = 0u;
+}
+
+/* Largest fixed-format snapshot frame = WVGA RGB565 (800x480x2).  cam_frame is
+   sized for it (one contiguous region, required by the HAL intra-frame banding)
+   and also serves as the JPEG capture budget buffer (<= CAM_JPEG_BUDGET_BYTES).
+   The active mode uses a prefix; the rest is unused slack (#45). */
+#define CAM_FRAME_MAX_BYTES  (800u * 480u * 2u)   /* 768000, 32-aligned */
+
+/* Snapshot frame buffer in external SDRAM (.sdram: NOLOAD, MPU non-cacheable,
+   #40).  DMA-written by DCMI, CPU-read by camera_frame_read -- coherent with no
    cache maintenance because the region never allocates cache lines. */
-static uint16_t cam_frame[CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT]
+static uint8_t cam_frame[CAM_FRAME_MAX_BYTES]
 	__attribute__((aligned(32), section(".sdram")));
 
 /* ---- streaming (issue #46): DCMI continuous + DMA double-buffer ---------- */
@@ -186,7 +257,13 @@ static uint16_t cam_frame[CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT]
 #define CAM_PRODUCER_TICK  10u     /* bounded sem wait so --secs/stop fire even
                                       when no frames arrive (sync lost), ms      */
 
-static uint8_t cam_ring[CAM_RING_N][CAMERA_FRAME_BYTES]
+/* Ring slot stride = the largest *streamable* frame (frame_words <= 65535, i.e.
+   <= 262140 B): 480x272 RGB565 = 261120 B is the largest, rounded up to 256 KB.
+   Streaming is gated to modes that fit this (stream_start_locked); snapshot of
+   bigger modes uses cam_frame, not the ring.  Ring = 4 x 256 KB = 1 MB (#45). */
+#define CAM_RING_SLOT_CAP  (256u * 1024u)         /* 262144, >= 480x272 RGB565 */
+
+static uint8_t cam_ring[CAM_RING_N][CAM_RING_SLOT_CAP]
 	__attribute__((aligned(32), section(".sdram")));
 
 static struct frame_pipeline cam_pipe;
@@ -267,6 +344,100 @@ static int32_t cam_io_read(uint16_t addr, uint16_t reg, uint8_t *data,
 	return OV5640_OK;
 }
 
+/* ---- mode timing / DCMI helpers (issue #45) ------------------------------ */
+
+/* Toggle the DCMI hardware JPEG mode.  JPEGMode latches at HAL_DCMI_Init, so a
+   switch needs a DeInit/Init with the new value; the cached hdcmi.Init keeps the
+   sync/polarity/EDM config, and the DMA link + NVIC are restored after.  Only
+   called under cam_lock with no capture in flight (stream/preview gate). */
+static int dcmi_set_jpeg(int on)
+{
+	if (HAL_DCMI_DeInit(&hdcmi) != HAL_OK)
+		return -1;
+	hdcmi.Init.JPEGMode = on ? DCMI_JPEG_ENABLE : DCMI_JPEG_DISABLE;
+	if (HAL_DCMI_Init(&hdcmi) != HAL_OK)
+		return -1;
+	__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
+	return 0;
+}
+
+static int read_reg_u16(uint16_t reg_hi, uint16_t reg_lo, uint16_t *out)
+{
+	uint8_t hi, lo;
+
+	if (cam_io_read(CAM_I2C_ADDR, reg_hi, &hi, 1) != OV5640_OK ||
+	    cam_io_read(CAM_I2C_ADDR, reg_lo, &lo, 1) != OV5640_OK)
+		return -1;
+	*out = (uint16_t)(((uint16_t)hi << 8) | lo);
+	return 0;
+}
+
+static int write_hts_vts(uint16_t hts, uint16_t vts)
+{
+	uint8_t b;
+
+	b = (uint8_t)(hts >> 8);
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_TIMING_HTS_HIGH, &b, 1) != OV5640_OK)
+		return -1;
+	b = (uint8_t)hts;
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_TIMING_HTS_LOW, &b, 1) != OV5640_OK)
+		return -1;
+	b = (uint8_t)(vts >> 8);
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_TIMING_VTS_HIGH, &b, 1) != OV5640_OK)
+		return -1;
+	b = (uint8_t)vts;
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_TIMING_VTS_LOW, &b, 1) != OV5640_OK)
+		return -1;
+	return 0;
+}
+
+/* AEC needs VTS to cover the max exposure (in lines) or frames clip / band.  The
+   OV5640 holds two max-exposure pairs (0x3A02/03 and 0x3A14/15, default 0x3D8 =
+   984; night mode raises BOTH to ~0x0B88).  Write the mode's HTS and an effective
+   VTS = max(mode.vts base, max exposure + margin) so the auto-exposure always has
+   room, and refresh the live fps target.  mode.vts stays the fps-table base, so
+   turning night mode off drops the effective VTS back to the table value.  Caller
+   holds cam_lock and the sensor is configured. */
+#define CAM_VTS_EXP_MARGIN  16u
+static int apply_vts_locked(void)
+{
+	uint16_t e1, e2, eff;
+
+	if (read_reg_u16(OV5640_AEC_CTRL02, OV5640_AEC_CTRL03, &e1) != 0 ||
+	    read_reg_u16(OV5640_AEC_MAX_EXPO_HIGH, OV5640_AEC_MAX_EXPO_LOW, &e2) != 0)
+		return -1;
+	eff = (uint16_t)((e1 > e2 ? e1 : e2) + CAM_VTS_EXP_MARGIN);
+	if (eff < mode.vts)
+		eff = mode.vts;
+	if (write_hts_vts(mode.hts, eff) != 0)
+		return -1;
+	if (mode.hts != 0u && eff != 0u)
+		mode.fps_target_x10 = (uint16_t)((uint64_t)mode.pclk_hz * 10u /
+		                                 ((uint32_t)mode.hts * eff));
+	return 0;
+}
+
+/* Reset the mode descriptor to the power-on QVGA RGB565 default (common-table
+   timing) and put the DCMI back to raster.  A power cycle / re-probe / failed
+   mode switch returns here, so mode / sensor / DCMI stay mutually consistent. */
+static void mode_reset_default(void)
+{
+	struct camera_mode d = {
+		.res = CAM_RES_QVGA, .format = CAM_FMT_RGB565,
+		.hts = 1600u, .vts = 1000u, .pclk_hz = 24000000u,   /* QVGA fps-table */
+	};
+
+	if (hdcmi.Init.JPEGMode == DCMI_JPEG_ENABLE)
+		(void)dcmi_set_jpeg(0);
+	/* Invalidate the lib's init cache too: OV5640_Init only re-writes the common
+	   table / resolution / format while IsInitialized == 0 (ov5640.c sticky
+	   guard), so without this a re-configure after a power cycle / failed switch
+	   would be a no-op and leave the sensor unprogrammed (mode/sensor mismatch). */
+	ov5640.IsInitialized = 0U;
+	mode_recompute(&d);
+	mode = d;
+}
+
 /* ---- power + probe (locked helpers) -------------------------------------- */
 
 static void power_off_locked(void)
@@ -276,7 +447,13 @@ static void power_off_locked(void)
 	info.powered     = 0;
 	info.configured  = 0;
 	info.frame_valid = 0;
+	info.frame_bytes = 0;
 	cam_colorbar     = -1;
+	/* The sensor lost power: any selected mode no longer matches it, so reset
+	   the descriptor (and the DCMI JPEG state) to the QVGA RGB565 default that
+	   the next lazy OV5640_Init will program -- keeps mode / sensor / DCMI
+	   consistent across a power cycle (#45). */
+	mode_reset_default();
 }
 
 /* PH13 high 100 ms -> low, then settle: the H747I BSP HwReset timing for the
@@ -297,7 +474,9 @@ static int camera_probe_locked(uint32_t *chip_id)
 	power_cycle_locked();
 	info.configured  = 0;
 	info.frame_valid = 0;
+	info.frame_bytes = 0;
 	cam_colorbar     = -1;   /* power cycle reset the sensor registers */
+	mode_reset_default();    /* sensor is back at power-on defaults (#45) */
 
 	/* OV5640_ReadID software-resets the sensor and waits 500 ms (GetTick
 	   poll) before reading 0x300A/0x300B. */
@@ -460,6 +639,25 @@ io_err:
 	return CAM_ERR_HAL;
 }
 
+/* Apply the cached quality settings AND refresh the exposure-aware VTS in one
+   shot: every settings application can change night mode, which raises the AEC
+   max exposure, so the VTS clamp must run right after (otherwise a live `camera
+   set night on` starves the auto-exposure at the fps-table VTS).  Caller holds
+   cam_lock with the sensor configured and the mode committed. */
+static int settings_and_timing_apply_locked(void)
+{
+	int rc = settings_apply_all_locked();   /* clears settings_dirty on success */
+
+	if (rc != 0)
+		return rc;
+	rc = apply_vts_locked();
+	if (rc != 0)
+		settings_dirty = 1;   /* SDE applied but timing not: re-arm so the next
+		                         configure re-applies settings AND re-clamps VTS,
+		                         keeping the night-mode AEC / VTS pairing intact */
+	return rc;
+}
+
 /* Apply now if the sensor is live; otherwise the cache is enough.  Cache-only
    when not configured (the next capture's lazy configure re-applies it after
    OV5640_Init wipes the SDE block) or while the colorbar test pattern is up
@@ -468,7 +666,7 @@ static int apply_if_live_locked(void)
 {
 	if (!info.configured || cam_colorbar != 0)
 		return 0;
-	return settings_apply_all_locked();
+	return settings_and_timing_apply_locked();
 }
 
 /* ---- capture (locked helpers, issue #41) ---------------------------------- */
@@ -514,7 +712,7 @@ static int camera_configure_locked(int colorbar)
 		   it there.  cam_colorbar is committed only after a successful apply
 		   so a failed apply re-runs this block on the next capture. */
 		if (!colorbar) {
-			int rc = settings_apply_all_locked();
+			int rc = settings_and_timing_apply_locked();
 
 			if (rc != 0)
 				return rc;
@@ -526,12 +724,208 @@ static int camera_configure_locked(int colorbar)
 	   the sensor matches the cache.  Skipped in colorbar mode -- quality is
 	   irrelevant there and would disturb the test pattern's SDE_CTRL4. */
 	if (!colorbar && settings_dirty) {
-		int rc = settings_apply_all_locked();
+		int rc = settings_and_timing_apply_locked();
 
 		if (rc != 0)
 			return rc;
 	}
 	return 0;
+}
+
+/* ---- mode switch: resolution / pixel format / fps (issue #45) ------------- */
+
+/*
+ * Per-resolution fps table.  fps = pclk_hz / (hts * vts).  ALL modes stay on the
+ * common-table 24 MHz PCLK: pushing PCLK to 48 MHz (for ~30 fps) doubles the
+ * peak DCMI burst rate and overruns the 16-bit SDRAM the instant the LTDC also
+ * reads it (the GUIX preview dies with a DCMI overrun) -- that bandwidth fight is
+ * issue #59.  Here we only tighten HTS/VTS on the streamable small modes for a
+ * safe ~15 fps (same peak rate as the proven 11 fps preview, just less blanking);
+ * VGA/WVGA keep the full common timing (snapshot-only, frame rate irrelevant).
+ * VTS is the BASE: apply_vts_locked() raises the effective VTS when the AEC max
+ * exposure needs more lines and drops it back to this base otherwise.  Tune
+ * against on-hardware `camera stream stats` (30 fps belongs to #59).
+ */
+static const struct {
+	uint16_t hts;
+	uint16_t vts;
+	uint8_t  ov_pclk;     /* OV5640_PCLK_* */
+	uint32_t pclk_hz;
+} mode_fps[CAM_RES__COUNT] = {
+	[CAM_RES_QQVGA]   = { 1600u, 1000u, OV5640_PCLK_24M, 24000000u },
+	[CAM_RES_QVGA]    = { 1600u, 1000u, OV5640_PCLK_24M, 24000000u },
+	[CAM_RES_480x272] = { 1600u, 1000u, OV5640_PCLK_24M, 24000000u },
+	[CAM_RES_VGA]     = { 1936u, 1088u, OV5640_PCLK_24M, 24000000u },
+	[CAM_RES_WVGA]    = { 1936u, 1088u, OV5640_PCLK_24M, 24000000u },
+};
+
+static uint32_t res_to_ov(uint8_t r)
+{
+	switch (r) {
+	case CAM_RES_QQVGA:   return OV5640_R160x120;
+	case CAM_RES_480x272: return OV5640_R480x272;
+	case CAM_RES_VGA:     return OV5640_R640x480;
+	case CAM_RES_WVGA:    return OV5640_R800x480;
+	default:              return OV5640_R320x240;   /* QVGA */
+	}
+}
+
+static uint32_t fmt_to_ov(uint8_t f)
+{
+	switch (f) {
+	case CAM_FMT_YUV422: return OV5640_YUV422;
+	case CAM_FMT_Y8:     return OV5640_Y8;
+	case CAM_FMT_JPEG:   return OV5640_JPEG;
+	default:             return OV5640_RGB565;
+	}
+}
+
+/* Map the port-neutral format to the pipeline's frame_format (for publish). */
+static enum frame_format fmt_to_frame(uint8_t f)
+{
+	switch (f) {
+	case CAM_FMT_YUV422: return FRAME_FMT_YUV422;
+	case CAM_FMT_Y8:     return FRAME_FMT_Y8;
+	case CAM_FMT_JPEG:   return FRAME_FMT_JPEG;
+	default:             return FRAME_FMT_RGB565;
+	}
+}
+
+/*
+ * Switch the live resolution / pixel format and apply the per-mode fps timing.
+ * Refused while streaming/preview owns the DCMI (the ring is a live target).
+ * On any I/O failure the sensor is marked unconfigured and the mode is reset to
+ * the QVGA RGB565 default, so a half-applied sensor/DCMI state never persists --
+ * the next capture full-re-inits to a state that matches the descriptor (#45).
+ * cam_lock held by the caller.
+ */
+static int camera_set_format_locked(uint8_t res, uint8_t fmt)
+{
+	struct camera_mode m;
+	int jpeg = (fmt == CAM_FMT_JPEG);
+	int rc;
+
+	if (cam_stream_active || cam_ext_sink != NULL)
+		return CAM_ERR_STATE;          /* streaming/preview owns the DCMI/DMA */
+	if (!sdram_is_up())
+		return CAM_ERR_STATE;
+	if (res >= CAM_RES__COUNT || fmt >= CAM_FMT__COUNT)
+		return CAM_ERR_PARAM;
+	if (jpeg && res > CAM_RES_VGA)
+		return CAM_ERR_PARAM;          /* JPEG is snapshot-only, gated <= VGA */
+
+	/* Candidate mode: geometry from res + timing from the fps table.  Validate
+	   capacity before touching the sensor. */
+	m = (struct camera_mode){ .res = res, .format = fmt,
+	    .hts = mode_fps[res].hts, .vts = mode_fps[res].vts,
+	    .pclk_hz = mode_fps[res].pclk_hz };
+	mode_recompute(&m);
+	if (m.frame_bytes > CAM_FRAME_MAX_BYTES)
+		return CAM_ERR_PARAM;
+
+	if (!info.powered) {
+		rc = camera_probe_locked(NULL);
+		if (rc != 0)
+			return rc;
+	}
+
+	/* A JPEG <-> raster change cannot be applied incrementally: the lib's
+	   OV5640_SetPixelFormat SETS the JPEG datapath bits (TIMING_TC_REG21 /
+	   SYSREM_RESET02 / CLOCK_ENABLE02) but never clears them, so a raster capture
+	   after a JPEG one wedges (no sync -> timeout).  Force a clean sensor re-init:
+	   clearing IsInitialized lets OV5640_Init re-run the common table, whose first
+	   write is a software reset (SYSTEM_CTROL0=0x82) that restores those bits.
+	   Toggle the DCMI JPEGMode to match. */
+	if (jpeg != (int)mode.is_jpeg) {
+		ov5640.IsInitialized = 0U;
+		info.configured = 0;
+		if (dcmi_set_jpeg(jpeg) != 0) {
+			LOG_ERR("DCMI JPEG re-init failed");
+			goto fail;
+		}
+	}
+
+	if (!info.configured) {
+		if (OV5640_Init(&ov5640, OV5640_R320x240, OV5640_RGB565) != OV5640_OK) {
+			LOG_ERR("OV5640_Init failed");
+			goto fail;
+		}
+		info.configured = 1;
+		tx_thread_sleep(CAM_SETTLE_INIT_MS);
+	}
+
+	if (OV5640_SetResolution(&ov5640, res_to_ov(res)) != OV5640_OK)
+		goto fail;
+	if (OV5640_SetPixelFormat(&ov5640, fmt_to_ov(fmt)) != OV5640_OK)
+		goto fail;
+	if (OV5640_SetPCLK(&ov5640, mode_fps[res].ov_pclk) != OV5640_OK)
+		goto fail;
+
+	/* Commit the base mode now: the quality re-apply + timing below needs the
+	   committed mode (ZoomConfig reads the new DVPHO/DVPVO, night mode rewrites
+	   AEC, and apply_vts writes the effective VTS from mode.hts/vts).  A failure
+	   after this lands in the fail path, which resets to the default. */
+	mode = m;
+	rc = settings_and_timing_apply_locked();   /* SDE settings + HTS/VTS clamp */
+	if (rc != 0)
+		goto fail;
+
+	info.frame_valid = 0;              /* geometry changed: old frame is stale */
+	info.frame_bytes = 0;
+	cam_colorbar     = -1;             /* next capture re-establishes live/colorbar */
+	tx_thread_sleep(CAM_SETTLE_MODE_MS);
+	return 0;
+
+fail:
+	/* Consistent fallback: mode + DCMI reset to the QVGA RGB565 default and the
+	   sensor flagged for re-init, so a half-applied sensor/DCMI/mode state never
+	   persists -- the next capture re-programs to a state matching the descriptor. */
+	info.configured  = 0;
+	info.frame_valid = 0;
+	info.frame_bytes = 0;
+	cam_colorbar     = -1;
+	mode_reset_default();
+	LOG_ERR("camera_set_format(res=%u fmt=%u) failed", (unsigned)res,
+	        (unsigned)fmt);
+	return CAM_ERR_HAL;
+}
+
+/* Rebuild the DMA stream after an aborted snapshot.  A VGA/WVGA snapshot runs
+   the HAL intra-frame banding path, which sets CR.DBM; a normal completion
+   self-heals (the next Start clears or re-sets DBM as needed), but an aborted
+   banded transfer (timeout / DCMI error) can leave DBM/CT stale, so re-init the
+   stream to a clean DMA_NORMAL state for the next capture (#45 R8). */
+static void snapshot_dma_reinit(void)
+{
+	(void)HAL_DMA_DeInit(&hdma_dcmi);
+	(void)HAL_DMA_Init(&hdma_dcmi);
+	__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
+}
+
+/* Determine the valid length of a JPEG snapshot.  @p eff_bytes is how many bytes
+   the DMA actually wrote (budget - NDTR, in bytes); the real stream is shorter
+   because the DCMI zero-pads the last 32-bit word.  Verify the SOI (0xFFD8) at
+   the start and scan backward within eff_bytes for the EOI marker (0xFFD9),
+   setting info.frame_bytes to EOI+2.  No EOI -> the frame was truncated.  Only
+   the captured range is scanned (the .sdram buffer is NOLOAD: it can hold an
+   older/garbage tail beyond eff_bytes). */
+static int jpeg_finalize_locked(uint32_t eff_bytes)
+{
+	uint32_t i;
+
+	if (eff_bytes < 4u ||
+	    cam_frame[0] != 0xFFu || cam_frame[1] != 0xD8u) {
+		LOG_ERR("JPEG SOI missing (eff=%lu)", (unsigned long)eff_bytes);
+		return CAM_ERR_HAL;
+	}
+	for (i = eff_bytes; i >= 2u; i--) {
+		if (cam_frame[i - 2u] == 0xFFu && cam_frame[i - 1u] == 0xD9u) {
+			info.frame_bytes = i;          /* include the EOI marker */
+			return 0;
+		}
+	}
+	LOG_ERR("JPEG EOI missing (truncated, eff=%lu)", (unsigned long)eff_bytes);
+	return CAM_ERR_HAL;
 }
 
 static int camera_capture_locked(int colorbar)
@@ -570,12 +964,20 @@ static int camera_capture_locked(int colorbar)
 	__HAL_DCMI_CLEAR_FLAG(&hdcmi, DCMI_FLAG_ERRRI | DCMI_FLAG_OVRRI |
 	                              DCMI_FLAG_FRAMERI | DCMI_FLAG_LINERI |
 	                              DCMI_FLAG_VSYNCRI);
-	__HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_ERR | DCMI_IT_OVR);
+	/* JPEG is a variable-length frame: the DMA never completes (the budget
+	   exceeds the stream), so the DMA-complete path that arms the FRAME
+	   interrupt for a raster snapshot never runs.  Enable FRAME explicitly so the
+	   hardware end-of-frame (RM0385 17.4) still wakes us. */
+	__HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_ERR | DCMI_IT_OVR |
+	                             (mode.is_jpeg ? DCMI_IT_FRAME : 0u));
 
-	/* Single transfer: 38400 words <= 65535 NDTR, no double buffering.  No
-	   cache maintenance -- cam_frame is in the MPU non-cacheable SDRAM. */
+	/* One contiguous transfer of mode.frame_words.  QVGA = 38400 words runs a
+	   plain single DMA; VGA/WVGA exceed 65535 words and HAL_DCMI_Start_DMA
+	   transparently bands them (intra-frame DBM into this one buffer), firing
+	   FRAME once at the end either way.  No cache maintenance -- cam_frame is in
+	   the MPU non-cacheable SDRAM. */
 	if (HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)cam_frame,
-	                       CAMERA_FRAME_BYTES / 4u) != HAL_OK) {
+	                       mode.frame_words) != HAL_OK) {
 		cam_xfer_active = 0;
 		(void)HAL_DCMI_Stop(&hdcmi);
 		drain_done();
@@ -584,9 +986,21 @@ static int camera_capture_locked(int colorbar)
 		return CAM_ERR_HAL;
 	}
 
+	/* The banded (>64 KB) path goes through HAL_DMAEx_MultiBufferStart_IT, which
+	   -- unlike the single-transfer HAL_DMA_Start_IT -- enables the DMA FIFO/direct
+	   -mode error interrupts.  Under SDRAM contention these FE/DME fire and HAL's
+	   DCMI_DMAError aborts the whole snapshot, so VGA/WVGA captures spuriously fail
+	   with CAM_ERR_HAL.  Per RM0385 8.5.5 FE/DME do NOT stop the stream, so silence
+	   them; a real transfer error (TE) and the DCMI overrun/sync error (DCMI_IT_OVR
+	   /ERR) stay terminal.  Harmless on the single-transfer path: FE is off there,
+	   and DME (enabled by HAL_DMA_Start_IT too) is benign to silence for a snapshot. */
+	__HAL_DMA_DISABLE_IT(&hdma_dcmi, DMA_IT_FE);
+	__HAL_DMA_DISABLE_IT(&hdma_dcmi, DMA_IT_DME);
+
 	if (tx_semaphore_get(&cam_done, CAM_XFER_TIMEOUT_TICKS) != TX_SUCCESS) {
 		cam_xfer_active = 0;
 		(void)HAL_DCMI_Stop(&hdcmi);
+		snapshot_dma_reinit();   /* clear any stale banding DBM/CT */
 		drain_done();
 		LOG_ERR("frame timed out (no DCMI sync? check wiring)");
 		return CAM_ERR_TIMEOUT;
@@ -595,15 +1009,33 @@ static int camera_capture_locked(int colorbar)
 
 	if (cam_xfer_err) {
 		(void)HAL_DCMI_Stop(&hdcmi);
+		snapshot_dma_reinit();   /* clear any stale banding DBM/CT */
 		drain_done();
 		LOG_ERR("capture error (HAL err 0x%lx)",
 		        (unsigned long)HAL_DCMI_GetError(&hdcmi));
 		return CAM_ERR_HAL;
 	}
 
-	/* Snapshot auto-cleared CAPTURE; Stop also disables the DCMI and leaves
-	   the HAL in a clean READY state for the next capture. */
+	/* Snapshot auto-cleared CAPTURE; Stop also disables the DCMI, aborts the DMA
+	   and leaves the HAL in a clean READY state for the next capture. */
 	(void)HAL_DCMI_Stop(&hdcmi);
+
+	if (mode.is_jpeg) {
+		/* The DMA was aborted mid-stream by Stop; NDTR holds the untransferred
+		   word count, so (budget - NDTR) words were written.  Read it AFTER Stop
+		   (not before -- the abort flushes the FIFO and settles NDTR), then trim
+		   to the JPEG EOI. */
+		uint32_t ndtr = __HAL_DMA_GET_COUNTER(&hdma_dcmi);
+		uint32_t eff  = (mode.frame_words - ndtr) * 4u;
+
+		rc = jpeg_finalize_locked(eff);
+		if (rc != 0) {
+			info.frame_valid = 0;
+			return rc;
+		}
+	} else {
+		info.frame_bytes = mode.frame_bytes;   /* raster: full frame valid */
+	}
 	cam_frame_gen++;        /* new pixels: multi-call readers must notice */
 	info.frame_valid = 1;
 	return 0;
@@ -621,15 +1053,23 @@ int camera_capture(int colorbar)
 	return rc;
 }
 
+int camera_set_format(enum camera_res res, enum camera_format fmt)
+{
+	int rc = op_lock();
+
+	if (rc != 0)
+		return rc;
+	rc = camera_set_format_locked((uint8_t)res, (uint8_t)fmt);
+	op_unlock();
+	return rc;
+}
+
 int camera_frame_read(uint32_t offset, void *dst, uint32_t len,
                       uint32_t *gen)
 {
 	int rc;
 
 	if (dst == NULL || len == 0u)
-		return CAM_ERR_PARAM;
-	/* Subtraction form: offset + len cannot wrap. */
-	if (offset >= CAMERA_FRAME_BYTES || len > CAMERA_FRAME_BYTES - offset)
 		return CAM_ERR_PARAM;
 
 	rc = op_lock();
@@ -638,6 +1078,14 @@ int camera_frame_read(uint32_t offset, void *dst, uint32_t len,
 	if (!info.frame_valid) {
 		op_unlock();
 		return CAM_ERR_NO_FRAME;
+	}
+	/* Bound against the captured frame's valid length under the lock: the live
+	   mode (hence the valid byte count, and for JPEG the trimmed stream length)
+	   can change between captures.  Subtraction form so offset+len cannot wrap. */
+	if (offset >= info.frame_bytes ||
+	    len > info.frame_bytes - offset) {
+		op_unlock();
+		return CAM_ERR_PARAM;
 	}
 	memcpy(dst, (const uint8_t *)cam_frame + offset, len);
 	if (gen != NULL)
@@ -697,6 +1145,20 @@ int camera_get_info(struct camera_info *out)
 	if (rc != 0)
 		return rc;
 	*out = info;
+	op_unlock();
+	return 0;
+}
+
+int camera_get_mode(struct camera_mode *out)
+{
+	int rc;
+
+	if (out == NULL)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	*out = mode;
 	op_unlock();
 	return 0;
 }
@@ -888,10 +1350,10 @@ static const struct frame_os cam_pipe_os = {
 static int cam_stat_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t h)
 {
 	(void)ctx;
-	if (fmt != FRAME_FMT_RGB565 || w != CAMERA_FRAME_WIDTH ||
-	    h != CAMERA_FRAME_HEIGHT)
-		return -1;
-	return 0;
+	(void)fmt;
+	(void)w;
+	(void)h;
+	return 0;   /* counting sink: accepts whatever the producer publishes (#45) */
 }
 
 static int cam_stat_consume(void *ctx, const struct frame_desc *f)
@@ -1026,10 +1488,11 @@ static void cam_stream_service(int had_sem)
 				        (uint32_t)freed->data, MEMORY1);
 				cam_m1 = freed;
 			}
-			frame_pipeline_publish(&cam_pipe, done, CAMERA_FRAME_BYTES,
-			                       FRAME_FMT_RGB565, CAMERA_FRAME_WIDTH,
-			                       CAMERA_FRAME_HEIGHT,
-			                       CAMERA_FRAME_WIDTH * 2u);
+			frame_pipeline_publish(&cam_pipe, done, mode.frame_bytes,
+			                       fmt_to_frame(mode.format), mode.width,
+			                       mode.height,
+			                       (uint16_t)(mode.width *
+			                                  mode.bytes_per_pixel));
 			published = 1;
 		}
 		/* freed == NULL: no free slot, drop (do not publish); the M-reg keeps
@@ -1078,16 +1541,30 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 		if (rc != 0)
 			return rc;
 	}
+	/* A streamed frame must fit one DMA NDTR (frame_words <= 65535) and one ring
+	   slot; bigger modes and JPEG are snapshot-only (mode.streamable is 0).  The
+	   ring backing is fixed at CAM_RING_N * CAM_RING_SLOT_CAP, so re-check the
+	   slot bound here -- frame_pipeline_publish() does not validate bytes <=
+	   slot_size (#45). */
+	if (!mode.streamable)
+		return CAM_ERR_STATE;
+	if (mode.frame_bytes > CAM_RING_SLOT_CAP ||
+	    (uint32_t)CAM_RING_N * mode.frame_bytes > sizeof cam_ring)
+		return CAM_ERR_STATE;
+
 	rc = camera_configure_locked(colorbar != 0);
 	if (rc != 0)
 		return rc;
 
-	/* Build the ring + pipeline fresh and attach the counting sink (+ ext). */
+	/* Build the ring + pipeline fresh and attach the counting sink (+ ext).
+	   slot_size is the ring slot STRIDE (CAM_RING_SLOT_CAP), not the frame
+	   length -- the DMA writes mode.frame_bytes into each slot's prefix and
+	   publish() stamps that as the valid length. */
 	if (frame_pipeline_init(&cam_pipe, &cam_pipe_os, cam_ring,
-	                        CAMERA_FRAME_BYTES, CAM_RING_N) != 0)
+	                        CAM_RING_SLOT_CAP, CAM_RING_N) != 0)
 		return CAM_ERR_STATE;
-	frame_pipeline_set_format(&cam_pipe, FRAME_FMT_RGB565,
-	                          CAMERA_FRAME_WIDTH, CAMERA_FRAME_HEIGHT);
+	frame_pipeline_set_format(&cam_pipe, fmt_to_frame(mode.format),
+	                          mode.width, mode.height);
 	if (frame_pipeline_attach(&cam_pipe, &cam_stat_sink) != 0)
 		return CAM_ERR_STATE;
 	if (ext != NULL && frame_pipeline_attach(&cam_pipe, ext) != 0) {
@@ -1129,7 +1606,7 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	if (HAL_DMAEx_MultiBufferStart_IT(&hdma_dcmi,
 	        (uint32_t)&hdcmi.Instance->DR,
 	        (uint32_t)cam_m0->data, (uint32_t)cam_m1->data,
-	        CAMERA_FRAME_BYTES / 4u) != HAL_OK) {
+	        mode.frame_words) != HAL_OK) {
 		cam_stream_active = 0;
 		if (ext != NULL)
 			frame_pipeline_detach(&cam_pipe, ext);
@@ -1178,7 +1655,13 @@ int camera_preview_start(struct frame_sink *s)
 	rc = op_lock();
 	if (rc != 0)
 		return rc;
-	rc = stream_start_locked(0, 0, 0, s);
+	/* Preview forces QVGA RGB565 (the #56 GUIX sink's only accepted geometry)
+	   regardless of the last `camera res/format`.  Same lock: call the locked
+	   helper, never the public camera_set_format (which would re-take cam_lock).
+	   The set_format gate passes because no stream/preview owns the DCMI yet. */
+	rc = camera_set_format_locked(CAM_RES_QVGA, CAM_FMT_RGB565);
+	if (rc == 0)
+		rc = stream_start_locked(0, 0, 0, s);
 	op_unlock();
 	return rc;
 }
@@ -1439,6 +1922,8 @@ int camera_init(void)
 		LOG_ERR("camera producer thread create failed");
 		goto fail_i2c;
 	}
+
+	mode_recompute(&mode);    /* fill geometry/derived fields for the default */
 
 	cam_ready = 1;
 	LOG_INF("I2C1 + DCMI/DMA2-S1 up; sensor I/O is lazy");

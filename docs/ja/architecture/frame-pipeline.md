@@ -157,7 +157,7 @@ publish の deliver 確定も detach も lock 下なので、detach は「確定
 ## ハードウェア根拠
 
 - **メモリ**: リング実体は [`.sdram`](../hardware/sdram.md)（0xC0000000, 8MB, NOLOAD, MPU 非キャッシュ #40）。QVGA RGB565=150KB/面 → N=3 で 450KB、VGA=600KB/面 → N=3 で 1.8MB（8MB に余裕）。**非キャッシュ**ゆえ DCMI-DMA write / CPU read / 将来の LTDC scanout / ETH MAC-DMA いずれも cache maintenance 不要（RM0385 §2.1.10–13 で全 master が FMC へ到達可能）。
-- **DMA NDTR ≤ 65535**: QVGA（38400 word）は単発 OK。VGA 以上は band 分割 / DBM が必須（#45/#46 の producer 内部事情で、`frame_desc` / リング自体は不変）。
+- **DMA NDTR ≤ 65535**: QVGA（38400 word）は単発 OK。VGA 以上は band 分割 / DBM が必須（#45/#46 の producer 内部事情で、`frame_desc` / リング自体は不変）。**#45 実装済**: snapshot は `HAL_DCMI_Start_DMA` の intra-frame banding で全解像度可。streaming は `frame_words ≤ 65535` のモードのみ（producer の手動 DBM が full-slot を NDTR で指すため）で、リングスロットは最大 streamable フレームを内包する 256KB 固定 stride・`frame_pipeline_init` に現モード `frame_bytes` を slot_size として渡す（背後固定 1MB）。JPEG は snapshot-only。`frame_pipeline_publish` は `bytes ≤ slot_size` を検査しないので producer 側で境界 assert。
 - **DCMI モード**: snapshot は自動停止（既存）、continuous は DBM/circular（#46）。DBM の inactive `M0AR/M1AR` を完了コールバックで次の空きスロットへ張り替えて N 面リング化する（RM0385 §8.3.10）。producer は **DBM ポインタ更新を明示所有**し、`HAL_DCMI_Start_DMA(Length>0xFFFF)` の HAL 内部 contiguous DBM 分割パスには乗らない。
 - **割込み / 優先度**: DCMI/DMA2_Stream1 = NVIC prio 8、SysTick 14 > PendSV 15（ThreadX 必須）。ThreadX スレッド優先度は [IWDG](../rtos/iwdg.md) petter 5 / LED 10 / shell 16 / jobs 17 で、producer ≈ 9–12・非同期 sink はその下に置く（watchdog を starve しない）。`tx_semaphore_put` は ISR 安全。
 

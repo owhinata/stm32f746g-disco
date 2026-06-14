@@ -49,18 +49,71 @@ extern "C" {
 #define CAM_ERR_NO_SENSOR -5   /* OV5640 not detected (no module / bad ID)      */
 #define CAM_ERR_NO_FRAME  -6   /* no captured frame available                   */
 
-/* Fixed capture geometry (issue #41): QVGA RGB565, little-endian 16-bit
-   pixels (R5 in bits 15..11, G6 in 10..5, B5 in 4..0). */
+/* Default capture geometry (issue #41): QVGA RGB565, little-endian 16-bit
+   pixels (R5 in bits 15..11, G6 in 10..5, B5 in 4..0).  Issue #45 makes the
+   live geometry variable (struct camera_mode); these remain the power-on
+   default and the QVGA reference used by the snapshot pixel-stat helpers. */
 #define CAMERA_FRAME_WIDTH   320u
 #define CAMERA_FRAME_HEIGHT  240u
 #define CAMERA_FRAME_BYTES   (CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT * 2u)
+
+/* ---- capture mode: resolution / pixel format (issue #45) ----------------- */
+/*
+ * Port-neutral resolution and pixel-format enums (mirror the lib/ov5640
+ * OV5640 resolution / pixel-format constants, the way the quality enums
+ * mirror the SDE controls).  The shell never sees the lib values.  Ceilings:
+ *   - snapshot supports every resolution (DCMI/DMA intra-frame banding);
+ *   - streaming supports a mode only while its frame fits one DMA NDTR
+ *     (frame_words <= 65535); larger modes are capture-only;
+ *   - JPEG is snapshot-only (variable length) and gated to <= VGA.
+ */
+enum camera_res {
+	CAM_RES_QQVGA = 0,  /* 160x120  */
+	CAM_RES_QVGA,       /* 320x240  (power-on default) */
+	CAM_RES_480x272,    /* 480x272  */
+	CAM_RES_VGA,        /* 640x480  */
+	CAM_RES_WVGA,       /* 800x480  */
+	CAM_RES__COUNT
+};
+enum camera_format {
+	CAM_FMT_RGB565 = 0, /* 2 bytes/pixel, little-endian R5G6B5 */
+	CAM_FMT_YUV422,     /* 2 bytes/pixel, packed YUYV          */
+	CAM_FMT_Y8,         /* 1 byte/pixel, greyscale            */
+	CAM_FMT_JPEG,       /* variable length, snapshot-only     */
+	CAM_FMT__COUNT
+	/* RGB888 is intentionally unsupported in #45 (3 bpp, no consumer). */
+};
+
+/**
+ * Live capture mode -- the single source of truth for geometry/format/timing
+ * (owned by the driver; read via camera_get_mode()).  @ref frame_bytes is the
+ * raster size for fixed formats (w*h*bpp) or the JPEG capture-budget capacity;
+ * the JPEG *valid* length comes back through camera_frame_read()'s sizing.
+ */
+struct camera_mode {
+	uint8_t  res;             /* enum camera_res                            */
+	uint8_t  format;          /* enum camera_format                         */
+	uint16_t width;
+	uint16_t height;
+	uint8_t  bytes_per_pixel; /* 2 RGB565/YUV422, 1 Y8, 0 = variable (JPEG) */
+	uint8_t  is_jpeg;
+	uint32_t frame_bytes;     /* raster bytes, or JPEG budget capacity      */
+	uint32_t frame_words;     /* DMA NDTR for fixed formats (frame_bytes/4) */
+	uint16_t hts;             /* OV5640 line total (fps table)              */
+	uint16_t vts;             /* OV5640 frame total (fps table)             */
+	uint32_t pclk_hz;         /* sensor PCLK (fps table)                    */
+	uint16_t fps_target_x10;  /* pclk_hz/(hts*vts) * 10 -- TARGET, not live */
+	uint8_t  streamable;      /* frame_words <= 65535 && !is_jpeg           */
+};
 
 /** Driver state snapshot for the `camera info` command. */
 struct camera_info {
 	uint32_t chip_id;     /* 0x5640 after a successful probe, else 0       */
 	int      powered;     /* PWR_EN asserted and probe succeeded           */
-	int      configured;  /* sensor programmed for QVGA RGB565 capture     */
+	int      configured;  /* sensor programmed for a capture mode          */
 	int      frame_valid; /* a captured frame is in the buffer             */
+	uint32_t frame_bytes; /* valid captured length (#45): raster size, or
+	                         the trimmed JPEG stream length; 0 when none    */
 };
 
 /* ---- quality settings (issue #44) ---------------------------------------- */
@@ -123,6 +176,22 @@ int camera_power_off(void);
 
 /** Fill @p out with the current driver state.  Never touches the sensor. */
 int camera_get_info(struct camera_info *out);
+
+/** Fill @p out with the live capture mode (geometry/format/timing, #45).
+ *  Never touches the sensor. */
+int camera_get_mode(struct camera_mode *out);
+
+/**
+ * Switch the capture resolution and/or pixel format (issue #45).  Re-programs
+ * the OV5640 (resolution/format scalers, the per-mode HTS/VTS/PCLK fps table)
+ * and resizes the live capture geometry.  Refused with CAM_ERR_STATE while a
+ * stream or GUIX preview is active (the ring slots are a live DMA target sized
+ * for the current mode).  Probes/configures the sensor on demand.  On any I/O
+ * failure the mode is left uncommitted and the sensor is marked unconfigured so
+ * the next capture re-programs it from scratch.  Returns 0 or a negative
+ * CAM_ERR_*.
+ */
+int camera_set_format(enum camera_res res, enum camera_format fmt);
 
 /**
  * Capture one QVGA RGB565 frame into the SDRAM frame buffer (DCMI snapshot +
