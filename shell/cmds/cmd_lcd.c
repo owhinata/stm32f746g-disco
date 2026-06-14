@@ -102,6 +102,10 @@ static int lcd_ready(struct cli_instance *sh)
 		cli_error(sh, "lcd: display not initialized\r\n");
 		return 0;
 	}
+	if (ltdc_scanout_off()) {
+		cli_error(sh, "lcd: scanout disabled (run 'lcd enable')\r\n");
+		return 0;
+	}
 	return 1;
 }
 
@@ -136,7 +140,9 @@ static int cmd_lcd_info(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "buffers: 2 (double, tear-free VBR)\r\n");
 	cli_print(sh, "front:   %u\r\n", (unsigned)ltdc_active_buffer());
 	cli_print(sh, "DMA2D:   on\r\n");
-	cli_print(sh, "state:   %s\r\n", ltdc_is_up() ? "up" : "DOWN (init failed)");
+	cli_print(sh, "state:   %s\r\n",
+	          ltdc_scanout_off() ? "disabled (scanout off)"
+	                             : (ltdc_is_up() ? "up" : "DOWN (init failed)"));
 	cli_print(sh, "errors:  underrun=%s transfer=%s\r\n",
 	          (err & LTDC_ERRFLAG_FIFO_UNDERRUN) ? "YES" : "no",
 	          (err & LTDC_ERRFLAG_TRANSFER_ERROR) ? "YES" : "no");
@@ -301,6 +307,30 @@ static int cmd_lcd_off(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+static int cmd_lcd_disable(struct cli_instance *sh, int argc, char **argv)
+{
+	(void)argc;
+	(void)argv;
+	if (ltdc_set_scanout(false) != LTDC_OK) {
+		cli_error(sh, "lcd: cannot disable scanout (display down or owned by gui)\r\n");
+		return 1;
+	}
+	cli_print(sh, "lcd: scanout disabled -- LTDC stopped reading SDRAM\r\n");
+	return 0;
+}
+
+static int cmd_lcd_enable(struct cli_instance *sh, int argc, char **argv)
+{
+	(void)argc;
+	(void)argv;
+	if (ltdc_set_scanout(true) != LTDC_OK) {
+		cli_error(sh, "lcd: cannot enable scanout (display down or owned by gui)\r\n");
+		return 1;
+	}
+	cli_print(sh, "lcd: scanout enabled\r\n");
+	return 0;
+}
+
 CLI_SUBCMD_SET_CREATE(lcd_subcmds,
 	CLI_CMD(info, NULL, "panel / clock / frame buffer / LTDC error flags",
 	        cmd_lcd_info),
@@ -315,6 +345,10 @@ CLI_SUBCMD_SET_CREATE(lcd_subcmds,
 	        cmd_lcd_blit),
 	CLI_CMD(on, NULL, "display-enable + backlight on", cmd_lcd_on),
 	CLI_CMD(off, NULL, "display-enable + backlight off", cmd_lcd_off),
+	CLI_CMD(enable, NULL, "start LTDC scanout (resume SDRAM reads)",
+	        cmd_lcd_enable),
+	CLI_CMD(disable, NULL, "stop LTDC scanout (LTDC stops reading SDRAM)",
+	        cmd_lcd_disable),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(lcd, lcd_subcmds,

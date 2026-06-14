@@ -169,7 +169,8 @@ int ltdc_flip(void);
  * in-flight draw helper (take() blocks until that helper releases the lock). */
 
 /** Take (on=true) or release (on=false) GUIX ownership of the display.  Atomic
- *  with ltdc_lock.  Returns false if the display is down (nothing to own). */
+ *  with ltdc_lock.  Returns false if the display is down/faulted, or (for
+ *  on=true) if scanout is disabled (#66) -- GUIX needs scanout running. */
 bool ltdc_gui_take(bool on);
 
 /** Nonzero while GUIX owns the display (the `lcd` draw/flip path is disabled). */
@@ -186,6 +187,21 @@ uint32_t ltdc_pixel_clock_hz(void);
 
 /** Drive LCD_DISP (PI12) + LCD_BL_CTRL (PK3): true = display on + backlight. */
 void ltdc_backlight(bool on);
+
+/** Stop (false) / start (true) LTDC scanout at runtime (#66): clears/sets
+ *  LTDC_GCR.LTDCEN so the controller stops/resumes fetching the framebuffer from
+ *  SDRAM, and parks/raises the backlight.  Lets the LTDC's continuous SDRAM read
+ *  be removed (e.g. to measure its contribution to the DCMI DMA FIFO errors of
+ *  #59, or to save bandwidth/power when no display is needed).  Returns LTDC_OK,
+ *  or LTDC_ERR_STATE if the display is down/faulted or GUIX owns it.  While
+ *  disabled, ltdc_flip()/ltdc_gui_flip() refuse (so no VBR-timeout fault) and
+ *  ltdc_gui_take(true) fails; the shell `lcd` draw commands refuse via lcd_ready().
+ *  Direct ltdc_fill()/ltdc_blit() still write the back buffer but nothing is
+ *  presented until re-enabled. */
+int ltdc_set_scanout(bool on);
+
+/** True when the LTDC is up but scanout is currently disabled (#66). */
+bool ltdc_scanout_off(void);
 
 /** Read the LTDC FIFO-underrun / transfer-error status flags (sticky since the
  *  last clear).  These are set by hardware regardless of the interrupt enable

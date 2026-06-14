@@ -40,7 +40,10 @@ static int guix_first_start(void)
 	   ltdc_front between this read and the GUIX thread's first buffer toggle --
 	   the canvas would otherwise be bound to a now-front (visible) buffer.
 	   Every failure path releases ownership before returning. */
-	ltdc_gui_take(true);
+	if (!ltdc_gui_take(true)) {              /* refused if scanout disabled (#66) */
+		LOG_ERR("LTDC scanout disabled -- cannot take the display");
+		return GUIX_ERR;
+	}
 	back = ltdc_back_buffer();
 
 	if (gx_system_initialize() != GX_SUCCESS) {
@@ -107,6 +110,10 @@ int guix_start(void)
 		LOG_ERR("LTDC display down -- cannot start GUIX");
 		return GUIX_ERR_STATE;
 	}
+	if (ltdc_scanout_off()) {           /* (#66) GUIX needs scanout running */
+		LOG_ERR("LTDC scanout disabled -- run 'lcd enable' before starting GUIX");
+		return GUIX_ERR_STATE;
+	}
 	if (guix_active)
 		return GUIX_OK;                  /* already running */
 
@@ -119,7 +126,10 @@ int guix_start(void)
 		/* Restart: re-take ownership, re-establish the canvas-on-back-buffer
 		   invariant (the manual blank in guix_stop() moved ltdc_front), re-show
 		   and force a repaint. */
-		ltdc_gui_take(true);
+		if (!ltdc_gui_take(true)) {       /* refused if scanout disabled (#66) */
+			LOG_ERR("LTDC scanout disabled -- cannot restart GUIX");
+			return GUIX_ERR;
+		}
 		guix_canvas.gx_canvas_memory = (GX_COLOR *)ltdc_back_buffer();
 		gx_widget_show(&guix_root);
 		guix_force_redraw();

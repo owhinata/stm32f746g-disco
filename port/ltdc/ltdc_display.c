@@ -84,6 +84,7 @@ static bool         ltdc_up;          /* init succeeded                       */
 static bool         ltdc_tried;       /* init ran (idempotence latch)         */
 static bool         ltdc_fault;       /* reload stuck -> display latched down */
 static bool         ltdc_gui_owned;   /* GUIX owns the display (#55)          */
+static bool         ltdc_disabled;    /* LTDC scanout stopped (lcd disable, #66) */
 static TX_SEMAPHORE ltdc_reload_sem;  /* posted by the reload-ready IRQ       */
 static TX_MUTEX     ltdc_lock;        /* serializes drawing + flip            */
 
@@ -123,12 +124,55 @@ void ltdc_unlock_frame(void)
    ltdc_gui_owned under the same lock) becomes a no-op/refusal. */
 bool ltdc_gui_take(bool on)
 {
-	if (!ltdc_is_up())
+	if (!ltdc_up)               /* lock/objects may not exist yet */
 		return false;
 	ltdc_lock_frame();
+	/* Re-check under the lock: fault and the scanout-disabled flag (#66) are
+	   both set under ltdc_lock, so the decision cannot race a concurrent flip
+	   or lcd disable.  GUIX cannot run/flip with scanout off. */
+	if (ltdc_fault || (on && ltdc_disabled)) {
+		ltdc_unlock_frame();
+		return false;
+	}
 	ltdc_gui_owned = on;
 	ltdc_unlock_frame();
 	return true;
+}
+
+/* Stop/start LTDC scanout at runtime (#66).  Disabling clears LTDC_GCR.LTDCEN so
+   the controller stops fetching the framebuffer from SDRAM (parks the backlight
+   off too); enabling restarts it -- the layer/timing registers are untouched, so
+   scanout resumes on the current front buffer.  Refused while GUIX owns the
+   display (it cannot run without scanout) or while the LTDC is down/faulted.
+   While disabled, ltdc_flip()/ltdc_gui_take(true) refuse (no VBR reload would
+   come, so a flip would otherwise latch ltdc_fault).  Thread-context only. */
+int ltdc_set_scanout(bool on)
+{
+	if (!ltdc_up)               /* lock/objects may not exist yet */
+		return LTDC_ERR_STATE;
+	ltdc_lock_frame();
+	/* Re-check fault/ownership under the lock (an in-flight flip can fault, or
+	   GUIX can take ownership, between the unlocked entry and here). */
+	if (ltdc_fault || ltdc_gui_owned) {
+		ltdc_unlock_frame();
+		return LTDC_ERR_STATE;
+	}
+	if (on) {
+		__HAL_LTDC_ENABLE(&hltdc);
+		ltdc_disabled = false;
+		ltdc_backlight(true);
+	} else {
+		__HAL_LTDC_DISABLE(&hltdc);
+		ltdc_disabled = true;
+		ltdc_backlight(false);
+	}
+	ltdc_unlock_frame();
+	return LTDC_OK;
+}
+
+bool ltdc_scanout_off(void)
+{
+	return ltdc_is_up() && ltdc_disabled;
 }
 
 bool ltdc_gui_owns(void)
@@ -611,6 +655,8 @@ static int ltdc_flip_locked(void)
 
 	if (!ltdc_up || ltdc_fault)
 		return LTDC_ERR_STATE;
+	if (ltdc_disabled)
+		return LTDC_ERR_STATE;   /* scanout off (#66): no VBR reload would come */
 
 	back = (uint8_t)!ltdc_front;
 
