@@ -15,7 +15,7 @@
 | 設定 | `port/guix/gx_user.h`（`GX_INCLUDE_USER_DEFINE_FILE`） | FX/LX と同作法 |
 | ディスプレイ | 480×272 **RGB565** 1 layer、LTDC ダブルバッファ | canvas = LTDC back buffer |
 | 描画加速 | **DMA2D**: 単色塗り（R2M）+ ダブルバッファ copy-forward（M2M） | RM0385 §9 |
-| 入力 | FT5336（I2C3）ポーリング → GUIX pen イベント | `port/guix/guix_touch.c` |
+| 入力 | FT5336（I2C3）EXTI13 割込み起床 → GUIX pen イベント（#62） | `port/guix/guix_touch.c` |
 | スレッド | GUIX システム=prio **14** / 入力=prio **13** | `gx_user.h` / `guix_touch.c` |
 
 ## スレッドと優先度
@@ -84,7 +84,7 @@ DMA2D は単一エンジンで、`lcd` コマンド（`ltdc_display.c`）と GUI
 
 ## 入力ドライバ（FT5336 → GUIX pen イベント）
 
-`port/guix/guix_touch.c`。専用スレッド（prio 13、stack 1 KB）が ~60 Hz で `touch_read()`（#54）をポーリングし、最初のタッチ点を GUIX の pen イベント（`GX_EVENT_PEN_DOWN` / `_PEN_DRAG` / `_PEN_UP`）に変換して `gx_system_event_send()` する。座標は FT5336 が返すパネルピクセル直値（スケール不要、#54）。`gx_system_event_send()` は内部で `TX_NO_WAIT` の `tx_queue_send` なので、キュー満杯時はそのサンプルを捨てて次ポーリングで回復する。
+`port/guix/guix_touch.c`。専用スレッド（prio 13、stack 1 KB）が最初のタッチ点を GUIX の pen イベント（`GX_EVENT_PEN_DOWN` / `_PEN_DRAG` / `_PEN_UP`）に変換して `gx_system_event_send()` する。**#62** で **EXTI13 割込み起床**化：無タッチ時は FT5336 INT のウェイク（`touch_wait_event`）を `TX_WAIT_FOREVER` で待ち **CPU ≈ 0 %**、INT エッジで起床して**指が触れている間だけ ~60 Hz でポーリング**して DRAG を追従する（接触中はエッジが出ないため。詳細は[タッチ](../hardware/touch.md)）。座標は FT5336 が返すパネルピクセル直値（スケール不要、#54）。`gx_system_event_send()` は内部で `TX_NO_WAIT` の `tx_queue_send` なので、キュー満杯時はそのサンプルを捨てて次ループで回復する。
 
 停止は**協調式**で、`active` フラグを見てループ先頭（= I2C トランザクションの外）で自ら sleep/park する。`tx_thread_suspend()` は使わない（touch mutex を保持/待機中に止まり得るため）。
 

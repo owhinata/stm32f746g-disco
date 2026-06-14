@@ -2,7 +2,7 @@
 
 The board's 4.3″ RK043FN48H panel carries a **FocalTech FT5336** capacitive touch controller. The driver lives in `port/touch/touch.{c,h}`, the shell command is `touch` (`shell/cmds/cmd_touch.c`).
 
-This is **issue #54** of the LTDC + GUIX epic (#48), after the display bring-up ([LCD](display.md), #52). This phase covers **polled** multi-touch (up to 5 points): the `touch` command probes the chip ID and reads the active points so the wiring and the X/Y mapping can be verified on real hardware. EXTI-driven dispatch and GUIX input follow in #55.
+This is **issue #54** of the LTDC + GUIX epic (#48), after the display bring-up ([LCD](display.md), #52): the `touch` command probes the chip ID and reads the active points so the wiring and the X/Y mapping can be verified on real hardware. **#62** then made the FT5336 INT (PI13) **EXTI13 interrupt-driven** and the I2C reads **interrupt-driven (IT)**, so the GUIX input thread idles on the interrupt (CPU ≈ 0 %) when nothing is touched (see below).
 
 ## Configuration
 
@@ -16,7 +16,7 @@ This is **issue #54** of the LTDC + GUIX epic (#48), after the display bring-up 
 | Max points | **5** | ft5336.h `FT5336_MAX_DETECTABLE_TOUCH` |
 | Coordinates | **panel pixels** (x 0..479 / y 0..271), **TS_SWAP_XY** applied | stm32746g_discovery_ts.c / hardware-confirmed |
 | Speed | ~100 kHz standard mode | RM0385 §34 (I2C) |
-| Mode | **polling** (INT pin PI13 unused) | this driver |
+| Mode | **EXTI13 interrupt-driven + I2C IT** (INT = PI13, #62) | this driver |
 
 TIMINGR is the same value the camera's I2C1 uses, computed for **PCLK1 = 54 MHz** (PRESC=11 / SCLL=24 / SCLH=19 / SCLDEL=5 / SDADEL=2 → SCL ≈ 99 kHz). The ST BSP constant `0x40912732` assumes APB1 = 50 MHz and is deliberately not reused.
 
@@ -42,7 +42,8 @@ This panel needs **TS_SWAP_XY** (the controller's native axes are transposed rel
 
 - Public API calls serialize on an internal ThreadX mutex (TX_INHERIT).
 - **Thread context only** — never call the API from an ISR.
-- `touch_init()` runs once from `tx_application_define()` (`src/main.c`) and performs **no I2C I/O** (GPIO/I2C3 setup plus the mutex), so it is safe before the scheduler starts. The first bus transaction happens lazily on `touch probe` / `touch read`.
+- I2C reads/writes are **interrupt-driven (IT)** (`HAL_I2C_Mem_Read_IT` / `_Write_IT` + a completion semaphore, #62): the caller blocks without busy-waiting for the duration of the transaction. The Rx/Tx/error completion callbacks are weak symbols shared across all I2C units, so they **filter on `Instance == I2C3`** (the camera's I2C1 is blocking and never drives them). With no synchronous abort available, a timeout/error is recovered with `HAL_I2C_DeInit`+`Init`.
+- `touch_init()` runs once from `tx_application_define()` (`src/main.c`) and performs **no I2C I/O** (GPIO/I2C3 setup, the mutex, the semaphores, and the I2C3 NVIC), so it is safe before the scheduler starts. The first bus transaction happens lazily on `touch probe` / `touch read` / `touch_irq_enable()`.
 
 ## The `touch` shell command
 
@@ -66,12 +67,18 @@ P0: x=133 y=211 event=2
 ^C
 ```
 
-## Interrupt line (future)
+## EXTI13 interrupt-driven + I2C IT (#62)
 
-The FT5336 INT output is wired to **PI13** (`EXTI15_10`). It is **not used** by this polling driver. EXTI-driven touch dispatch arrives with GUIX (#55), where a per-pin EXTI dispatcher is added.
+The GUIX input poll (`port/guix/guix_touch.c`) used to hit the bus at 60 Hz even with nothing touched, busy-waiting inside the blocking `HAL_I2C_Mem_Read`, so it burned **CPU ≈ 20 % at idle**. #62 removes that in two steps.
 
-!!! note "EXTI line shared with SD_DETECT"
-    The microSD card-detect (SD_DETECT = **PC13**) and the touch INT (**PI13**) both land on EXTI line 13 (`EXTI15_10_IRQn`). SD_DETECT is currently **polled**, not EXTI-driven, so there is no conflict today; a future EXTI13 handler must dispatch by source pin.
+**1. EXTI13 interrupt wake.** The FT5336 INT output is wired to **PI13** (`EXTI15_10`). `touch_irq_enable()` arms PI13 as a rising-edge EXTI and puts the FT5336 in **interrupt (trigger) mode** (GMODE reg `0xA4` = `0x01`) so it drives INT on touch. The order mirrors the ST BSP (`stm32746g_discovery_ts.c`): **arm the GPIO/NVIC first, write GMODE last**, so no edge is lost in the enable→arm window. The EXTI ISR never calls `gx_system_event_send` (GUIX is thread-context only) — it just posts a wake semaphore.
+
+**2. Hybrid state machine.** The GUIX input thread waits on that semaphore with `TX_WAIT_FOREVER` when no finger is down (**CPU ≈ 0 %**). An INT edge wakes it, and **only while a finger stays down does it poll at ~60 Hz** to emit DOWN/DRAG/UP (the controller emits no edges during sustained contact, so polling is required to follow a drag). On release it returns to the semaphore wait. A short post-wake settle poll catches the FT5336's `0xFFF/0xFFF` invalid first sample so a press is never dropped. `gui stop` (park) disarms the wake and kicks the thread out of the semaphore wait.
+
+!!! note "EXTI line shared with SD_DETECT — exclusive mux"
+    The microSD card-detect (SD_DETECT = **PC13**) and the touch INT (**PI13**) both land on EXTI line 13 (`EXTI15_10_IRQn`). `SYSCFG_EXTICR4` maps line 13 to **exactly one port** (PC13 and PI13 **cannot both** use it). SD_DETECT is currently **polled** (`port/sd/sd_card.c`), so PI13 owns line 13; moving SD_DETECT to EXTI13 in the future would require resolving this mux (keep one of them polled).
+
+The `touch read` shell command still polls on its own 100 ms cadence (each read is IT-backed internally).
 
 ## References
 

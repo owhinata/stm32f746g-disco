@@ -154,6 +154,9 @@ int guix_stop(void)
 		return GUIX_OK;
 
 	guix_touch_set_active(false);        /* park input (outside any I2C op) */
+	touch_evt_signal();                  /* (#62) kick the input thread out of its
+	                                        FOREVER touch-wake wait so it re-checks
+	                                        the active flag and re-parks promptly */
 	gx_widget_hide(&guix_root);          /* GUIX stops compositing the UI   */
 
 	/* Blank the screen via the owner DMA2D path (public ltdc_fill() is a no-op

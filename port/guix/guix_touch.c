@@ -25,6 +25,7 @@
 #define GUIX_TOUCH_STACK_SIZE  1024
 #define GUIX_TOUCH_POLL_MS     16          /* ~60 Hz while active            */
 #define GUIX_TOUCH_PARK_MS     50          /* idle poll of the active flag   */
+#define GUIX_TOUCH_SETTLE      4           /* post-wake reads before re-idling  */
 
 static TX_THREAD     guix_touch_thread;
 static UCHAR         guix_touch_stack[GUIX_TOUCH_STACK_SIZE];
@@ -46,33 +47,72 @@ static void guix_send_pen(ULONG type, USHORT x, USHORT y)
 	(void)gx_system_event_send(&ev);
 }
 
+/*
+ * Hybrid EXTI-wake + drag-poll input loop (issue #62).  When no finger is down
+ * the thread blocks on the FT5336 INT wake (touch_wait_event FOREVER) at ~0 %
+ * CPU; an INT edge wakes it, and while a finger stays down it polls at ~60 Hz to
+ * follow a drag (the controller emits NO edges during sustained contact).  On
+ * release it returns to the idle wake wait.  Park (gui stop) disarms the wake and
+ * sleeps on the active flag.  If arming the INT fails (bus down) the loop
+ * degrades to plain ~60 Hz polling so the UI still responds.
+ */
 static void guix_touch_entry(ULONG arg)
 {
-	bool   was_down = false;
-	USHORT last_x = 0, last_y = 0;
+	bool     was_down = false;
+	bool     irq_ready = false;
+	unsigned settle = 0;      /* >0 = in a post-wake poll window (skip idle wait) */
+	USHORT   last_x = 0, last_y = 0;
 
 	(void)arg;
 
 	for (;;) {
 		struct touch_state st;
 
-		/* Parked: sleep here, OUTSIDE any I2C transaction, and re-check.  A
-		   pending press is released so a finger held across a stop/start does
-		   not look stuck. */
+		/* Parked (gui stop): release a held press, disarm the wake, and sleep
+		   OUTSIDE any I2C transaction.  gui stop posts the wake semaphore so a
+		   thread blocked in the idle wait below returns promptly; this bounded
+		   park sleep is the fallback. */
 		if (!guix_touch_active) {
 			if (was_down) {
 				guix_send_pen(GX_EVENT_PEN_UP, last_x, last_y);
 				was_down = false;
 			}
+			if (irq_ready) {
+				touch_irq_disable();
+				irq_ready = false;
+			}
+			settle = 0;
 			tx_thread_sleep(GUIX_TOUCH_PARK_MS);
 			continue;
 		}
 
+		/* First poll after un-parking: arm the FT5336 INT + PI13 EXTI.  Drop any
+		   wake posts that piled up while parked so they cause no phantom wake. */
+		if (!irq_ready) {
+			touch_evt_drain();
+			irq_ready = (touch_irq_enable() == TOUCH_OK);
+		}
+
+		/* Idle (no finger down, not in a post-wake settle window): block on the
+		   touch wake.  Armed -> FOREVER wait = ~0 % CPU until an INT edge; arming
+		   failed (bus down) -> bounded poll so the UI still responds.  A stop
+		   wakes us via touch_evt_signal().  After a wake we DO NOT return straight
+		   to FOREVER on the first read (settle below) -- the FT5336's first sample
+		   of a press can be 0xFFF/0xFFF, and trigger-mode INT edges are not
+		   guaranteed for every later frame, so we poll a short window to catch the
+		   real coordinates instead of dropping the press. */
+		if (!was_down && settle == 0) {
+			if (irq_ready)
+				(void)touch_wait_event(TX_WAIT_FOREVER);
+			else
+				tx_thread_sleep(GUIX_TOUCH_POLL_MS);
+			if (!guix_touch_active)
+				continue;        /* woken by gui stop -> re-park at the top */
+			settle = GUIX_TOUCH_SETTLE;   /* open the post-wake poll window */
+		}
+
 		/* A touch is "valid" only when the controller reports a point inside the
-		   panel.  The FT5336 occasionally returns 0xFFF/0xFFF (4095,4095) for the
-		   first sample of a press; treating that as a PEN_DOWN sends an
-		   off-screen press that GUIX drops, after which the real coordinates
-		   arrive as PEN_DRAG and the button never sees its press.  Filter it. */
+		   panel (filters the 0xFFF/0xFFF first-sample described above). */
 		if (touch_read(&st) == TOUCH_OK && st.count > 0 &&
 		    st.p[0].x < LTDC_LCD_WIDTH && st.p[0].y < LTDC_LCD_HEIGHT) {
 			USHORT x = st.p[0].x;
@@ -85,12 +125,27 @@ static void guix_touch_entry(ULONG arg)
 			last_x   = x;
 			last_y   = y;
 			was_down = true;
+			settle   = 0;
+			/* A held finger emits no INT edges, so poll to follow a drag.  This
+			   ~60 Hz beat runs ONLY while a finger is down; on release the loop
+			   drops back to the idle wake wait above. */
+			tx_thread_sleep(GUIX_TOUCH_POLL_MS);
 		} else if (was_down) {
 			guix_send_pen(GX_EVENT_PEN_UP, last_x, last_y);
 			was_down = false;
+			settle   = 0;
+			/* Drop the trailing INT edges of the just-finished press so the next
+			   idle wait blocks instead of waking once on a stale post. */
+			touch_evt_drain();
+		} else if (--settle != 0) {
+			/* Woken but no valid touch yet (first-sample 0xFFF, a slightly late
+			   frame, or a read error): keep polling the short window. */
+			tx_thread_sleep(GUIX_TOUCH_POLL_MS);
+		} else {
+			/* Window expired with no touch -> give up; the next loop falls into
+			   the idle wake wait.  Drop any edges that accumulated meanwhile. */
+			touch_evt_drain();
 		}
-
-		tx_thread_sleep(GUIX_TOUCH_POLL_MS);
 	}
 }
 

@@ -15,7 +15,7 @@ On top of the board's 4.3″ 480×272 LCD (LTDC, #52/#53) and the FT5336 capacit
 | Config | `port/guix/gx_user.h` (`GX_INCLUDE_USER_DEFINE_FILE`) | same idiom as FX/LX |
 | Display | 480×272 **RGB565**, 1 layer, LTDC double buffer | canvas = LTDC back buffer |
 | Acceleration | **DMA2D**: solid fills (R2M) + double-buffer copy-forward (M2M) | RM0385 §9 |
-| Input | FT5336 (I2C3) polling → GUIX pen events | `port/guix/guix_touch.c` |
+| Input | FT5336 (I2C3) EXTI13 interrupt wake → GUIX pen events (#62) | `port/guix/guix_touch.c` |
 | Threads | GUIX system = prio **14** / input = prio **13** | `gx_user.h` / `guix_touch.c` |
 
 ## Threads and priorities
@@ -84,7 +84,7 @@ This closes the foreground, background and in-flight `lcd` cases against GUIX's 
 
 ## Input driver (FT5336 → GUIX pen events)
 
-`port/guix/guix_touch.c`. A dedicated thread (prio 13, 1 KB stack) polls `touch_read()` (#54) at ~60 Hz and turns the first touch point into GUIX pen events (`GX_EVENT_PEN_DOWN` / `_PEN_DRAG` / `_PEN_UP`) via `gx_system_event_send()`. Coordinates are the panel pixels the FT5336 reports directly (no scaling, #54). `gx_system_event_send()` uses a `TX_NO_WAIT` `tx_queue_send`, so a full queue just drops that sample (recovered on the next poll).
+`port/guix/guix_touch.c`. A dedicated thread (prio 13, 1 KB stack) turns the first touch point into GUIX pen events (`GX_EVENT_PEN_DOWN` / `_PEN_DRAG` / `_PEN_UP`) via `gx_system_event_send()`. **#62** made it **EXTI13-wake driven**: with nothing touched it waits on the FT5336 INT wake (`touch_wait_event`) with `TX_WAIT_FOREVER` at **CPU ≈ 0 %**, and only while a finger is down does it poll at ~60 Hz to follow a drag (the controller emits no edges during contact — see [Touch](../hardware/touch.md)). Coordinates are the panel pixels the FT5336 reports directly (no scaling, #54). `gx_system_event_send()` uses a `TX_NO_WAIT` `tx_queue_send`, so a full queue just drops that sample (recovered on the next loop).
 
 Stopping is **cooperative**: the thread checks an `active` flag and parks itself at the top of the loop — outside any I2C transaction. It never uses `tx_thread_suspend()` (which could stop it while it holds/awaits the touch mutex).
 

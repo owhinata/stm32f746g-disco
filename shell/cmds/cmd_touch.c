@@ -57,7 +57,7 @@ static int cmd_touch_info(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "address:    0x70\r\n");
 	cli_print(sh, "state:      %s\r\n", touch_is_up() ? "up" : "down");
 	cli_print(sh, "max points: %u\r\n", (unsigned)TOUCH_MAX_POINTS);
-	cli_print(sh, "mode:       polling\r\n");
+	cli_print(sh, "mode:       interrupt (EXTI13 wake + I2C-IT)\r\n");
 	return 0;
 }
 

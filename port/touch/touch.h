@@ -18,12 +18,17 @@
  *     is a SEPARATE bus from the camera's I2C1 (PB8/PB9), so the two never
  *     contend.
  *   - Address: 0x70 (8-bit, the HAL Mem API form).
- *   - INT: FT5336_INT = PI13 (EXTI15_10), unused here -- this driver POLLS.
+ *   - INT: FT5336_INT = PI13 (EXTI15_10).  touch_irq_enable() puts the FT5336 in
+ *     interrupt (trigger) mode and arms PI13 as a rising-edge EXTI so a touch
+ *     wakes a waiter (touch_wait_event) -- the GUIX input path uses this to idle
+ *     at ~0 % CPU instead of polling (issue #62).
  *
  * Concurrency: public calls serialize on an internal TX_MUTEX; the API is
- * thread-context only (never from an ISR).  touch_init() does NO I2C I/O, so it
- * is safe to call from tx_application_define() before the scheduler runs; the
- * first bus transaction happens lazily on touch_probe()/touch_read().
+ * thread-context only (never from an ISR).  I2C reads/writes are interrupt-driven
+ * (HAL_I2C_Mem_Read_IT / _Write_IT + a completion semaphore), so a transaction
+ * blocks the caller without busy-waiting.  touch_init() does NO I2C I/O, so it is
+ * safe to call from tx_application_define() before the scheduler runs; the first
+ * bus transaction happens lazily on touch_probe()/touch_read()/touch_irq_enable().
  *
  * Clean-room implementation; the ST BSP component driver (ft5336.h) and the
  * STM32746G-Discovery BSP (stm32746g_discovery_ts.c, for TS_SWAP_XY and the
@@ -44,6 +49,7 @@ extern "C" {
 #define TOUCH_ERR_HAL    -1   /* a HAL I2C transaction failed                 */
 #define TOUCH_ERR_STATE  -2   /* touch_init() did not bring the bus up        */
 #define TOUCH_ERR_ID     -3   /* wrong / no chip ID at 0x70 (panel absent?)   */
+#define TOUCH_ERR_TIMEOUT -4  /* an I2C-IT xfer / EXTI wait timed out         */
 
 /* FT5336 reports at most 5 simultaneous touch points. */
 #define TOUCH_MAX_POINTS  5
@@ -96,6 +102,39 @@ int touch_probe(uint8_t *id);
  * the bus is down, TOUCH_ERR_HAL on an I2C error.
  */
 int touch_read(struct touch_state *st);
+
+/* ---- EXTI13 interrupt-driven wake (issue #62) --------------------------- */
+
+/**
+ * Arm the FT5336 INT line (PI13 / EXTI15_10): configure PI13 as a rising-edge
+ * EXTI and enable EXTI15_10 in the NVIC FIRST, then put the controller in
+ * interrupt (trigger) mode -- GMODE reg 0xA4 = 0x01 -- so no edge is lost in the
+ * window between enabling INT and arming the line.  The GMODE write does I2C I/O,
+ * so this MUST run in thread context with the scheduler running (NOT from
+ * touch_init()).  After this an INT edge posts the wake semaphore (see
+ * touch_wait_event).  Returns TOUCH_OK or a TOUCH_ERR_*.
+ */
+int touch_irq_enable(void);
+
+/** Disarm the EXTI15_10 wake (NVIC disable + stop honouring posts). */
+void touch_irq_disable(void);
+
+/**
+ * Block until the EXTI wake semaphore is posted (a touch INT edge) or @p
+ * timeout_ticks elapse.  TX_WAIT_FOREVER blocks indefinitely (~0 % CPU until a
+ * touch).  Returns TOUCH_OK on a wake, TOUCH_ERR_TIMEOUT on timeout.  Thread
+ * context only.
+ */
+int touch_wait_event(unsigned long timeout_ticks);
+
+/** Drop any pending wake posts -- call after un-parking so edges that piled up
+ *  while parked (or the trailing edges of a finished press) do not trigger a
+ *  phantom wake. */
+void touch_evt_drain(void);
+
+/** Post the wake semaphore from another thread, so e.g. gui stop can kick a
+ *  thread out of a touch_wait_event(TX_WAIT_FOREVER) to re-check its run flag. */
+void touch_evt_signal(void);
 
 #ifdef __cplusplus
 }
