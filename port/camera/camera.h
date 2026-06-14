@@ -48,6 +48,7 @@ extern "C" {
 #define CAM_ERR_STATE     -4   /* driver not initialized / SDRAM down           */
 #define CAM_ERR_NO_SENSOR -5   /* OV5640 not detected (no module / bad ID)      */
 #define CAM_ERR_NO_FRAME  -6   /* no captured frame available                   */
+#define CAM_ERR_BUSY      -7   /* streaming or preview already owns the DCMI    */
 
 /* Default capture geometry (issue #41): QVGA RGB565, little-endian 16-bit
    pixels (R5 in bits 15..11, G6 in 10..5, B5 in 4..0).  Issue #45 makes the
@@ -184,7 +185,7 @@ int camera_get_mode(struct camera_mode *out);
 /**
  * Switch the capture resolution and/or pixel format (issue #45).  Re-programs
  * the OV5640 (resolution/format scalers, the per-mode HTS/VTS/PCLK fps table)
- * and resizes the live capture geometry.  Refused with CAM_ERR_STATE while a
+ * and resizes the live capture geometry.  Refused with CAM_ERR_BUSY while a
  * stream or GUIX preview is active (the ring slots are a live DMA target sized
  * for the current mode).  Probes/configures the sensor on demand.  On any I/O
  * failure the mode is left uncommitted and the sensor is marked unconfigured so
@@ -268,7 +269,7 @@ struct frame_desc;       /* svc/frame.h          */
  * sink (in addition to the internal stats sink).  Equivalent to
  * camera_stream_start(colorbar=0, unbounded) but also takes **preview
  * ownership**: while it holds, the public `camera stream start/stop` are
- * refused (CAM_ERR_STATE).  Returns 0 on success or a negative CAM_ERR_* (e.g.
+ * refused (CAM_ERR_BUSY).  Returns 0 on success or a negative CAM_ERR_* (e.g.
  * a plain stream / preview already running, no sensor, SDRAM down).  The
  * producer's async teardown (DCMI overrun) also releases ownership and detaches
  * @p s, so the slot/pin contract survives a later frame_pipeline_init().

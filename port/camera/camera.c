@@ -806,7 +806,7 @@ static int camera_set_format_locked(uint8_t res, uint8_t fmt)
 	int rc;
 
 	if (cam_stream_active || cam_ext_sink != NULL)
-		return CAM_ERR_STATE;          /* streaming/preview owns the DCMI/DMA */
+		return CAM_ERR_BUSY;           /* streaming/preview owns the DCMI/DMA */
 	if (!sdram_is_up())
 		return CAM_ERR_STATE;
 	if (res >= CAM_RES__COUNT || fmt >= CAM_FMT__COUNT)
@@ -936,7 +936,7 @@ static int camera_capture_locked(int colorbar)
 		return CAM_ERR_STATE;
 
 	if (cam_stream_active)
-		return CAM_ERR_STATE;   /* streaming owns the DCMI/DMA (issue #46) */
+		return CAM_ERR_BUSY;    /* streaming owns the DCMI/DMA (issue #46) */
 
 	if (!info.powered) {
 		rc = camera_probe_locked(NULL);
@@ -1114,7 +1114,7 @@ int camera_probe(uint32_t *chip_id)
 		return rc;
 	if (cam_stream_active) {          /* streaming owns the sensor/DCMI (#46) */
 		op_unlock();
-		return CAM_ERR_STATE;
+		return CAM_ERR_BUSY;
 	}
 	rc = camera_probe_locked(chip_id);
 	op_unlock();
@@ -1128,7 +1128,7 @@ int camera_power_off(void)
 		return rc;
 	if (cam_stream_active) {          /* cutting power mid-stream wrecks the HW */
 		op_unlock();
-		return CAM_ERR_STATE;
+		return CAM_ERR_BUSY;
 	}
 	power_off_locked();
 	op_unlock();
@@ -1533,7 +1533,7 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	int rc;
 
 	if (cam_stream_active)
-		return CAM_ERR_STATE;          /* already streaming */
+		return CAM_ERR_BUSY;           /* already streaming */
 	if (!sdram_is_up())
 		return CAM_ERR_STATE;
 	if (!info.powered) {
@@ -1639,7 +1639,7 @@ int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 		return rc;
 	if (cam_ext_sink != NULL) {        /* owned by the GUIX live preview (#56) */
 		op_unlock();
-		return CAM_ERR_STATE;
+		return CAM_ERR_BUSY;
 	}
 	rc = stream_start_locked(colorbar, frames, secs, NULL);
 	op_unlock();
@@ -1703,7 +1703,7 @@ int camera_stream_stop(void)
 		return rc;
 	if (cam_ext_sink != NULL) {        /* owned by the GUIX live preview (#56) */
 		op_unlock();
-		return CAM_ERR_STATE;
+		return CAM_ERR_BUSY;
 	}
 	if (cam_stream_active) {
 		cam_stop_req = 1;

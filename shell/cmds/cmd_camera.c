@@ -42,6 +42,7 @@ static const char *cam_strerror(int rc)
 	case CAM_ERR_STATE:     return "driver not initialized / SDRAM down";
 	case CAM_ERR_NO_SENSOR: return "OV5640 not detected (module connected?)";
 	case CAM_ERR_NO_FRAME:  return "no captured frame";
+	case CAM_ERR_BUSY:      return "busy (streaming or preview active)";
 	default:                return "unknown error";
 	}
 }
