@@ -20,6 +20,7 @@
  *     double buffering is meant to work.
  */
 #include "guix_display.h"
+#include "guix_camera.h"         /* CAM_VIEW_* preview geometry (#59 B2) */
 #include "ltdc_display.h"
 
 #include "gx_display.h"          /* _gx_display_driver_565rgb_setup proto */
@@ -30,6 +31,7 @@
 #include "log.h"
 
 #include <stdint.h>
+#include <string.h>             /* memcpy: corrective camera-rect CPU fallback (#59) */
 
 /* DMA2D handle private to GUIX.  DMA2D is one engine shared with ltdc_display.c;
    we serialize on ltdc_lock (ltdc_lock_frame/unlock_frame) and fully reconfigure
@@ -132,6 +134,13 @@ static int guix_dma2d_blit(uint16_t *dst, const uint16_t *src, uint32_t w,
 	    HAL_DMA2D_Start(&hdma2d_gui, (uint32_t)(uintptr_t)src,
 	                    (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
 		rc = (HAL_DMA2D_PollForTransfer(&hdma2d_gui, 30) == HAL_OK) ? 0 : -1;
+	/* A PollForTransfer timeout returns without clearing CR.START -- the engine
+	   may still be writing the destination.  Abort so a failed blit always
+	   leaves DMA2D idle, which a CPU follow-up to the same buffer relies on
+	   (cam_rect_refresh's fallback) and which keeps the next blit's re-init
+	   clean (#59). */
+	if (rc != 0 && (DMA2D->CR & DMA2D_CR_START) != 0u)
+		(void)HAL_DMA2D_Abort(&hdma2d_gui);
 	ltdc_unlock_frame();
 	return rc;
 }
@@ -222,6 +231,151 @@ static VOID guix_horizontal_line_draw(GX_DRAW_CONTEXT *context, INT xstart,
 	                (uint32_t)(pitch - len));
 }
 
+/* ===== #59 Lever B2: camera live-preview copy-forward elimination ===========
+ *
+ * The camera icon (CAM_VIEW_W x CAM_VIEW_H at CAM_VIEW_X,CAM_VIEW_Y) is fully
+ * repainted from cam_view_buf every preview frame, so forwarding it in the
+ * buffer toggle is wasted SDRAM bandwidth (one ~150 KB DMA2D blit per displayed
+ * frame) and a contributor to the DCMI DMA FIFO errors of #59.  We skip that
+ * copy but must never present a STALE camera rect (a later non-camera flip could
+ * otherwise show an older frame -> visible regression).  Correctness is enforced
+ * at PRESENT time by a per-buffer freshness flag:
+ *
+ *   cam_buf_stale[i] == false   <=>   ltdc_fb[i]'s camera rect already holds the
+ *                                     latest cam_view_buf content.
+ *
+ *   - a new view frame (guix_display_cam_view_store) makes BOTH buffers stale;
+ *   - a full-rect camera pixelmap draw clears the drawn (back) buffer;
+ *   - before each flip, if the buffer about to be presented is still stale we do
+ *     a corrective view->buffer copy first.
+ *
+ * Every stale-flag transition is kept in the SAME ltdc_lock section as the DMA2D
+ * copy it reflects, so the producer thread cannot advance cam_view_buf between a
+ * copy and its flag update (a false-negative would present stale pixels). */
+#define CAM_RECT_L  (CAM_VIEW_X)
+#define CAM_RECT_T  (CAM_VIEW_Y)
+#define CAM_RECT_R  (CAM_VIEW_X + CAM_VIEW_W - 1)
+#define CAM_RECT_B  (CAM_VIEW_Y + CAM_VIEW_H - 1)
+
+static bool      cam_preview_active;   /* session armed (begin..end): store() ok  */
+static bool      cam_visible;          /* camera screen on display (SHOW..HIDE):
+                                          gates the toggle's corrective + skip so
+                                          we never stamp camera pixels onto, or
+                                          drop a forward-copy on, another screen  */
+static uint16_t *cam_view_data;        /* cam_view_buf base (registered by begin) */
+static bool      cam_buf_stale[2];     /* per LTDC buffer; invariant above        */
+
+/* True if screen-space rect r lies fully inside the camera icon rect. */
+static bool rect_in_cam(const GX_RECTANGLE *r)
+{
+	return r->gx_rectangle_left   >= (GX_VALUE)CAM_RECT_L &&
+	       r->gx_rectangle_top    >= (GX_VALUE)CAM_RECT_T &&
+	       r->gx_rectangle_right  <= (GX_VALUE)CAM_RECT_R &&
+	       r->gx_rectangle_bottom <= (GX_VALUE)CAM_RECT_B;
+}
+
+/* True if screen-space clip rect r fully COVERS the camera icon rect. */
+static bool rect_covers_cam(const GX_RECTANGLE *r)
+{
+	return r->gx_rectangle_left   <= (GX_VALUE)CAM_RECT_L &&
+	       r->gx_rectangle_top    <= (GX_VALUE)CAM_RECT_T &&
+	       r->gx_rectangle_right  >= (GX_VALUE)CAM_RECT_R &&
+	       r->gx_rectangle_bottom >= (GX_VALUE)CAM_RECT_B;
+}
+
+/* Corrective copy of the full camera rect (cam_view_buf -> @p fb at the icon
+   position).  Caller holds ltdc_lock.  Tries DMA2D first and, on the rare DMA2D
+   failure, falls back to a row-by-row CPU copy so the presented camera rect is
+   ALWAYS made current -- the toggle therefore never has to skip the flip (which
+   would strand that cycle's non-camera draws).  Both buffers are MPU
+   non-cacheable SDRAM, so the CPU copy is coherent with no cache maintenance.
+   Returns 0 when the rect was refreshed, -1 only on a NULL buffer (cannot happen
+   while cam_visible, since begin() set cam_view_data). */
+static int cam_rect_refresh(uint16_t *fb)
+{
+	uint16_t *dst;
+	const uint16_t *src;
+	uint32_t y;
+
+	if (fb == NULL || cam_view_data == NULL)
+		return -1;
+	dst = fb + (uint32_t)CAM_RECT_T * LTDC_LCD_WIDTH + CAM_RECT_L;
+	if (guix_dma2d_blit(dst, cam_view_data, CAM_VIEW_W, CAM_VIEW_H,
+	                    LTDC_LCD_WIDTH - CAM_VIEW_W, 0u) == 0)
+		return 0;
+	/* DMA2D failed.  guix_dma2d_blit aborts a timed-out transfer, so the engine
+	   is normally idle now; only run the CPU copy once that is confirmed (START
+	   clear).  If the abort itself failed the engine is wedged (hard DMA2D
+	   fault) -- do NOT race it with a CPU write; report failure and leave the
+	   buffer stale. */
+	if ((DMA2D->CR & DMA2D_CR_START) != 0u)
+		return -1;
+	src = cam_view_data;
+	for (y = 0; y < CAM_VIEW_H; y++) {
+		memcpy(dst, src, (size_t)CAM_VIEW_W * sizeof(uint16_t));
+		dst += LTDC_LCD_WIDTH;
+		src += CAM_VIEW_W;
+	}
+	return 0;
+}
+
+/* Register the view buffer and arm B2 for a preview session.  Both LTDC buffers
+   start stale so the first frames are corrected before present. */
+void guix_display_cam_preview_begin(uint16_t *view_buf)
+{
+	ltdc_lock_frame();
+	cam_view_data      = view_buf;
+	cam_buf_stale[0]   = true;
+	cam_buf_stale[1]   = true;
+	cam_preview_active = true;
+	ltdc_unlock_frame();
+}
+
+void guix_display_cam_preview_end(void)
+{
+	ltdc_lock_frame();
+	cam_preview_active = false;
+	cam_visible        = false;
+	cam_view_data      = NULL;
+	ltdc_unlock_frame();
+}
+
+/* Gate the buffer-toggle B2 paths to when the camera screen is actually on
+   display (set by the SHOW/HIDE root events on the GUIX thread).  Turning it on
+   marks both buffers stale so the first presented frame is corrected -- the
+   camera rect currently holds whatever the previous screen drew there. */
+void guix_display_cam_set_visible(bool on)
+{
+	ltdc_lock_frame();
+	cam_visible = on;
+	if (on) {
+		cam_buf_stale[0] = true;
+		cam_buf_stale[1] = true;
+	}
+	ltdc_unlock_frame();
+}
+
+/* Store a freshly captured frame into the view buffer and mark BOTH LTDC buffers
+   stale, atomically under ltdc_lock (#59 B2).  Returns 0 on a completed DMA2D
+   copy, -1 otherwise. */
+int guix_display_cam_view_store(const uint16_t *src)
+{
+	int rc;
+
+	ltdc_lock_frame();
+	if (cam_view_data == NULL || !cam_preview_active) {
+		ltdc_unlock_frame();
+		return -1;
+	}
+	rc = guix_dma2d_blit(cam_view_data, src, CAM_VIEW_W, CAM_VIEW_H, 0u, 0u);
+	if (rc == 0) {
+		cam_buf_stale[0] = true;
+		cam_buf_stale[1] = true;
+	}
+	ltdc_unlock_frame();
+	return rc;
+}
+
 /*
  * Tear-free buffer toggle (GUIX calls this once per refreshed frame).  GUIX has
  * just composited the accumulated dirty region into the back buffer (= the
@@ -247,6 +401,24 @@ static VOID guix_buffer_toggle(GX_CANVAS *canvas, GX_RECTANGLE *dirty)
 		return;
 	}
 
+	/* #59 B2: ensure the buffer about to be presented holds the latest camera
+	   frame BEFORE the flip.  In steady-state preview the full-rect pixelmap
+	   draw already cleared this buffer's stale flag, so the corrective copy only
+	   fires on a non-camera cycle whose camera rect has fallen behind. */
+	if (cam_visible) {
+		uint8_t cur = (uint8_t)!ltdc_active_buffer();
+
+		/* Make the buffer about to be presented hold the latest camera frame.
+		   cam_rect_refresh falls back to a CPU copy if DMA2D fails, so it
+		   succeeds whenever the view buffer is valid; clear stale only then.  We
+		   never skip the flip here -- doing so would strand this cycle's
+		   non-camera draws in the back buffer, and the normal copy-forward below
+		   keeps the two buffers consistent outside the camera rect (#59). */
+		if (cam_buf_stale[cur] &&
+		    cam_rect_refresh((uint16_t *)canvas->gx_canvas_memory) == 0)
+			cam_buf_stale[cur] = false;
+	}
+
 	if (ltdc_gui_flip() != LTDC_OK || !ltdc_is_up()) {
 		ltdc_unlock_frame();
 		return;                       /* display faulted: leave it be */
@@ -256,6 +428,15 @@ static VOID guix_buffer_toggle(GX_CANVAS *canvas, GX_RECTANGLE *dirty)
 	back  = ltdc_back_buffer();
 	front = ltdc_framebuffer();       /* what we just presented */
 	canvas->gx_canvas_memory = (GX_COLOR *)back;
+
+	/* #59 B2: when the live preview is on and the whole dirty region is the
+	   camera icon, skip the copy-forward -- that rect is repainted from
+	   cam_view_buf every frame and its two-buffer consistency is maintained by
+	   the stale tracking above, so forwarding it is wasted bandwidth. */
+	if (cam_visible && rect_in_cam(dirty)) {
+		ltdc_unlock_frame();
+		return;
+	}
 
 	/* Copy the dirty rectangle forward (front -> new back), clipped to panel. */
 	x      = dirty->gx_rectangle_left;
@@ -315,16 +496,37 @@ static VOID guix_pixelmap_draw(GX_DRAW_CONTEXT *context, INT xpos, INT ypos,
 	h = clip->gx_rectangle_bottom - clip->gx_rectangle_top + 1;
 	if (w <= 0 || h <= 0)
 		return;
-	guix_dma2d_blit((uint16_t *)context->gx_draw_context_memory +
-	                    (uint32_t)clip->gx_rectangle_top * (uint32_t)pitch +
-	                    (uint32_t)clip->gx_rectangle_left,
-	                (const uint16_t *)pmp->gx_pixelmap_data +
-	                    (uint32_t)(clip->gx_rectangle_top - ypos) *
-	                        (uint32_t)pmp->gx_pixelmap_width +
-	                    (uint32_t)(clip->gx_rectangle_left - xpos),
-	                (uint32_t)w, (uint32_t)h,
-	                (uint32_t)(pitch - w),
-	                (uint32_t)(pmp->gx_pixelmap_width - w));
+	{
+		uint16_t *dst = (uint16_t *)context->gx_draw_context_memory +
+		                (uint32_t)clip->gx_rectangle_top * (uint32_t)pitch +
+		                (uint32_t)clip->gx_rectangle_left;
+		const uint16_t *src = (const uint16_t *)pmp->gx_pixelmap_data +
+		                (uint32_t)(clip->gx_rectangle_top - ypos) *
+		                    (uint32_t)pmp->gx_pixelmap_width +
+		                (uint32_t)(clip->gx_rectangle_left - xpos);
+		uint32_t dst_off = (uint32_t)(pitch - w);
+		uint32_t src_off = (uint32_t)(pmp->gx_pixelmap_width - w);
+
+		/* #59 B2: the camera live-preview icon draws cam_view_buf into the back
+		   buffer.  Keep the blit and the stale-flag clear in one ltdc_lock
+		   section so the producer cannot advance cam_view_buf in between (a
+		   false-negative would later present stale pixels).  Only a clip that
+		   fully covers the icon rect counts as a complete repaint. */
+		if (cam_preview_active &&
+		    (uint16_t *)pmp->gx_pixelmap_data == cam_view_data) {
+			ltdc_lock_frame();
+			/* Clear the stale flag only when the copy actually COMPLETED and it
+			   covered the whole icon rect -- otherwise the buffer's camera rect
+			   is not really the latest view and must stay stale (#59). */
+			if (guix_dma2d_blit(dst, src, (uint32_t)w, (uint32_t)h,
+			                    dst_off, src_off) == 0 && rect_covers_cam(clip))
+				cam_buf_stale[!ltdc_active_buffer()] = false;
+			ltdc_unlock_frame();
+		} else {
+			(void)guix_dma2d_blit(dst, src, (uint32_t)w, (uint32_t)h,
+			                      dst_off, src_off);
+		}
+	}
 }
 
 /*

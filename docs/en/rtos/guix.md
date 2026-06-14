@@ -69,6 +69,9 @@ The destination frame buffer lives in the MPU non-cacheable SDRAM region (#40), 
 
 DMA2D is a single engine used by both the `lcd` command (`ltdc_display.c`) and GUIX. All GUIX DMA2D work runs under `ltdc_lock_frame()`, serialized on the same recursive `ltdc_lock` as the `lcd` path. While GUIX runs, the ownership interlock below also disables `lcd` drawing, so the two never fight for the screen.
 
+!!! note "Polled completion → the calling thread spins (and why #59 lowered CPU)"
+    Each DMA2D op finishes with **`HAL_DMA2D_PollForTransfer`** — a synchronous (polled) wait. The *copy* is done by the DMA2D hardware engine, but the **calling thread busy-waits (spins), consuming its CPU**, until the transfer completes. So removing a DMA2D op removes both its SDRAM traffic *and* the thread's spin time. This is why #59's B2 (dropping the camera **copy-forward**, a 320×240 ≈ 150 KB M2M blit that ran on the **GUIX thread** every frame) **roughly halved the GUIX thread's CPU (≈5.5% → 2.4%, measured via `thread`)** — the GUIX thread went from two polled DMA2D waits per frame (`pixelmap_draw` + copy-forward) to one. The polled model was chosen for simplicity and bounded `ltdc_lock` critical sections; the transfers are short (~tens of µs) and CPU headroom is large (~73% idle), so the spin cost is not a problem in practice. Making the completion **interrupt-driven** (`HAL_DMA2D_Start_IT` + the DMA2D IRQ → a semaphore) would free the waiting thread's CPU (to idle/WFI for power, or to lower-priority work) but does not increase DMA2D concurrency (single engine, serialized on `ltdc_lock`) and adds per-op context-switch/ISR overhead that rivals a short transfer — tracked as a future optimization in **#64**.
+
 ## LTDC ownership interlock
 
 `ltdc_lock` only serializes individual accesses; it does not stop a shell `lcd fill`→`ltdc_flip()` from moving `ltdc_front` while the GUIX canvas points at the back buffer (which would leave GUIX drawing into the visible frame). So while GUIX runs it **takes ownership of the display** (`port/ltdc/ltdc_display.c`):
@@ -124,7 +127,13 @@ Shell control:
 - `gui camera off` — return to screen 0 → stop the stream + detach/drain the sink.
 - Screen 2's **Back button** also stops and returns (`guix_camera_off` only does a bounded drain, so it is safe to call from the GUIX thread).
 
-**Bandwidth**: even at QVGA, the LTDC continuous read + DCMI write + three DMA2D blits per displayed frame (slot→view, view→back, toggle copy-forward) all share the SDRAM (16-bit FMC @108 MHz). The average fits the budget, but on hardware monitor `camera stream stats` `dcmi_ovr` / `cam_ring_ovr` and the LTDC underrun and confirm they stay 0.
+**Bandwidth**: even at QVGA, the LTDC continuous read + DCMI write + the DMA2D blits per displayed frame all share the SDRAM (16-bit FMC @108 MHz). The average fits the budget, but on hardware monitor `camera stream stats` `dcmi_ovr` / `cam_ring_ovr` / `dma fe/s` and the LTDC underrun and confirm they stay near 0.
+
+!!! note "#59: fewer DMA2D round-trips (FE mitigation)"
+    It originally ran DMA2D three times per displayed frame (slot→view, view→back, toggle copy-forward), which contributed to the SDRAM contention and the DCMI DMA FIFO errors (FE).  #59 removed two of them:
+
+    - **B1**: `consume()` **coalesces** the slot→view copy while `cam_redraw_pending` is set (the previous frame is not yet drawn); the slot is always `put`.  It helps exactly when frames outpace the redraw — the contended case.
+    - **B2**: the camera rect is fully repainted every frame, so the `guix_buffer_toggle` **copy-forward is eliminated in steady state**.  Consistency is held by a **per-buffer stale flag (`cam_buf_stale[2]`, invariant "false ⟺ that buffer's camera rect == latest view") plus a pre-flip corrective copy**.  Each stale-flag transition stays in the same `ltdc_lock` section as its DMA2D copy, so the producer advancing the view cannot cause a false-negative.  The toggle's B2 paths are gated on `cam_visible` (toggled by SHOW/HIDE) so camera pixels are never stamped onto another screen.  The LCD_CLK was also lowered 9.6→4.8 MHz ([display](../hardware/display.md)).  The figure of merit is `dma fe/s`.
 
 ## Usage
 

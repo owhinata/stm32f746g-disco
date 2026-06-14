@@ -163,8 +163,36 @@ publish の deliver 確定も detach も lock 下なので、detach は「確定
 
 ## 下流要件（#48/#49 で確定）
 
-- **SDRAM 帯域**: リスクは容量でなく帯域。DCMI write + LTDC scanout + DMA2D + ETH DMA + CPU read が単一 FMC SDRAM に集中する。**#48/#49 で「帯域実測 + slot / 表示バッファ予算表」を必須**とする。
+- **SDRAM 帯域**: リスクは容量でなく帯域。DCMI write + LTDC scanout + DMA2D + ETH DMA + CPU read が単一 FMC SDRAM に集中する。**#48/#49 で「帯域実測 + slot / 表示バッファ予算表」を必須**とする（下記予算表 #59 で着手。実スループット計測は #57 membench へ委譲）。
 - **`.sdram` teardown**: `sdram test` は `.sdram` を破壊する。リングや将来の LTDC framebuffer が増えると `camera_frame_invalidate()` だけでは不足 → パイプラインに「全 SDRAM 常駐 consumer を停止 / 無効化する suspend/invalidate 契約」を持たせる（`camera_frame_invalidate` の一般化）。
+
+### SDRAM 帯域予算（#59）
+
+QVGA RGB565 プレビューの定常時、単一 16-bit FMC SDRAM（理論 216 MB/s @ 108 MHz CAS3）を奪い合う主要コンシューマの予算。**「実測スループット」ではなく予算 + 実測カウンタ**で評価する（実 fps と `dma fe/s` は実機 verify で確定。フル membench は #57）:
+
+| コンシューマ | 1 フレーム | 代表レート | 帯域 | #59 |
+|---|---|---|---|---|
+| LTDC scanout（front 面 read） | 480×272×2 = 255 KB | 29.6 Hz | ~7.8 MB/s | **(A)** 9.6→4.8 MHz で 15.5→7.8 |
+| DCMI write（QVGA RGB565） | 320×240×2 = 150 KB | ~15 fps | ~2.3 MB/s | 不変 |
+| DMA2D slot→view | 150 KB R+W = 300 KB | 表示 fps 依存 | — | **(B1)** redraw pending 時は省略 |
+| DMA2D view→back（icon draw） | 300 KB | 表示 fps 依存 | — | 不変（必須） |
+| DMA2D copy-forward | 300 KB | — | — | **(B2)** 定常で全廃 |
+
+- **(A)** LTDC を 9.6→4.8 MHz に下げ瞬間 SDRAM 占有とバースト頻度を低減（out-of-spec、[display](../hardware/display.md)）。LTDC は active 画素のみ read するので帯域はリフレッシュにのみ比例。
+- **(B1)** `cam_redraw_pending` 中の slot→view コピーをコアレス（フレームが redraw を上回る競合時にこそ効く）。
+- **(B2)** カメラ矩形は毎フレーム全面再描画されるので copy-forward（旧来 3 本目の全面 DMA2D コピー ≈ 300 KB/表示frame）を定常で全廃。ダブルバッファ整合は per-buffer の stale 追跡 + present 直前の corrective copy で担保（[guix](../rtos/guix.md)）。
+- 指標: `camera stream stats` の **`dma fe/s`**（理想 0 近傍）、`lcd info` の **underrun=no**、表示 tear なし。
+
+**実測（プレビュー, QVGA RGB565, 同一 14.9 fps, 10 秒法, underrun=no）** — レバーを順に足した切り分け:
+
+| 版 | LCD_CLK | DMA2D | dma fe/s |
+|---|---|---|---|
+| レバー無し | 9.6 MHz | 3 | 3408 |
+| A のみ | 6.4 MHz | 3 | 2539 |
+| A+B（40Hz） | 6.4 MHz | 2 | 2005 |
+| **A+B（最終, 30Hz）** | 4.8 MHz | 2 | **1670** |
+
+レバー無し **3408 fe/s** → 最終 **1670 fe/s（−51%）**。内訳: **A（クロック 9.6→6.4 MHz, 3 回固定）−869**、**B（DMA2D 3→2 回, 6.4 MHz 固定）−534**、さらに **クロック 6.4→4.8 MHz（30Hz 化）−335**。A が支配的だが B も約 4 割寄与。`ovr dcmi/ring=0`・表示安定。FE は 0 にはならない（残 ~1.17%/バースト＝調停レイテンシ由来）が**非致命・実害ゼロ**。0 近傍を狙うなら今回スコープ外の **AXI QoS / DMA FIFO 調停**が必要（#59 受け入れ基準の「FE 残存でも実害ゼロ」を満たす）。
 
 ## 後続 issue との関係
 

@@ -920,6 +920,14 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "ovr dcmi:  %lu\r\n", (unsigned long)si.dcmi_ovr);
 	cli_print(sh, "ovr ring:  %lu\r\n", (unsigned long)si.ring_ovr);
 	cli_print(sh, "dma fe:    %lu\r\n", (unsigned long)si.dma_fe);
+	if (si.elapsed_ms != 0) {
+		/* DMA FIFO-error RATE (#59): the figure of merit for the SDRAM-contention
+		   work -- fe per second x10 (one decimal), no floating point. */
+		uint32_t fe10 = (uint32_t)((uint64_t)si.dma_fe * 10000u / si.elapsed_ms);
+
+		cli_print(sh, "dma fe/s:  %lu.%lu\r\n",
+		          (unsigned long)(fe10 / 10u), (unsigned long)(fe10 % 10u));
+	}
 	return 0;
 }
 

@@ -58,22 +58,28 @@ static int cam_sink_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t 
    pin is held across threads, so off() drains in one consume() at most. */
 static int cam_sink_consume(void *ctx, const struct frame_desc *f)
 {
-	int rc;
+	int pending = cam_redraw_pending;   /* snapshot for B1 coalescing (#59) */
+	int rc = 0;
 
 	(void)ctx;
 	cam_sink_inflight++;
 
-	/* slot -> view buffer (DMA2D M2M under ltdc_lock; serialised against the
-	   GUIX icon draw so the view is never half-overwritten while displayed). */
-	rc = guix_display_copy_rgb565(cam_view_buf, (const uint16_t *)f->data,
-	                              CAM_VIEW_W, CAM_VIEW_H, 0u, 0u);
+	/* B1 (#59): while a repaint is still outstanding the GUIX thread has not yet
+	   consumed the previous view, so copying another frame into it is wasted
+	   DMA2D/SDRAM bandwidth -- it would just be overdrawn.  Coalesce: store only
+	   when no redraw is pending.  guix_display_cam_view_store does the slot->view
+	   DMA2D copy AND marks both LTDC buffers stale atomically under ltdc_lock
+	   (B2), so the GUIX draw/toggle can never clear a stale flag for an older
+	   view (the producer is the only writer of cam_view_buf). */
+	if (!pending)
+		rc = guix_display_cam_view_store((const uint16_t *)f->data);
 
 	camera_frame_put(&guix_cam_sink, f);   /* release the pre-pinned slot */
 
 	/* Wake the GUIX thread to repaint the icon.  dirty_mark happens there (the
 	   root handler), not here -- a non-GUIX thread must not touch the dirty
 	   list.  On a copy failure keep the last good frame and skip the wake. */
-	if (rc == 0 && !cam_redraw_pending) {
+	if (rc == 0 && !pending) {
 		if (guix_post_root_event(GX_EVENT_CAMERA_FRAME) == GUIX_OK)
 			cam_redraw_pending = 1;
 	}
@@ -133,8 +139,12 @@ int guix_camera_on(void)
 	}
 
 	cam_redraw_pending = 0;
+	/* Register the view buffer and arm the B2 copy-forward optimization before
+	   any frame can arrive (#59).  CAMERA_SHOW later makes it visible. */
+	guix_display_cam_preview_begin(cam_view_buf);
 	rc = camera_preview_start(&guix_cam_sink);   /* probe/configure + stream */
 	if (rc != 0) {
+		guix_display_cam_preview_end();
 		LOG_ERR("camera preview start failed (%d)", rc);
 		return GUIX_ERR;
 	}
@@ -176,6 +186,7 @@ int guix_camera_off(void)
 	if (cam_sink_inflight > 0)
 		LOG_WRN("camera preview drain timeout (inflight=%d)", cam_sink_inflight);
 
+	guix_display_cam_preview_end();   /* disarm B2; cam_view_buf no longer fed (#59) */
 	cam_redraw_pending = 0;
 	LOG_INF("camera preview off");
 	return GUIX_OK;

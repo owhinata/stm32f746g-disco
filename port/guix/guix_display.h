@@ -22,6 +22,7 @@
 #ifndef GUIX_DISPLAY_H
 #define GUIX_DISPLAY_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "gx_api.h"
@@ -46,6 +47,28 @@ void guix_display_fill_back(uint16_t rgb565);
  *  private view buffer; both must be DMA2D-coherent (non-cacheable SDRAM). */
 int guix_display_copy_rgb565(uint16_t *dst, const uint16_t *src, uint32_t w,
                              uint32_t h, uint32_t dst_off, uint32_t src_off);
+
+/* ---- camera live-preview copy-forward elimination (#59 Lever B2) ---------- */
+
+/** Arm the preview-path copy-forward optimization for a session and register the
+ *  camera view buffer (whose content is the latest captured frame).  Both LTDC
+ *  buffers start "stale" so the first frames are corrected before present.
+ *  Call from guix_camera before the stream starts; runs under ltdc_lock. */
+void guix_display_cam_preview_begin(uint16_t *view_buf);
+
+/** Disarm the optimization at preview teardown (runs under ltdc_lock). */
+void guix_display_cam_preview_end(void);
+
+/** Gate the buffer-toggle B2 paths to when the camera screen is on display.
+ *  Call with true on CAMERA_SHOW and false on CAMERA_HIDE, from the GUIX thread
+ *  (root handler), so the corrective copy / copy-forward skip never touch the
+ *  camera rect while another screen owns it.  Runs under ltdc_lock. */
+void guix_display_cam_set_visible(bool on);
+
+/** Store a freshly captured frame (@p src, CAM_VIEW_W x CAM_VIEW_H RGB565) into
+ *  the view buffer via DMA2D and mark BOTH LTDC buffers stale, atomically under
+ *  ltdc_lock.  Returns 0 on a completed copy, -1 otherwise. */
+int guix_display_cam_view_store(const uint16_t *src);
 
 #ifdef __cplusplus
 }

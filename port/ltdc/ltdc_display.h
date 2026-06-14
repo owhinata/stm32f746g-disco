@@ -36,9 +36,14 @@
  * PLLSAI shares the main PLL's input divider M (=25), so VCO_in = HSE/M =
  * 25/25 = 1 MHz; with PLLSAIN=192 the PLLSAI VCO is 192 MHz (within the
  * 100..432 MHz range, RM0385 §5.3.24), /PLLSAIR(5) = 38.4 MHz PLLLCDCLK, and
- * /PLLSAIDIVR(4) = 9.6 MHz LCD_CLK (RM0385 §5.3.25 RCC_DCKCFGR1).  This is a
+ * /PLLSAIDIVR(8) = 4.8 MHz LCD_CLK (RM0385 §5.3.25 RCC_DCKCFGR1).  This is a
  * separate PLL from the main PLL, so it does NOT disturb SYSCLK (216 MHz) or
- * the FMC SDRAM clock (108 MHz).
+ * the FMC SDRAM clock (108 MHz).  LCD_CLK was lowered from the stock 9.6 MHz to
+ * 4.8 MHz (~29.6 Hz; only PLLSAIDIVR doubled 4 -> 8) to relieve the LTDC's
+ * continuous SDRAM read pressure and the DCMI DMA FIFO errors of #59 (measured
+ * -51% preview FE) -- a DELIBERATE out-of-spec operating point (line period
+ * 118 us > the RK043FN48H 65 us max, refresh < the ~50 Hz floor) validated on
+ * hardware; in-spec fallback ~8.8 MHz / ~54 Hz (PLLSAIN=176).
  *
  * Memory: the frame buffer lives in the `.sdram` (NOLOAD) section -- the same
  * 8 MB region that bsp_init() maps Normal **non-cacheable** through the MPU, so
@@ -80,8 +85,8 @@ extern "C" {
 #define LTDC_LCD_WIDTH   480u
 #define LTDC_LCD_HEIGHT  272u
 
-/* LCD_CLK fed to the panel: PLLSAI VCO(192) / R(5) / DIVR(4) = 9.6 MHz. */
-#define LTDC_PIXEL_CLOCK_HZ  9600000u
+/* LCD_CLK fed to the panel: PLLSAI VCO(192) / R(5) / DIVR(8) = 4.8 MHz (#59). */
+#define LTDC_PIXEL_CLOCK_HZ  4800000u
 
 /* Handy RGB565 constants for the `lcd` command. */
 #define LTDC_RGB565_BLACK    0x0000u

@@ -263,10 +263,58 @@ slot is not recycled mid-copy); a multi-call reader (row-by-row save) compares
 - **SDRAM bandwidth**: the risk is bandwidth, not capacity.  DCMI write + LTDC
   scanout + DMA2D + ETH DMA + CPU read all converge on one FMC SDRAM.  **#48/#49
   must include a measured-bandwidth and slot / display-buffer budget table.**
+  (Started by the #59 budget table below; a measured throughput number is
+  deferred to the #57 membench.)
 - **`.sdram` teardown**: `sdram test` clobbers `.sdram`.  As the ring and a
   future LTDC framebuffer grow there, `camera_frame_invalidate()` alone is no
   longer enough -> the pipeline gains a "suspend/invalidate all SDRAM-resident
   consumers" contract (a generalisation of `camera_frame_invalidate`).
+
+### SDRAM bandwidth budget (#59)
+
+Steady-state QVGA RGB565 preview budget for the main consumers contending for the
+one 16-bit FMC SDRAM (theoretical 216 MB/s @ 108 MHz CAS3).  This is a **budget +
+observed-counters** view, not a measured throughput (real fps and `dma fe/s` are
+confirmed on hardware; a full membench is #57):
+
+| Consumer | Per frame | Reference rate | Bandwidth | #59 |
+|---|---|---|---|---|
+| LTDC scanout (front-buffer read) | 480×272×2 = 255 KB | 29.6 Hz | ~7.8 MB/s | **(A)** 9.6→4.8 MHz: 15.5→7.8 |
+| DCMI write (QVGA RGB565) | 320×240×2 = 150 KB | ~15 fps | ~2.3 MB/s | unchanged |
+| DMA2D slot→view | 150 KB R+W = 300 KB | display-fps | — | **(B1)** skipped while a redraw is pending |
+| DMA2D view→back (icon draw) | 300 KB | display-fps | — | unchanged (required) |
+| DMA2D copy-forward | 300 KB | — | — | **(B2)** eliminated in steady state |
+
+- **(A)** Lower LTDC from 9.6 → 4.8 MHz to cut its instantaneous SDRAM occupancy
+  and burst frequency (out-of-spec, [display](../hardware/display.md)).  The LTDC
+  reads only active pixels, so its bandwidth scales only with refresh.
+- **(B1)** Coalesce the slot→view copy while `cam_redraw_pending` is set (it helps
+  exactly when frames outpace the redraw — the contended case).
+- **(B2)** The camera rect is fully repainted every frame, so the copy-forward
+  (the old third full-frame DMA2D copy, ≈300 KB/displayed frame) is eliminated in
+  steady state.  Double-buffer consistency is held by per-buffer stale tracking +
+  a pre-flip corrective copy ([guix](../rtos/guix.md)).
+- Figures of merit: `camera stream stats` **`dma fe/s`** (ideally near 0),
+  `lcd info` **underrun=no**, and no display tearing.
+
+**Measured (preview, QVGA RGB565, same 14.9 fps, 10 s, underrun=no)** — isolating
+the levers as they are added:
+
+| Variant | LCD_CLK | DMA2D | dma fe/s |
+|---|---|---|---|
+| no levers | 9.6 MHz | 3 | 3408 |
+| A only | 6.4 MHz | 3 | 2539 |
+| A+B (40 Hz) | 6.4 MHz | 2 | 2005 |
+| **A+B (final, 30 Hz)** | 4.8 MHz | 2 | **1670** |
+
+No levers **3408 fe/s** → final **1670 fe/s (−51%)**.  Breakdown: **A (clock
+9.6→6.4 MHz, 3 copies fixed) −869**, **B (DMA2D 3→2 copies, 6.4 MHz fixed) −534**,
+and a further **clock 6.4→4.8 MHz (the 30 Hz step) −335**.  A dominates but B still
+contributes ~40%.  `ovr dcmi/ring=0`, stable image.  FE does not reach zero
+(residual ~1.17%/burst, an arbitration-latency effect) but it is non-fatal and
+harmless.  Driving it toward 0 would need the out-of-scope AXI QoS / DMA-FIFO
+arbitration levers (this satisfies #59's "residual FE with zero harm" acceptance
+criterion).
 
 ## Relationship to later issues
 

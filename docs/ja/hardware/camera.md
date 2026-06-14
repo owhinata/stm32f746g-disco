@@ -286,7 +286,7 @@ camera stream stats                                   FPS / frames / overrun
 
 `start` は即座に戻り、CLI プロンプトを奪わない。取り込みは producer スレッドが回し、`--frames`/`--secs` 到達・`stream stop`・**DMA 転送エラー (TE)** のいずれかで自動停止する。stream と `camera capture` は同一 DCMI/DMA を共有するため**排他**（stream 中の capture は busy）。
 
-**DMA エラーの扱い (#56)**: double-buffer arm（`HAL_DMAEx_MultiBufferStart_IT`）は、snapshot 経路（`HAL_DMA_Start_IT`）が有効化しない **FIFO error 割込み**を有効化する。FIFO threshold/burst が不整合な構成なら FE はストリームを HW disable し得るが、本実装の `FIFO_THRESHOLD_FULL + MBURST_INC4` は整合構成であり、LTDC がフレームバッファを常時リードする SDRAM 競合下で観測される FE（FIFO overrun/underrun）/ DME は**ストリームを停止させない**（snapshot は単に割込みを見ていないだけ）。したがってこれらは**計数して継続**（`stats` の `dma fe`、QVGA で数千/秒オーダー）し、ハードがストリームを実際に停止させる **TE のみを terminal** として扱う。DCMI FIFO オーバーラン (`ovr dcmi`) は別系統で、これは本来 0 近傍。
+**DMA エラーの扱い (#56)**: double-buffer arm（`HAL_DMAEx_MultiBufferStart_IT`）は、snapshot 経路（`HAL_DMA_Start_IT`）が有効化しない **FIFO error 割込み**を有効化する。FIFO threshold/burst が不整合な構成なら FE はストリームを HW disable し得るが、本実装の `FIFO_THRESHOLD_FULL + MBURST_INC4` は整合構成であり、LTDC がフレームバッファを常時リードする SDRAM 競合下で観測される FE（FIFO overrun/underrun）/ DME は**ストリームを停止させない**（snapshot は単に割込みを見ていないだけ）。したがってこれらは**計数して継続**（`stats` の `dma fe`、QVGA で数千/秒オーダー）し、ハードがストリームを実際に停止させる **TE のみを terminal** として扱う。DCMI FIFO オーバーラン (`ovr dcmi`) は別系統で、これは本来 0 近傍。**#59** はこのプレビュー時 FE を緩和した（LCD_CLK 9.6→4.8MHz + DMA2D copy-forward 全廃、指標は `stats` の `dma fe/s`。詳細は [GUIX](../rtos/guix.md) / [display](display.md)）。
 
 ### GUIX ライブプレビュー（#56）
 

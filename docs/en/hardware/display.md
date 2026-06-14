@@ -11,8 +11,8 @@ This started as **Phase 1** (#52) of the LTDC + GUIX epic (#48) — a single RGB
 | Panel | RK043FN48H-CT (480×272, 24-bit RGB, capacitive touch) | UM1907 / rk043fn48h.h |
 | Pixel format | **RGB565** (16 bpp) | LTDC layer 0 |
 | Frame buffer | 480×272×2 × **2 buffers** = **522240 B (~510 KB)**, in `.sdram` | non-cacheable, double-buffer |
-| LCD_CLK | **9.6 MHz** (PLLSAI) | derivation below |
-| Frame rate | 565×285 clk @ 9.6 MHz ≈ **59.3 Hz** (~16.9 ms/frame) | timings below |
+| LCD_CLK | **4.8 MHz** (PLLSAI; lowered from 9.6 MHz in #59, **out-of-spec**) | derivation below |
+| Frame rate | 566×286 clk @ 4.8 MHz ≈ **29.6 Hz** (~33.7 ms/frame) | timings below |
 | Timings (spec) | HSYNC=41 / HBP=13 / HFP=32 / VSYNC=10 / VBP=2 / VFP=2 | rk043fn48h.h |
 | Polarity | HS / VS / DE = **active-low**, PC = **IPC** (not inverted) | ST BSP / RM0385 §18.7.5 |
 | Drawing | **DMA2D** (R2M fill / M2M blit, polled to completion) | RM0385 §9 |
@@ -20,7 +20,7 @@ This started as **Phase 1** (#52) of the LTDC + GUIX epic (#48) — a single RGB
 
 The values programmed into LTDC are each **spec minus one** (`HorizontalSync=40 / VerticalSync=9 / AccumulatedHBP=53 / AccumulatedVBP=11 / AccumulatedActiveW=533 / AccumulatedActiveH=283 / TotalWidth=565 / TotalHeigh=285`).
 
-## Clock: PLLSAI → LCD_CLK 9.6 MHz
+## Clock: PLLSAI → LCD_CLK 4.8 MHz (#59, out-of-spec)
 
 The LTDC pixel clock comes from **PLLSAI**, previously unused. PLLSAI **shares the main PLL's input divider M (=25)** (RM0385 §5.3.8), so:
 
@@ -28,10 +28,13 @@ The LTDC pixel clock comes from **PLLSAI**, previously unused. PLLSAI **shares t
 VCO_in    = HSE / M       = 25 MHz / 25 = 1 MHz
 PLLSAI VCO = VCO_in × PLLSAIN(192)   = 192 MHz   (within 100..432 MHz, RM0385 §5.3.24)
 PLLLCDCLK = VCO / PLLSAIR(5)          = 38.4 MHz
-LCD_CLK   = PLLLCDCLK / PLLSAIDIVR(4) = 9.6 MHz   (RM0385 §5.3.25 RCC_DCKCFGR1)
+LCD_CLK   = PLLLCDCLK / PLLSAIDIVR(8) = 4.8 MHz   (RM0385 §5.3.25 RCC_DCKCFGR1)
 ```
 
 PLLSAI is a **separate PLL from the main PLL**, so configuring it via `HAL_RCCEx_PeriphCLKConfig(RCC_PERIPHCLK_LTDC)` **does not disturb SYSCLK (216 MHz) or the FMC SDRAM clock (108 MHz)**.
+
+!!! warning "4.8 MHz is a deliberate out-of-spec point (#59)"
+    It was originally **9.6 MHz** (`PLLSAIN=192`). **#59** lowered it to **4.8 MHz (~29.6 Hz)** to relieve the LTDC's continuous SDRAM read pressure and the DCMI DMA FIFO errors it causes during camera preview. At 4.8 MHz the **line period is 566 clk = 118 µs** (beyond the RK043FN48H 55–65 µs spec — the 480 active px alone take 100 µs) and **~29.6 Hz is below the panel's ~50 Hz floor** — both out of panel spec. It is a deliberate operating point validated on hardware (stable image, no sync loss, underrun=0, no flicker); the **in-spec fallback is ~8.8 MHz / ~54 Hz (`PLLSAIN=176`)** if artifacts appear. Because the LTDC reads only active pixels, its bandwidth scales only with refresh, so in spec it can drop only to ~54 Hz.
 
 !!! note "Why it is safe from tx_application_define (the HAL tick)"
     The HAL PLLSAI lock wait is `HAL_GetTick()`-based (100 ms timeout). This project's `SysTick_Handler` calls `HAL_IncTick()` **unconditionally**, regardless of whether the ThreadX timer is running (`port/threadx/tx_glue.c`), so the HAL tick advances even inside `tx_application_define` before the scheduler starts, and a failed lock still times out. `sdram_init()` uses a TIM2 busy-wait because the *ThreadX* timer tick is a different thing; the HAL tick is separate.
@@ -60,7 +63,7 @@ Double buffering (#53) uses **two buffers = ~510 KB**. Current `.sdram` occupanc
 
 0. **SDRAM guard**: return `LTDC_ERR_STATE` immediately unless `sdram_is_up()`. The frame buffer is in `.sdram` (0xC0000000); touching it with the FMC down would fault, so the caller gates it too (defence in depth).
 1. **Create ThreadX objects**: the reload semaphore + the `ltdc_lock` mutex (creating them in `tx_application_define` is the normal use; no interrupt fires at run time)
-2. PLLSAI → LCD_CLK 9.6 MHz (`HAL_RCCEx_PeriphCLKConfig`)
+2. PLLSAI → LCD_CLK 4.8 MHz (`HAL_RCCEx_PeriphCLKConfig`, #59)
 3. LTDC clock + GPIO (AF + DISP/BL outputs, parked off for now)
 4. **Clear BOTH buffers to black** (`.sdram` is NOLOAD = undefined; clearing before ConfigLayer / backlight-on prevents a garbage front frame and a garbage first flip). `ltdc_front=0`
 5. `HAL_LTDC_Init` (timings / polarity / black background above)
@@ -107,7 +110,7 @@ Each op follows the same ST BSP `LL_FillBuffer` / `LL_ConvertLineToARGB8888` idi
    - VBR==0 → swap `ltdc_front` to the back buffer (commit), return `LTDC_OK`
    - timeout with VBR==1 → **fail-closed**: leave the front buffer unchanged, latch `ltdc_fault` (so `ltdc_is_up()` becomes false), return `LTDC_ERR_HAL`. Recovery is a system reset.
 
-The LTDC frame period is 565×285 clk @ 9.6 MHz ≈ **59.3 Hz** (~16.9 ms/frame), so 100 ms is several frames of slack. The interrupt priority is **9** (below DCMI/DMA2=8, no clash with SD=6-7 / USART=5).
+The LTDC frame period is 566×286 clk @ 4.8 MHz ≈ **29.6 Hz** (~33.7 ms/frame, #59), so 100 ms is several frames of slack. The interrupt priority is **9** (below DCMI/DMA2=8, no clash with SD=6-7 / USART=5).
 
 ## The `lcd` shell command
 
@@ -131,7 +134,7 @@ Example session:
 ```
 sh> lcd info
 panel:   RK043FN48H-CT 480x272 RGB565 (LTDC layer 0)
-clock:   LCD_CLK 9.60 MHz (PLLSAI N=192 R=5, DIVR/4)
+clock:   LCD_CLK 4.80 MHz (PLLSAI N=192 R=5, DIVR/8)
 fb:      0xc00bb800 (.sdram, non-cacheable)
 buffers: 2 (double, tear-free VBR)
 front:   0
@@ -146,7 +149,10 @@ sh> lcd fill red
 
 ## Bandwidth
 
-The LTDC continuously reads **only the front buffer** during the active period, every frame (double buffering does not increase the LTDC read bandwidth — it still fetches one buffer). At RGB565 and a 9.6 MHz pixel clock the upper bound is **9.6 Mpix/s × 2 B = 19.2 MB/s** (≈15.6 MB/s effective for active fetch only). Against the SDRAM's theoretical bandwidth (16-bit @ 108 MHz = 216 MB/s) that is about 9%. The DMA2D fills/blits are short write bursts to the back buffer (at most ~510 KB per drawn frame), and the CPU waits on `PollForTransfer`, so they contend with the LTDC read only briefly. There is headroom alongside DCMI writes (QVGA ~11 fps ≈ 1.65 MB/s) and the CPU (verify on hardware: `lcd anim`/`blit`, `camera capture`/`stream` regress cleanly, underrun=no). Re-evaluate with higher resolution/fps.
+The LTDC continuously reads **only the front buffer** during the active period, every frame (double buffering does not increase the LTDC read bandwidth — it still fetches one buffer). At RGB565 and a **4.8 MHz** pixel clock (#59) the upper bound is **4.8 Mpix/s × 2 B = 9.6 MB/s** (≈7.8 MB/s effective for active fetch only). Against the SDRAM's theoretical bandwidth (16-bit @ 108 MHz = 216 MB/s) that is about 4.4%. The DMA2D fills/blits are short write bursts to the back buffer (at most ~510 KB per drawn frame), and the CPU waits on `PollForTransfer`, so they contend with the LTDC read only briefly. There is headroom alongside DCMI writes (QVGA ≈ 1.65 MB/s) and the CPU (verify on hardware: `lcd anim`/`blit`, `camera capture`/`stream` regress cleanly, underrun=no).
+
+!!! note "SDRAM bandwidth contention and the camera preview (#59)"
+    On **average** the LTDC read is only ~6%, but its **instantaneous bursts** contend (in FMC arbitration) with the DCMI DMA's 16-byte FIFO and induce DCMI DMA FIFO errors (FE) during camera preview. #59 mitigates this with two levers: **(A)** the LCD_CLK drop from 9.6 → 4.8 MHz in this section (less instantaneous LTDC SDRAM occupancy), and **(B)** fewer DMA2D round-trips in the preview path (see the bandwidth budget table in [frame pipeline](../architecture/frame-pipeline.md)). The figures of merit are `camera stream stats` **`dma fe/s`** and `lcd info` **underrun**. Re-evaluate with higher resolution/fps.
 
 ## References
 

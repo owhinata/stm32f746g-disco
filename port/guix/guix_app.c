@@ -8,6 +8,7 @@
  */
 #include "guix_app.h"
 #include "guix_camera.h"         /* camera preview screen: pixmap, events, off() */
+#include "guix_display.h"        /* guix_display_cam_set_visible (#59 B2)       */
 #include "ltdc_display.h"        /* LTDC_LCD_WIDTH / HEIGHT */
 
 #include "gx_api.h"
@@ -179,9 +180,11 @@ static UINT guix_root_event(GX_WIDGET *widget, GX_EVENT *event_ptr)
 		gx_system_dirty_mark((GX_WIDGET *)&cam_icon);
 		return GX_SUCCESS;
 	case GX_EVENT_CAMERA_SHOW:
+		guix_display_cam_set_visible(true);   /* arm B2 before screen2 draws (#59) */
 		guix_app_select_screen(2);
 		return GX_SUCCESS;
 	case GX_EVENT_CAMERA_HIDE:
+		guix_display_cam_set_visible(false);  /* disarm before screen0 draws (#59) */
 		guix_app_select_screen(0);
 		return GX_SUCCESS;
 	default:

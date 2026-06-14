@@ -11,8 +11,17 @@
  *
  *   - Pixel clock from PLLSAI: VCO_in = HSE/M = 25/25 = 1 MHz (M shared with the
  *     main PLL, RM0385 §5.3.8), PLLSAIN=192 -> VCO 192 MHz, PLLSAIR=5 ->
- *     PLLLCDCLK 38.4 MHz, PLLSAIDIVR=4 -> LCD_CLK 9.6 MHz.  PLLSAI is a separate
- *     PLL, so SYSCLK (216 MHz) and the FMC SDRAM clock (108 MHz) are untouched.
+ *     PLLLCDCLK 38.4 MHz, PLLSAIDIVR=8 -> LCD_CLK 4.8 MHz (~29.6 Hz).  PLLSAI is a
+ *     separate PLL, so SYSCLK (216 MHz) and the FMC SDRAM clock (108 MHz) are
+ *     untouched.  4.8 MHz is LOWERED from the stock 9.6 MHz (only PLLSAIDIVR
+ *     doubled 4 -> 8) to cut the LTDC's continuous SDRAM read pressure and the
+ *     DCMI DMA FIFO errors it causes during camera preview (#59; measured -51%
+ *     preview FE vs no levers).  NOTE: at 4.8 MHz the line period is 566 clk =
+ *     118 us, well OUTSIDE the RK043FN48H 55..65 us spec (the 480 active px alone
+ *     take 100 us), and ~29.6 Hz is below the panel's ~50 Hz floor -- a deliberate
+ *     out-of-spec operating point validated on hardware (stable image, no sync
+ *     loss / flicker, LTDC underrun=0); the in-spec fallback is ~8.8 MHz / ~54 Hz
+ *     (PLLSAIN=176, R=5, DIVR=4).
  *   - Panel timing (RK043FN48H datasheet / rk043fn48h.h), HW values are the
  *     spec minus one: HSYNC 41, HBP 13, HFP 32, VSYNC 10, VBP 2, VFP 2.
  *     Polarity HS/VS/DE active-low, pixel clock not inverted (LTDC_PCPOLARITY_IPC).
@@ -223,7 +232,10 @@ static void ltdc_dma2d_blit(uint16_t *dst, const uint16_t *src, uint32_t w,
 		HAL_DMA2D_PollForTransfer(&hdma2d, 30);
 }
 
-/* PLLSAI -> LCD_CLK = 9.6 MHz (see file header / RM0385 §5.3.24/25). */
+/* PLLSAI -> LCD_CLK = 4.8 MHz (#59; see file header / RM0385 §5.3.24/25).
+   VCO_in 1 MHz * PLLSAIN(192) = 192 MHz (100..432 range) / PLLSAIR(5) = 38.4 MHz
+   / PLLSAIDIVR(8) = 4.8 MHz (~29.6 Hz).  Out-of-spec on purpose (validated on
+   hardware); in-spec fallback PLLSAIN=176, R=5, DIVR=4 (-> 8.8 MHz / ~54 Hz). */
 static int ltdc_clock_init(void)
 {
 	RCC_PeriphCLKInitTypeDef pclk = {0};
@@ -231,7 +243,7 @@ static int ltdc_clock_init(void)
 	pclk.PeriphClockSelection = RCC_PERIPHCLK_LTDC;
 	pclk.PLLSAI.PLLSAIN       = 192;
 	pclk.PLLSAI.PLLSAIR       = 5;
-	pclk.PLLSAIDivR           = RCC_PLLSAIDIVR_4;
+	pclk.PLLSAIDivR           = RCC_PLLSAIDIVR_8;
 
 	if (HAL_RCCEx_PeriphCLKConfig(&pclk) != HAL_OK) {
 		LOG_ERR("PLLSAI/LCD clock config failed");
@@ -402,7 +414,7 @@ int ltdc_init(void)
 	ltdc_backlight(true);
 
 	ltdc_up = true;
-	LOG_INF("RK043FN48H up: 480x272 RGB565 double-buffered, LCD_CLK 9.6 MHz, "
+	LOG_INF("RK043FN48H up: 480x272 RGB565 double-buffered, LCD_CLK 4.8 MHz, "
 	        "FB0 @0x%08lx FB1 @0x%08lx",
 	        (unsigned long)(uintptr_t)&ltdc_fb[0][0],
 	        (unsigned long)(uintptr_t)&ltdc_fb[1][0]);
@@ -613,7 +625,8 @@ static int ltdc_flip_locked(void)
 	(void)HAL_LTDC_Reload(&hltdc, LTDC_RELOAD_VERTICAL_BLANKING);
 
 	/* Wake-up hint (the IRQ posts on reload-ready); the truth is VBR below.
-	   A frame is ~16.9 ms (59.3 Hz), so 100 ms is many frames of slack. */
+	   A frame is ~33.7 ms (~29.6 Hz @ 4.8 MHz, #59), so 100 ms is still several
+	   frames of slack. */
 	(void)tx_semaphore_get(&ltdc_reload_sem, 100);
 
 	/* Authoritative confirmation: wait (up to ~100 ms total) for the hardware

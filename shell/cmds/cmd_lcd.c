@@ -128,7 +128,7 @@ static int cmd_lcd_info(struct cli_instance *sh, int argc, char **argv)
 	(void)argv;
 
 	cli_print(sh, "panel:   RK043FN48H-CT 480x272 RGB565 (LTDC layer 0)\r\n");
-	cli_print(sh, "clock:   LCD_CLK %lu.%02lu MHz (PLLSAI N=192 R=5, DIVR/4)\r\n",
+	cli_print(sh, "clock:   LCD_CLK %lu.%02lu MHz (PLLSAI N=192 R=5, DIVR/8)\r\n",
 	          (unsigned long)(LTDC_PIXEL_CLOCK_HZ / 1000000u),
 	          (unsigned long)(LTDC_PIXEL_CLOCK_HZ % 1000000u / 10000u));
 	cli_print(sh, "fb:      0x%08lx (.sdram, non-cacheable)\r\n",
