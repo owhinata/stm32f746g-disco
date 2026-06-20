@@ -191,6 +191,15 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		          (unsigned long)(cm.fps_target_x10 / 10u),
 		          (unsigned long)(cm.fps_target_x10 % 10u),
 		          cm.streamable ? "" : "  (capture only -- too large to stream)");
+		cli_print(sh, "fps select: %u", (unsigned)cm.fps_sel);
+		if (cm.fps_sel == 30u && cm.fps_eff == 15u) {
+			if (cm.fps_clamp == CAM_FPS_CLAMP_LTDC)
+				cli_print(sh, "  (clamped to 15: lcd scanout active "
+				          "-- `lcd disable` for 30fps)");
+			else
+				cli_print(sh, "  (24MHz: snapshot-only mode)");
+		}
+		cli_print(sh, "\r\n");
 	}
 
 	if (camera_get_settings(&cs) == 0) {
@@ -817,6 +826,20 @@ static int cmd_camera_format(struct cli_instance *sh, int argc, char **argv)
 	                                    (enum camera_format)n));
 }
 
+/* ---- frame rate (issue #67) ---------------------------------------------- */
+/* `camera fps <15|30>`: 15 = 24 MHz PCLK, 30 = 48 MHz.  30 fps only takes effect
+   for a small mode while the LTDC is not scanning out (otherwise it is clamped to
+   15 fps so the 48 MHz DCMI burst does not overrun the SDRAM); use `lcd disable`. */
+static int cmd_camera_fps(struct cli_instance *sh, int argc, char **argv)
+{
+	int n;
+
+	(void)argc;
+	if (cam_parse_int(argv[1], &n) != 0 || (n != 15 && n != 30))
+		return set_reject(sh, argv[0], argv[1]);
+	return set_report(sh, argv[0], argv[1], camera_set_fps((unsigned)n));
+}
+
 /* ---- streaming (issue #46): non-blocking start / stop / stats ------------ */
 
 static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
@@ -848,16 +871,23 @@ static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
 	}
 
 	/* Clearer message than the generic CAM_ERR_STATE: large modes and JPEG are
-	   capture-only (the ring slot / one DMA NDTR cannot hold the frame). */
+	   capture-only (the ring slot / one DMA NDTR cannot hold the frame).  Also warn
+	   when 30 fps is selected but clamped to 15 because the LTDC is scanning out
+	   (the stream still runs, just at 15 fps) -- `lcd disable` for 30 fps (#67). */
 	{
 		struct camera_mode m;
 
-		if (camera_get_mode(&m) == 0 && !m.streamable) {
-			cli_error(sh, "camera: %ux%u %s is capture-only -- too large to "
-			          "stream; use a smaller resolution\r\n",
-			          (unsigned)m.width, (unsigned)m.height,
-			          cam_name_of(format_names, m.format));
-			return 1;
+		if (camera_get_mode(&m) == 0) {
+			if (!m.streamable) {
+				cli_error(sh, "camera: %ux%u %s is capture-only -- too large to "
+				          "stream; use a smaller resolution\r\n",
+				          (unsigned)m.width, (unsigned)m.height,
+				          cam_name_of(format_names, m.format));
+				return 1;
+			}
+			if (m.fps_sel == 30u && m.fps_clamp == CAM_FPS_CLAMP_LTDC)
+				cli_print(sh, "camera: note: 30fps clamped to 15 (lcd scanout "
+				          "active; `lcd disable` for 30fps)\r\n");
 		}
 	}
 
@@ -957,6 +987,8 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD_ARG(format, NULL,
 	            "set pixel format <rgb565|yuv422|y8|jpeg> (jpeg: snapshot <=VGA)",
 	            cmd_camera_format, 2, 0),
+	CLI_CMD_ARG(fps, NULL, "set frame rate <15|30> (30 needs `lcd disable`)",
+	            cmd_camera_fps, 2, 0),
 	CLI_CMD_ARG(capture, NULL, "snapshot the current mode + stats ('test' = colorbar)",
 	            cmd_camera_capture, 1, 1),
 	CLI_CMD_ARG(save, NULL, "write frame raw <sd|fs> <path> (format per mode)",

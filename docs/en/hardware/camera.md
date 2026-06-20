@@ -81,6 +81,7 @@ camera probe             power cycle + read the OV5640 chip ID (~1 s)
 camera info              driver / sensor state + current mode / quality settings
 camera res <resolution>  switch resolution qqvga|qvga|480x272|vga|wvga (#45)
 camera format <fmt>      switch pixel format rgb565|yuv422|y8|jpeg (#45)
+camera fps <15|30>       frame rate 15 (PCLK 24M) / 30 (PCLK 48M); 30 needs lcd disable (#67)
 camera capture [test]    snapshot one frame in the current mode (test = colorbar)
 camera save <sd|fs> <p>  write the captured frame to a file, raw (mode's format)
 camera set [<name> <v>]  OV5640 image-quality controls (no arg = show)
@@ -202,11 +203,18 @@ type 'help camera set' for the list of settings
 - **Streaming only supports modes with frame_words ≤ 65535** (QQVGA/QVGA/480x272 in RGB565/YUV422). The producer's manual DBM points each M-register at a whole slot via NDTR, so larger modes are flagged `capture only` in `camera info` and `camera stream start` is refused.
 - **JPEG is snapshot-only and gated to ≤ VGA** (variable-length ring management is a separate concern).
 
-### Frame rate (per-mode HTS/VTS, ~15fps)
+### Frame rate (per-mode HTS/VTS + 15/30 fps knob, #45/#67)
 
-The `lib/ov5640` common table sets HTS=1936/VTS=1088 for **every** resolution at a fixed 24 MHz PCLK, so the default is **~11fps**. The fps table (`mode_fps[]`) applied by `camera res` gives the streamable small modes a tightened HTS/VTS (1600/1000 → **~15fps**, 14.9fps measured) and keeps the snapshot-only VGA/WVGA on the full common timing (1936/1088, ~11fps). `fps = PCLK/(HTS×VTS)`.
+The `lib/ov5640` common table sets HTS=1936/VTS=1088 for **every** resolution at a fixed 24 MHz PCLK, so the default is **~11fps**. The timing table (`mode_fps[]`) applied by `camera res` gives the streamable small modes a tightened HTS/VTS (1600/1000 → **~15fps**, 14.9fps measured) and keeps the snapshot-only VGA/WVGA on the full common timing (1936/1088, ~11fps). `fps = PCLK/(HTS×VTS)`.
 
-**PCLK stays at 24 MHz for all modes**: reaching 30fps needs 48 MHz PCLK, but 48 MHz doubles the peak DCMI burst rate and overruns the 16-bit SDRAM the instant the LTDC also reads the framebuffer (the GUIX preview dies with a DCMI overrun at frame 0) -- that bandwidth fight is issue #59. 15fps shares the **same peak rate** as the proven 11fps preview (tightening HTS/VTS only removes blanking), so it is overrun-safe. **30fps (48 MHz + FIFO threshold / FMC arbitration tuning) belongs to #59.**
+**`camera fps <15|30>` switches the PCLK between 24 and 48 MHz (#67).** The small modes (QQVGA/QVGA/480x272) keep HTS/VTS=1600/1000, so `48e6/(1600×1000)=30.0fps`. The default is **15fps (safe)**. `camera fps` re-applies to the sensor at once like `camera res/format`, and is refused while a stream/preview owns the DCMI (its PLL must not be retuned under a live DMA target).
+
+!!! danger "30fps (48 MHz) requires LTDC scanout to be stopped"
+    48 MHz doubles the peak DCMI burst rate and, while the LTDC continuously reads the framebuffer from the 16-bit SDRAM, **even the smallest QQVGA overruns within a few hundred ms** (`camera stream stats` shows `stopped (overrun)`). Measured: with **`lcd disable` (LTDC scanout OFF, #66)** all of qqvga/qvga/480x272 RGB565 run at ~30fps with 0 overrun and 0 FE (even 480x272 = 7.8 MB/s is perfectly clean).
+
+    So the effective PCLK is decided by a **single predicate**: 48 MHz **only when "fps 30 selected ∧ small mode ∧ `ltdc_scanout_active()`==false"** all hold; otherwise it **auto-clamps to 24 MHz** (a clamp, not a reject). This predicate is applied at every path that programs the sensor PCLK (`camera_set_format` / before a stream arm / before a snapshot arm), so selecting fps 30 while `lcd enable` is active or a GUIX preview is running safely falls back to 15fps. `camera info`'s `fps select` line shows the selection and the clamp reason (`lcd scanout active` / `snapshot-only mode`), and `camera stream start` prints a clamp note.
+
+    **Remaining constraint (TOCTOU):** if you start a 30fps stream under `lcd disable` and then `lcd enable`, the contention returns and overruns -- the stream **gracefully auto-stops** (counted in `stopped (overrun)` / `ovr dcmi`). Do not `lcd enable` during a 30fps stream. Cutting the LTDC scanout bandwidth to get "30fps even with preview" is a separate scope (#59/#65).
 
 !!! warning "VTS vs AEC max exposure clamp"
     If VTS drops below the AEC max-exposure line count (`0x3A02/03` and `0x3A14/15`, default 0x3D8=984) the exposure clips and the frame darkens / bands. `camera_set_format` reads **both** max-exposure pairs back **after re-applying the quality settings** (night mode rewrites AEC) and guarantees `VTS ≥ max + margin`, raising VTS (and lowering fps below target) if needed. The fps table values are a **starting point to tune against on-hardware `camera stream stats`** (contention tuning is #59).

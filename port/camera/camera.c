@@ -42,6 +42,7 @@
  */
 #include "camera.h"
 #include "sdram.h"
+#include "ltdc_display.h"   /* ltdc_scanout_active() -- 30 fps clamp guard (#67) */
 
 #include "stm32f7xx_hal.h"
 #include "tx_api.h"
@@ -173,6 +174,20 @@ static struct camera_mode mode = {
 	.res = CAM_RES_QVGA, .format = CAM_FMT_RGB565,
 	.hts = 1600u, .vts = 1000u, .pclk_hz = 24000000u,   /* QVGA fps-table base */
 };
+
+/* fps knob (#67): the selected frame rate (15 or 30), a user preference mapped to
+   a 24/48 MHz OV5640 PCLK.  48 MHz (30 fps) takes effect only for a small mode
+   while the LTDC is not scanning out (effective_ov_pclk()); otherwise the sensor
+   is clamped to 24 MHz so the 48 MHz DCMI burst never overruns the 16-bit SDRAM
+   the LTDC also reads.  Default 15 (safe with the display on). */
+static uint8_t cam_fps_sel = 15u;
+
+/* The PCLK actually programmed into the OV5640 (Hz), or 0 when unknown/desynced.
+   Distinct from mode.pclk_hz (the displayed/effective value): this is the truth
+   about the sensor.  Reset to 0 on every re-init (mode_reset_default / each
+   OV5640_Init) so apply_effective_pclk_locked() re-writes SetPCLK after a reset
+   even when mode.pclk_hz happens to match what we would select (#67). */
+static uint32_t cam_sensor_pclk_hz;
 
 /* Pure geometry per resolution (independent of format/timing). */
 static const uint16_t res_wh[CAM_RES__COUNT][2] = {
@@ -434,6 +449,7 @@ static void mode_reset_default(void)
 	   guard), so without this a re-configure after a power cycle / failed switch
 	   would be a no-op and leave the sensor unprogrammed (mode/sensor mismatch). */
 	ov5640.IsInitialized = 0U;
+	cam_sensor_pclk_hz = 0u;   /* sensor PLL back at power-on default (#67) */
 	mode_recompute(&d);
 	mode = d;
 }
@@ -691,6 +707,7 @@ static int camera_configure_locked(int colorbar)
 		}
 		info.configured = 1;
 		cam_colorbar    = -1;   /* forces the mode block below to run */
+		cam_sensor_pclk_hz = 0u;   /* Init reset the PLL; apply_effective re-sets (#67) */
 		tx_thread_sleep(CAM_SETTLE_INIT_MS);
 	}
 
@@ -735,29 +752,81 @@ static int camera_configure_locked(int colorbar)
 /* ---- mode switch: resolution / pixel format / fps (issue #45) ------------- */
 
 /*
- * Per-resolution fps table.  fps = pclk_hz / (hts * vts).  ALL modes stay on the
- * common-table 24 MHz PCLK: pushing PCLK to 48 MHz (for ~30 fps) doubles the
- * peak DCMI burst rate and overruns the 16-bit SDRAM the instant the LTDC also
- * reads it (the GUIX preview dies with a DCMI overrun) -- that bandwidth fight is
- * issue #59.  Here we only tighten HTS/VTS on the streamable small modes for a
- * safe ~15 fps (same peak rate as the proven 11 fps preview, just less blanking);
- * VGA/WVGA keep the full common timing (snapshot-only, frame rate irrelevant).
- * VTS is the BASE: apply_vts_locked() raises the effective VTS when the AEC max
- * exposure needs more lines and drops it back to this base otherwise.  Tune
- * against on-hardware `camera stream stats` (30 fps belongs to #59).
+ * Per-resolution timing table.  fps = pclk_hz / (hts * vts); the PCLK is no longer
+ * a fixed column -- it is the runtime fps knob (#67), see effective_ov_pclk().
+ * HTS/VTS is tightened on the small streamable modes (1600x1000) so 24 MHz gives a
+ * clean ~15 fps and 48 MHz exactly doubles it to ~30 fps (48e6/(1600*1000)=30.0);
+ * VGA/WVGA keep the full common timing (snapshot-only, frame rate irrelevant, and
+ * pinned to 24 MHz).  VTS is the BASE: apply_vts_locked() raises the effective VTS
+ * when the AEC max exposure needs more lines and drops it back to this base.
  */
 static const struct {
 	uint16_t hts;
 	uint16_t vts;
-	uint8_t  ov_pclk;     /* OV5640_PCLK_* */
-	uint32_t pclk_hz;
 } mode_fps[CAM_RES__COUNT] = {
-	[CAM_RES_QQVGA]   = { 1600u, 1000u, OV5640_PCLK_24M, 24000000u },
-	[CAM_RES_QVGA]    = { 1600u, 1000u, OV5640_PCLK_24M, 24000000u },
-	[CAM_RES_480x272] = { 1600u, 1000u, OV5640_PCLK_24M, 24000000u },
-	[CAM_RES_VGA]     = { 1936u, 1088u, OV5640_PCLK_24M, 24000000u },
-	[CAM_RES_WVGA]    = { 1936u, 1088u, OV5640_PCLK_24M, 24000000u },
+	[CAM_RES_QQVGA]   = { 1600u, 1000u },
+	[CAM_RES_QVGA]    = { 1600u, 1000u },
+	[CAM_RES_480x272] = { 1600u, 1000u },
+	[CAM_RES_VGA]     = { 1936u, 1088u },
+	[CAM_RES_WVGA]    = { 1936u, 1088u },
 };
+
+/* Only the small modes (QQVGA/QVGA/480x272) are streamable and worth 48 MHz; the
+   larger VGA/WVGA modes are snapshot-only and stay at 24 MHz regardless of fps. */
+static int res_is_small(uint8_t res)
+{
+	return res <= CAM_RES_480x272;
+}
+
+struct cam_pclk_sel { uint8_t ov; uint32_t hz; };
+
+/*
+ * The single safety predicate (#67): 48 MHz (30 fps) only when 30 fps is selected
+ * AND the mode is small AND the LTDC is NOT scanning out.  Any missing condition
+ * clamps to 24 MHz (15 fps) so the 48 MHz DCMI burst cannot overrun the 16-bit
+ * SDRAM that the LTDC reads continuously.  ltdc_scanout_active() is false when the
+ * LTDC never came up (no display = no contention), which correctly allows 48 MHz.
+ */
+static struct cam_pclk_sel effective_ov_pclk(uint8_t res)
+{
+	struct cam_pclk_sel s = { OV5640_PCLK_24M, 24000000u };
+
+	if (cam_fps_sel == 30u && res_is_small(res) && !ltdc_scanout_active()) {
+		s.ov = OV5640_PCLK_48M;
+		s.hz = 48000000u;
+	}
+	return s;
+}
+
+/*
+ * Re-apply the effective PCLK to the live sensor if it differs from what is
+ * actually programmed (cam_sensor_pclk_hz).  Called before arming a stream or a
+ * snapshot so the sensor PCLK always matches (fps_sel, res, scanout) even when the
+ * scanout state changed since the last set_format -- and it fixes the old #45
+ * asymmetry where the snapshot lazy-configure never set PCLK at all.  Caller holds
+ * cam_lock with the sensor configured.
+ */
+static int apply_effective_pclk_locked(void)
+{
+	struct cam_pclk_sel sel = effective_ov_pclk(mode.res);
+
+	if (sel.hz == cam_sensor_pclk_hz)
+		return 0;                         /* already programmed (scanout unchanged) */
+	if (OV5640_SetPCLK(&ov5640, sel.ov) != OV5640_OK) {
+		cam_sensor_pclk_hz = 0u;          /* desynced: force a re-write next time */
+		LOG_ERR("OV5640_SetPCLK failed");
+		return CAM_ERR_HAL;
+	}
+	cam_sensor_pclk_hz = sel.hz;
+	mode.pclk_hz       = sel.hz;
+	if (mode.hts != 0u && mode.vts != 0u)
+		mode.fps_target_x10 = (uint16_t)((uint64_t)sel.hz * 10u /
+		                                 ((uint32_t)mode.hts * mode.vts));
+	/* SetPCLK writes 0x3036/0x3037 (PLL multiplier / root divider) with no internal
+	   delay, so the PLL must re-lock: wait >1 frame before arming (#67, codex). */
+	tx_thread_sleep(CAM_SETTLE_MODE_MS);
+	return 0;
+}
 
 static uint32_t res_to_ov(uint8_t r)
 {
@@ -814,11 +883,13 @@ static int camera_set_format_locked(uint8_t res, uint8_t fmt)
 	if (jpeg && res > CAM_RES_VGA)
 		return CAM_ERR_PARAM;          /* JPEG is snapshot-only, gated <= VGA */
 
-	/* Candidate mode: geometry from res + timing from the fps table.  Validate
-	   capacity before touching the sensor. */
+	/* Candidate mode: geometry from res + HTS/VTS from the timing table + the
+	   effective PCLK from the fps knob (#67).  Validate capacity before the sensor. */
+	struct cam_pclk_sel psel = effective_ov_pclk(res);
+
 	m = (struct camera_mode){ .res = res, .format = fmt,
 	    .hts = mode_fps[res].hts, .vts = mode_fps[res].vts,
-	    .pclk_hz = mode_fps[res].pclk_hz };
+	    .pclk_hz = psel.hz };
 	mode_recompute(&m);
 	if (m.frame_bytes > CAM_FRAME_MAX_BYTES)
 		return CAM_ERR_PARAM;
@@ -851,6 +922,7 @@ static int camera_set_format_locked(uint8_t res, uint8_t fmt)
 			goto fail;
 		}
 		info.configured = 1;
+		cam_sensor_pclk_hz = 0u;   /* Init reprogrammed the PLL to its default (#67) */
 		tx_thread_sleep(CAM_SETTLE_INIT_MS);
 	}
 
@@ -858,8 +930,9 @@ static int camera_set_format_locked(uint8_t res, uint8_t fmt)
 		goto fail;
 	if (OV5640_SetPixelFormat(&ov5640, fmt_to_ov(fmt)) != OV5640_OK)
 		goto fail;
-	if (OV5640_SetPCLK(&ov5640, mode_fps[res].ov_pclk) != OV5640_OK)
+	if (OV5640_SetPCLK(&ov5640, psel.ov) != OV5640_OK)      /* fps knob (#67) */
 		goto fail;
+	cam_sensor_pclk_hz = psel.hz;   /* sensor now matches the effective selection */
 
 	/* Commit the base mode now: the quality re-apply + timing below needs the
 	   committed mode (ZoomConfig reads the new DVPHO/DVPVO, night mode rewrites
@@ -945,6 +1018,12 @@ static int camera_capture_locked(int colorbar)
 	}
 
 	rc = camera_configure_locked(colorbar);
+	if (rc != 0)
+		return rc;
+
+	/* Program the effective PCLK for the fps knob + current scanout state (#67);
+	   also covers the old #45 asymmetry (lazy configure never set PCLK). */
+	rc = apply_effective_pclk_locked();
 	if (rc != 0)
 		return rc;
 
@@ -1064,6 +1143,32 @@ int camera_set_format(enum camera_res res, enum camera_format fmt)
 	return rc;
 }
 
+int camera_set_fps(unsigned fps)
+{
+	uint8_t prev;
+	int rc;
+
+	if (fps != 15u && fps != 30u)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	/* Re-apply to the live sensor the same way `camera res` / `camera format` do:
+	   rebuild the current mode so the new effective PCLK is reprogrammed at once.
+	   Inherits the set_format BUSY gate (refused while a stream/preview owns the
+	   DCMI) -- the sensor PLL must not be retuned under a live DMA target (#67).
+	   On any failure (BUSY / I/O) restore the previous selection so the stored
+	   preference never diverges from what the sensor actually got -- otherwise
+	   camera_get_mode() would report an fps the live sensor never received. */
+	prev = cam_fps_sel;
+	cam_fps_sel = (uint8_t)fps;
+	rc = camera_set_format_locked(mode.res, mode.format);
+	if (rc != 0)
+		cam_fps_sel = prev;
+	op_unlock();
+	return rc;
+}
+
 int camera_frame_read(uint32_t offset, void *dst, uint32_t len,
                       uint32_t *gen)
 {
@@ -1151,6 +1256,7 @@ int camera_get_info(struct camera_info *out)
 
 int camera_get_mode(struct camera_mode *out)
 {
+	struct cam_pclk_sel sel;
 	int rc;
 
 	if (out == NULL)
@@ -1159,6 +1265,23 @@ int camera_get_mode(struct camera_mode *out)
 	if (rc != 0)
 		return rc;
 	*out = mode;
+	/* Evaluate the fps clamp live against the current LTDC scanout state (#67), so
+	   `camera info` reflects whether 30 fps is actually in effect right now -- the
+	   sensor PCLK is only re-applied at the next capture/stream arm, but the report
+	   must be current.  Report the live-effective PCLK / fps target, not a stale
+	   last-programmed value. */
+	sel = effective_ov_pclk(mode.res);
+	out->fps_sel = cam_fps_sel;
+	out->fps_eff = (sel.hz >= 48000000u) ? 30u : 15u;
+	if (cam_fps_sel == 30u && out->fps_eff == 15u)
+		out->fps_clamp = res_is_small(mode.res) ? CAM_FPS_CLAMP_LTDC
+		                                        : CAM_FPS_CLAMP_SIZE;
+	else
+		out->fps_clamp = CAM_FPS_OK;
+	out->pclk_hz = sel.hz;
+	if (mode.hts != 0u && mode.vts != 0u)
+		out->fps_target_x10 = (uint16_t)((uint64_t)sel.hz * 10u /
+		                                 ((uint32_t)mode.hts * mode.vts));
 	op_unlock();
 	return 0;
 }
@@ -1553,6 +1676,14 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 		return CAM_ERR_STATE;
 
 	rc = camera_configure_locked(colorbar != 0);
+	if (rc != 0)
+		return rc;
+
+	/* Program the effective PCLK for the fps knob + current scanout state (#67):
+	   30 fps (48 MHz) only takes effect here when the LTDC is not scanning out, so
+	   a plain `camera stream start` after `lcd disable` runs at 30 fps while one
+	   started with the display on (or a GUIX preview) clamps to 15 fps. */
+	rc = apply_effective_pclk_locked();
 	if (rc != 0)
 		return rc;
 

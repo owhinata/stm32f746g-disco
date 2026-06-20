@@ -85,6 +85,16 @@ enum camera_format {
 	/* RGB888 is intentionally unsupported in #45 (3 bpp, no consumer). */
 };
 
+/* Why the selected fps (camera fps 15|30) is or is not in effect right now (#67).
+   30 fps = 48 MHz PCLK is applied only for a small streamable mode while the LTDC
+   is not scanning out; otherwise the sensor is clamped to 24 MHz (15 fps) so the
+   48 MHz DCMI burst never overruns the 16-bit SDRAM that the LTDC also reads. */
+enum camera_fps_clamp {
+	CAM_FPS_OK = 0,        /* selected fps is in effect (fps_eff == fps_sel)  */
+	CAM_FPS_CLAMP_SIZE,    /* clamped to 15: res is VGA/WVGA (snapshot-only)  */
+	CAM_FPS_CLAMP_LTDC,    /* clamped to 15: LTDC scanout active (lcd enable) */
+};
+
 /**
  * Live capture mode -- the single source of truth for geometry/format/timing
  * (owned by the driver; read via camera_get_mode()).  @ref frame_bytes is the
@@ -102,9 +112,14 @@ struct camera_mode {
 	uint32_t frame_words;     /* DMA NDTR for fixed formats (frame_bytes/4) */
 	uint16_t hts;             /* OV5640 line total (fps table)              */
 	uint16_t vts;             /* OV5640 frame total (fps table)             */
-	uint32_t pclk_hz;         /* sensor PCLK (fps table)                    */
-	uint16_t fps_target_x10;  /* pclk_hz/(hts*vts) * 10 -- TARGET, not live */
+	uint32_t pclk_hz;         /* sensor PCLK -- live effective (#67)        */
+	uint16_t fps_target_x10;  /* effective pclk_hz/(hts*vts) * 10, not live  */
 	uint8_t  streamable;      /* frame_words <= 65535 && !is_jpeg           */
+	uint8_t  fps_sel;         /* selected fps knob bucket: 15 or 30 (#67)   */
+	uint8_t  fps_eff;         /* effective knob bucket now: 15 or 30 -- the
+	                             PCLK selection (24/48 MHz), not the exact
+	                             target rate (see fps_target_x10) (#67)     */
+	uint8_t  fps_clamp;       /* enum camera_fps_clamp: why eff != sel      */
 };
 
 /** Driver state snapshot for the `camera info` command. */
@@ -179,7 +194,9 @@ int camera_power_off(void);
 int camera_get_info(struct camera_info *out);
 
 /** Fill @p out with the live capture mode (geometry/format/timing, #45).
- *  Never touches the sensor. */
+ *  Never touches the sensor.  Evaluates the fps clamp (fps_sel/fps_eff/fps_clamp,
+ *  pclk_hz, fps_target_x10) live against the current LTDC scanout state (#67), so
+ *  the reported rate reflects whether 30 fps is in effect right now. */
 int camera_get_mode(struct camera_mode *out);
 
 /**
@@ -193,6 +210,18 @@ int camera_get_mode(struct camera_mode *out);
  * CAM_ERR_*.
  */
 int camera_set_format(enum camera_res res, enum camera_format fmt);
+
+/**
+ * Select the streaming frame rate (issue #67): @p fps is 15 (24 MHz PCLK) or 30
+ * (48 MHz PCLK).  Stored as a preference and re-applied to the live sensor at
+ * once (same path as camera_set_format), so it is refused with CAM_ERR_BUSY while
+ * a stream or GUIX preview owns the DCMI.  30 fps takes effect only for a small
+ * streamable mode (QQVGA/QVGA/480x272) while the LTDC is not scanning out;
+ * otherwise the sensor is clamped to 24 MHz so the 48 MHz DCMI burst never
+ * overruns the SDRAM the LTDC also reads (use `lcd disable` for 30 fps).  Returns
+ * 0 or a negative CAM_ERR_* (CAM_ERR_PARAM for an fps other than 15/30).
+ */
+int camera_set_fps(unsigned fps);
 
 /**
  * Capture one QVGA RGB565 frame into the SDRAM frame buffer (DCMI snapshot +

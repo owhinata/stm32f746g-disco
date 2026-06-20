@@ -203,6 +203,13 @@ int ltdc_set_scanout(bool on);
 /** True when the LTDC is up but scanout is currently disabled (#66). */
 bool ltdc_scanout_off(void);
 
+/** True when the LTDC is up AND scanout is running (fetching the framebuffer
+ *  from SDRAM).  This is the condition under which a 48 MHz (30 fps) DCMI burst
+ *  overruns the 16-bit SDRAM, so the camera clamps to 24 MHz when it holds (#67).
+ *  Distinct from !ltdc_scanout_off(): both are false when the LTDC never came up
+ *  (no display = no contention), which is the correct "scanout not active" case. */
+bool ltdc_scanout_active(void);
+
 /** Read the LTDC FIFO-underrun / transfer-error status flags (sticky since the
  *  last clear).  These are set by hardware regardless of the interrupt enable
  *  (RM0385 §18.7.9), so they work without an LTDC IRQ: a non-zero FIFO-underrun

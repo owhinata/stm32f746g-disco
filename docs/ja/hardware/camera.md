@@ -81,6 +81,7 @@ camera probe             電源サイクル + OV5640 chip ID 読出し（~1 s）
 camera info              ドライバ / センサ状態 + 現在のモード / 画質設定を表示
 camera res <解像度>      解像度切替 qqvga|qvga|480x272|vga|wvga（#45）
 camera format <fmt>      ピクセルフォーマット切替 rgb565|yuv422|y8|jpeg（#45）
+camera fps <15|30>       フレームレート切替 15(PCLK24M) / 30(PCLK48M)。30 は lcd disable 必須（#67）
 camera capture [test]    現在モードを 1 フレーム snapshot（test = colorbar パターン）
 camera save <sd|fs> <p>  キャプチャ済みフレームを raw（モードのフォーマット）で保存
 camera set [<name> <値>] OV5640 画質設定（引数なしで一覧表示）
@@ -202,11 +203,18 @@ type 'help camera set' for the list of settings
 - **stream は frame_words ≤ 65535 のモードのみ**（QQVGA/QVGA/480x272 の RGB565・YUV422 等）。producer の手動 DBM は各 M-reg が full-slot を NDTR で指すため、これを超えるモードは `camera info` で `capture only` と表示し `camera stream start` を拒否する。
 - **JPEG は snapshot-only・解像度 ≤ VGA**。可変長リング管理は別系統のため stream には載せない。
 
-### フレームレート（per-mode HTS/VTS、~15fps）
+### フレームレート（per-mode HTS/VTS + fps 切替 15/30、#45/#67）
 
-OV5640 の `lib/ov5640` 共通テーブルは HTS=1936/VTS=1088 を**全解像度共通**・PCLK 24MHz 固定で設定するため既定は **~11fps**。`camera res` で適用される **fps 表**（`mode_fps[]`）は、stream 対象の小モードに HTS/VTS 縮小（1600/1000 → **~15fps**、実機 14.9fps）を、snapshot 専用の VGA/WVGA に従来のタイミング（1936/1088, ~11fps）を与える。`fps = PCLK/(HTS×VTS)`。
+OV5640 の `lib/ov5640` 共通テーブルは HTS=1936/VTS=1088 を**全解像度共通**・PCLK 24MHz 固定で設定するため既定は **~11fps**。`camera res` で適用される **timing 表**（`mode_fps[]`）は、stream 対象の小モードに HTS/VTS 縮小（1600/1000 → **~15fps**、実機 14.9fps）を、snapshot 専用の VGA/WVGA に従来のタイミング（1936/1088, ~11fps）を与える。`fps = PCLK/(HTS×VTS)`。
 
-**PCLK は全モード 24MHz 据え置き**: 30fps は PCLK 48MHz が必要だが、48MHz は peak DCMI バーストレートを倍化し、LTDC がフレームバッファを常時リードする 16-bit SDRAM 競合下で **DCMI を即 OVR**（GUIX プレビューが frame0 で停止）させる。これは #59 の帯域問題。15fps は実証済 11fps プレビューと **peak レートが同一**（HTS/VTS 縮小は blanking を削るだけ）なので OVR 安全。**30fps（48MHz + FIFO threshold/FMC アービトレーション調整）は #59** の本題。
+**`camera fps <15|30>` で PCLK を 24/48MHz 切替（#67）**。小モード（QQVGA/QVGA/480x272）は HTS/VTS=1600/1000 据え置きなので `48e6/(1600×1000)=30.0fps`。既定は **15fps（安全側）**。`camera fps` は `camera res/format` と同様に即時センサ再適用し、stream/プレビュー所有中は拒否（live DMA target のセンサ PLL を触らない）。
+
+!!! danger "30fps（48MHz）は LTDC scanout 停止が前提"
+    48MHz は peak DCMI バーストレートを倍化し、LTDC がフレームバッファを連続リードする 16-bit SDRAM 競合下では **最小の QQVGA ですら数百 ms で DCMI OVR**（`camera stream stats` が `stopped (overrun)`）。実測では **`lcd disable`（LTDC scanout OFF, #66）なら** qqvga/qvga/480x272 RGB565 すべて ~30fps・OVR 0・FE 0（480x272=7.8MB/s でも完全クリーン）。
+
+    そこで実効 PCLK は**単一述語**で決まる: **「fps 30 選択 ∧ 小モード ∧ `ltdc_scanout_active()`==false」が全部成立する時だけ 48MHz**、それ以外は **24MHz に自動クランプ**（reject ではなく clamp）。これを「センサ PCLK を書く全経路」（`camera_set_format` / stream arm 前 / snapshot arm 前）で適用するため、`lcd enable` 中・GUIX プレビュー中は fps 30 を選んでも安全に 15fps へ落ちる。`camera info` の `fps select` 行が選択値と clamp 理由（`lcd scanout active` / `snapshot-only mode`）を表示し、`camera stream start` 時も clamp note を出す。
+
+    **残る制約（TOCTOU）**: 30fps stream を `lcd disable` 下で開始した後に `lcd enable` すると競合が復活して OVR → stream は **graceful auto-stop**（`stopped (overrun)` / `ovr dcmi` に計上）する。30fps stream 中は `lcd enable` しないこと。LTDC scanout を削って「プレビューでも 30fps」を狙う路線は別スコープ（#59/#65）。
 
 !!! warning "VTS と AEC 最大露光のクランプ"
     VTS が AEC 最大露光行数（`0x3A02/03` と `0x3A14/15`、既定 0x3D8=984）を下回ると露光がクリップして暗化/バンディングする。`camera_set_format` は **設定再適用（night mode が AEC を書換える）後**に両系統を read-back し、`VTS ≥ max + margin` を保証する（不足なら VTS を引き上げ、fps は目標を下回る）。fps 表の値は**実機 `camera stream stats` で要調整**の出発点である（帯域競合下の最適化は #59）。

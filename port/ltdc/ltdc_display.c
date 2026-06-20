@@ -175,6 +175,11 @@ bool ltdc_scanout_off(void)
 	return ltdc_is_up() && ltdc_disabled;
 }
 
+bool ltdc_scanout_active(void)
+{
+	return ltdc_is_up() && !ltdc_disabled;
+}
+
 bool ltdc_gui_owns(void)
 {
 	return ltdc_gui_owned;
