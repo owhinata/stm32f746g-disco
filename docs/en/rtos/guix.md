@@ -4,7 +4,7 @@ On top of the board's 4.3″ 480×272 LCD (LTDC, #52/#53) and the FT5336 capacit
 
 - Submodule: `lib/guix` ([eclipse-threadx/guix](https://github.com/eclipse-threadx/guix) v6.5.1, **MIT**). A read-only mirror like `threadx`/`filex`/`levelx`.
 - Glue: `port/guix/`; shell command `gui` (`shell/cmds/cmd_gui.c`).
-- Lazy start: GUIX only takes over the LCD and touch on `gui start`. Until then the `lcd`/`touch` test commands work as before.
+- Started ON at boot (#60): GUIX takes over the LCD and touch from `tx_application_define()` at boot, resident and symmetric with the camera producer. Run `gui stop` to release the display so the `lcd`/`touch` test commands work, and `gui start` to resume.
 
 ## Configuration
 
@@ -92,7 +92,9 @@ Stopping is **cooperative**: the thread checks an `active` flag and parks itself
 
 `port/guix/guix_glue.c`. `gx_system_initialize()` + display/canvas/widget creation + `gx_system_start()` happen **exactly once** (the GUIX system thread and its global objects are never torn down).
 
-- `gui start` — first time: the init above → take ownership → `gx_widget_show(root)` → `gx_system_start()` → start the input thread. On a later restart (after stop): **no re-initialise**; re-take ownership → resync the canvas onto the back buffer → re-show → post one `GX_EVENT_REDRAW` to wake the sleeping GUIX thread and force a full repaint.
+**Started ON at boot (#60)**: that first `guix_start()` is called from **`tx_application_define()` (before the scheduler starts)**, not from `gui start`, right after the LTDC/touch bring-up. This is safe — `guix_first_start()` does **only memory setup + ThreadX object creation** with no blocking wait (`gx_system_initialize()` creates the GUIX system thread **`TX_DONT_START`**, `gx_system_start()` just `tx_thread_resume()`s it, and the LTDC mutex is uncontended at boot so it never suspends). **The first actual paint runs on the GUIX thread once scheduling starts**, so no DMA2D completion wait (#64) happens in this init context. Failure is fail-soft (the shell keeps running and `gui start` can retry).
+
+- `gui start` — first time: the init above → take ownership → `gx_widget_show(root)` → `gx_system_start()` → start the input thread (already done at boot by #60). On a later restart (after stop): **no re-initialise**; re-take ownership → resync the canvas onto the back buffer → re-show → post one `GX_EVENT_REDRAW` to wake the sleeping GUIX thread and force a full repaint.
 - `gui stop` — park input → `gx_widget_hide(root)` → blank the screen to black via DMA2D (the public `ltdc_fill` is a no-op while owned, so the owner path) → release ownership (the `lcd` drawing path works again).
 - `gui info` — state, GUIX system-thread priority, display handle, canvas address.
 
@@ -138,14 +140,14 @@ Shell control:
 ## Usage
 
 ```text
-sh> lcd info          # right after boot the LCD test commands work as before
-sh> gui start         # show the GUIX UI (takes over LCD + touch)
-sh> gui info          # status
+sh> gui info          # state: running right from boot (GUI ON at boot, #60)
 # tap "Next >" -> screen 2; "< Back" returns.
-sh> gui camera on     # live camera preview (320x240 native); auto-starts GUIX if down
+sh> gui camera on     # live camera preview (320x240 native)
 sh> gui camera off    # stop the preview (screen 2's Back button also stops it)
 sh> lcd fill red      # refused while GUIX runs (display owned by gui)
 sh> gui stop          # blank the screen and hand the LCD back to `lcd`
+sh> lcd info          # after gui stop the LCD/touch test commands work
+sh> gui start         # resume the GUIX UI (takes over LCD + touch again)
 ```
 
 ## Implementation notes

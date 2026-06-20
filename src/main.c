@@ -42,6 +42,7 @@
 #include "camera.h"
 #include "ltdc_display.h"
 #include "touch.h"
+#include "guix_glue.h"
 #include "iwdg.h"
 
 #include <stddef.h>
@@ -204,6 +205,25 @@ void tx_application_define(void *first_unused_memory)
 	 * `touch` command reports it; nothing else stops. */
 	if (touch_init() != 0)
 		printf("touch: init failed (touch command disabled)\r\n");
+
+	/* GUIX boot start (issue #60): bring the GUI up ON at boot, symmetric with
+	 * the camera producer (created at boot, idle-sleeping) instead of the lazy
+	 * `gui start`.  Gated on the LTDC display being up -- the canvas lives in the
+	 * .sdram frame buffer (guix_start() re-checks ltdc_is_up()/scanout too).
+	 * After touch_init() so the FT5336 input thread attaches at boot.  Fail-soft:
+	 * on any GUIX error the shell keeps running and `gui start` can retry.  Safe
+	 * before the scheduler -- guix_start() only does memory setup + ThreadX object
+	 * creation (the GUIX system + input threads): gx_system_initialize() creates
+	 * the system thread TX_DONT_START and gx_system_start() resumes it, with no
+	 * blocking wait (the uncontended LTDC mutex never suspends).  The first actual
+	 * paint (DMA2D blit) is deferred to the GUIX thread once scheduling runs, so
+	 * no draw-completion wait happens in this init context. */
+	if (ltdc_is_up()) {
+		int guix_rc = guix_start();
+		if (guix_rc != GUIX_OK)
+			printf("guix: boot start failed (%d); use 'gui start' to retry\r\n",
+			       guix_rc);
+	}
 
 #if BSP_ENABLE_IWDG
 	/* IWDG last (issue #38).  Order here is deliberate and must stay

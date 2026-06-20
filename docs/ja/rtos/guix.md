@@ -4,7 +4,7 @@
 
 - submodule: `lib/guix`（[eclipse-threadx/guix](https://github.com/eclipse-threadx/guix) v6.5.1、**MIT**）。`threadx`/`filex`/`levelx` と同じ read-only ミラー。
 - グルー: `port/guix/`、シェルコマンドは `gui`（`shell/cmds/cmd_gui.c`）。
-- 遅延起動: `gui start` で初めて GUIX が LCD とタッチを占有する。未起動時は `lcd`/`touch` のテストコマンドが従来どおり使える。
+- 起動時 ON（#60）: `tx_application_define()` から boot で GUIX が LCD とタッチを占有する（カメラ producer と対称に常駐）。`gui stop` で解放すれば `lcd`/`touch` のテストコマンドが使え、`gui start` で再開する。
 
 ## 構成
 
@@ -92,7 +92,9 @@ DMA2D は単一エンジンで、`lcd` コマンド（`ltdc_display.c`）と GUI
 
 `port/guix/guix_glue.c`。`gx_system_initialize()` + display/canvas/widget 生成 + `gx_system_start()` は**初回 1 回だけ**（GUIX システムスレッドと global オブジェクトは tear-down しない）。
 
-- `gui start` … 初回は上記初期化 → 所有権取得 → `gx_widget_show(root)` → `gx_system_start()` → 入力スレッド起動。2 回目以降（stop 後の再開）は**再 initialize せず**、所有権再取得 → canvas を back に再同期 → 再 show → `GX_EVENT_REDRAW` を 1 発 post して sleep 中の GUIX スレッドを起こし全再描画。
+**起動時 ON（#60）**: その初回 `guix_start()` は `gui start` ではなく **`tx_application_define()`（scheduler 開始前）から** 呼ばれる（LTDC/touch bring-up の後）。これは安全 — `guix_first_start()` は **メモリ初期化 + ThreadX オブジェクト生成のみ**でブロッキング wait を伴わない（`gx_system_initialize()` が GUIX システムスレッドを **`TX_DONT_START`** で生成、`gx_system_start()` は `tx_thread_resume()` するだけ、LTDC mutex は boot 非競合で suspend しない）。**実際の描画は scheduler 開始後に GUIX スレッドが行う**ので、init コンテキストで DMA2D 完了待ち（#64）を踏まない。失敗は fail-soft（shell は継続し `gui start` でリトライ可能）。
+
+- `gui start` … 初回は上記初期化 → 所有権取得 → `gx_widget_show(root)` → `gx_system_start()` → 入力スレッド起動（#60 で boot から実行済）。2 回目以降（stop 後の再開）は**再 initialize せず**、所有権再取得 → canvas を back に再同期 → 再 show → `GX_EVENT_REDRAW` を 1 発 post して sleep 中の GUIX スレッドを起こし全再描画。
 - `gui stop` … 入力スレッド park → `gx_widget_hide(root)` → DMA2D で画面を黒 blank（公開 `ltdc_fill` は所有中 no-op なので owner 経路）→ 所有権解放（`lcd` 描画が再び通る）。
 - `gui info` … 状態・GUIX システムスレッド優先度・display handle・canvas アドレス。
 
@@ -138,14 +140,14 @@ UI（`port/guix/guix_app.c`）は GUIX Studio を使わず手書き。色/フォ
 ## 使い方
 
 ```text
-sh> lcd info          # 起動直後は従来どおり LCD テストが使える
-sh> gui start         # GUIX UI を表示（LCD + タッチを占有）
-sh> gui info          # 状態
+sh> gui info          # 起動直後から state: running（boot で GUI ON, #60）
 # 画面の「Next >」をタップ → 画面 2 へ。「< Back」で戻る。
-sh> gui camera on     # カメラライブプレビュー（320x240 等倍）。GUIX 未起動なら自動 start
+sh> gui camera on     # カメラライブプレビュー（320x240 等倍）
 sh> gui camera off    # プレビュー停止（画面 2 の Back ボタンでも可）
 sh> lcd fill red      # GUIX 稼働中は拒否される（display owned by gui）
 sh> gui stop          # 画面を消して LCD を lcd コマンドへ返す
+sh> lcd info          # gui stop 後は LCD/touch テストが使える
+sh> gui start         # GUIX UI を再開（LCD + タッチを再占有）
 ```
 
 ## 実装メモ

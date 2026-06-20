@@ -14,9 +14,10 @@
  * Phase 4 of #48 (#55): GUIX (Eclipse ThreadX GUIX v6.5.1) runs on its own
  * ThreadX thread, drawing through a 565rgb display driver bound to the LTDC
  * tear-free double buffer with DMA2D-accelerated fills, and takes pen input from
- * the FT5336 over I2C3.  Lazy-started so the `lcd`/`touch` test commands work
- * normally until the UI is wanted; while running, the `lcd` drawing commands are
- * refused (the display is owned by GUIX) -- run `gui stop` first.
+ * the FT5336 over I2C3.  Started ON at boot (issue #60) from tx_application_define,
+ * so the UI is up from power-on; while running, the `lcd` drawing commands are
+ * refused (the display is owned by GUIX) -- run `gui stop` first to use the
+ * `lcd`/`touch` test commands, then `gui start` to resume.
  *
  * Clean-room design; no third-party code reused.
  */

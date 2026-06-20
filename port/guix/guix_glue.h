@@ -8,8 +8,12 @@
  *
  * Ties the GUIX 565rgb display driver (guix_display), the FT5336 input thread
  * (guix_touch) and the demo UI (guix_app) together and starts GUIX on ThreadX.
- * Lazy-started from the `gui` shell command so the display/touch test commands
- * (`lcd`/`touch`) work normally until the UI is wanted.
+ * Started ON at boot (issue #60): tx_application_define() calls guix_start()
+ * after the LTDC/touch bring-up, symmetric with the camera producer.  This is
+ * safe before the scheduler -- guix_first_start() only does memory setup +
+ * ThreadX object creation (no blocking wait); the first paint is deferred to
+ * the GUIX system thread once scheduling runs.  `gui stop` then hands the
+ * display back so the `lcd`/`touch` test commands work, and `gui start` resumes.
  *
  * gx_system_initialize() + display/canvas/widget creation + gx_system_start()
  * happen exactly ONCE (the GUIX system thread and its global objects are not
