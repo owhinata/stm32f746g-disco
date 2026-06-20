@@ -80,6 +80,7 @@ nav:
       - rtos/shell-free.md
       - rtos/shell-devmem.md
       - rtos/shell-coremark.md
+      - rtos/shell-membench.md
       - rtos/shell-sleep-watch.md
       - rtos/shell-jobs.md
       - rtos/shell-fs.md

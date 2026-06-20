@@ -133,6 +133,25 @@ SECTIONS
   ASSERT(_elog_noinit <= ORIGIN(DTCM) + LENGTH(DTCM),
          ".log_noinit must fit inside the 64 KB DTCM")
 
+  /* membench DTCM benchmark buffer (issue #57): NOLOAD so the startup .data
+   * copy / .bss clear never touches it (the bench fills it itself).  Placed in
+   * the DTCM region after .log_noinit so the `membench` command can measure the
+   * tightly-coupled, non-D-cached DTCM (which otherwise holds only the log ring).
+   * Sized 16 KB: 0x2020 (.log_noinit) + 0x4000 = 0x6020, well inside the 64 KB
+   * DTCM.  Present only when the buffer is linked in (the shell build); the
+   * input section is empty otherwise. */
+  .dtcm_bench (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _sdtcm_bench = .;
+    KEEP(*(.dtcm_bench))
+    . = ALIGN(32);
+    _edtcm_bench = .;
+  } >DTCM
+
+  ASSERT(_edtcm_bench <= ORIGIN(DTCM) + LENGTH(DTCM),
+         ".dtcm_bench must fit inside the 64 KB DTCM (after .log_noinit)")
+
   /* Initialized data: loaded from FLASH (_sidata), runs from RAM */
   _sidata = LOADADDR(.data);
   .data :
