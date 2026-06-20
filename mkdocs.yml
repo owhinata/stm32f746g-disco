@@ -77,6 +77,7 @@ nav:
       - rtos/shell-app.md
       - rtos/shell-builtins.md
       - rtos/shell-thread.md
+      - rtos/shell-free.md
       - rtos/shell-devmem.md
       - rtos/shell-coremark.md
       - rtos/shell-sleep-watch.md

@@ -247,6 +247,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_system.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_thread.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_free.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_coremark.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sleep.c"
