@@ -68,7 +68,7 @@ static uint32_t dtcm_bench_buf[DTCM_BENCH_BYTES / 4]
 static uint32_t sram_bench_buf[SRAM_BENCH_BYTES / 4]
 	__attribute__((aligned(32)));                       /* .bss */
 static uint32_t sdram_bench_buf[SDRAM_BENCH_BYTES / 4]
-	__attribute__((aligned(32), section(".sdram")));
+	__attribute__((aligned(32), section(".sdram.fixed")));
 
 /* Volatile sink: every measured loop ends by storing into it, so -O2/-O3 cannot
  * eliminate the loop as dead code. */

@@ -258,7 +258,7 @@ PC: /shot.jpg is a JPEG stream -- open it directly
 
 ### SDRAM budget
 
-`cam_frame` is sized for the largest fixed format, WVGA RGB565 (768,000 B), as one contiguous region (also the JPEG budget buffer); the stream ring is a 256 KB slot (holding 480x272 RGB565) × 4 = 1 MB. Total `.sdram` is 2.39 MB / 8 MB, guarded by a linker `ASSERT(_esdram-_ssdram <= 0x800000)`.
+`cam_frame` is sized for the largest fixed format, WVGA RGB565 (768,000 B), as one contiguous region (also the JPEG budget buffer). The stream ring is **partitioned at runtime from the camera arena `cam_arena` (2 MB, FMC internal bank1 @0xC0200000) as of #65** (replacing the old fixed `cam_ring[4][256KB]`): slot stride = `align32(frame_bytes)`, slot count = `min(2MB/stride, 8)`, so small modes get a deeper ring. Bank placement and the `ASSERT`s are in [SDRAM](sdram.md#fmc-internal-bank-placement-65).
 
 ## Continuous capture (streaming, #46)
 
@@ -266,7 +266,7 @@ Where `camera capture` takes a single snapshot (`DCMI_MODE_SNAPSHOT` + `DMA_NORM
 
 ### Ring and DBM
 
-An **N=4 ring** in `.sdram` (`cam_ring[4]`, separate from `cam_frame[]`) is injected into `frame_pipeline_init`. DBM always keeps two slots as DMA targets (M0AR/M1AR), one holds the latest published frame, and one is free to acquire (the N=4 rationale). The HAL's internal `HAL_DCMI_Start_DMA` DBM split only triggers for `Length>0xFFFF` and is *intra-frame* banding, so it is not used; instead the producer drives an *inter-frame* N-slot ring explicitly with **`HAL_DMAEx_MultiBufferStart_IT` + `HAL_DMAEx_ChangeMemory`**.
+An **N-slot ring** partitioned at runtime from `cam_arena` (bank1; deeper for small modes, capped at 8) is injected into `frame_pipeline_init` (#65; a different bank from `cam_frame[]`). DBM always keeps two slots as DMA targets (M0AR/M1AR), one holds the latest published frame, and one is free to acquire (N≥4 is comfortable, N≥2 is the DBM minimum). Observe the live value via `camera stream stats`'s `ring: N slots x M B`. The HAL's internal `HAL_DCMI_Start_DMA` DBM split only triggers for `Length>0xFFFF` and is *intra-frame* banding, so it is not used; instead the producer drives an *inter-frame* N-slot ring explicitly with **`HAL_DMAEx_MultiBufferStart_IT` + `HAL_DMAEx_ChangeMemory`**.
 
 ### Threading (the ISR only notifies)
 

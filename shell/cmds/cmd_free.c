@@ -28,7 +28,9 @@
  *   SRAM   static = _end - ORIGIN(RAM) (.data + .bss + .sram1_dma); the heap then
  *          grows up from _end and the main/ISR stack grows down from _estack, so
  *          used = (heap break) - ORIGIN(RAM) and free = _estack - (heap break).
- *   SDRAM  used = .sdram (_esdram - _ssdram), the NOLOAD camera/LTDC buffers.
+ *   SDRAM  used = .sdram.fixed (bank0) + .sdram.cam (bank1 camera arena); the two
+ *          bank-aligned sub-regions are summed so the 2 MB-alignment hole between
+ *          them is not counted (issue #65).
  *
  * Region ORIGIN/LENGTH are compile-time constants mirroring the linker MEMORY
  * block (single source of truth: the .ld).  They never change without a linker
@@ -74,7 +76,10 @@
 extern uint8_t _sdata[], _edata[];          /* .data run image in SRAM        */
 extern uint8_t _sidata[];                   /* .data load image in FLASH      */
 extern uint8_t _slog_noinit[], _elog_noinit[]; /* DTCM reset-persistent ring  */
-extern uint8_t _ssdram[], _esdram[];        /* .sdram NOLOAD residents        */
+/* .sdram is split into two bank-aligned sub-regions with a 2 MB-alignment hole
+ * between them (issue #65); sum the two residents so the hole is not counted. */
+extern uint8_t _ssdram_fixed[], _esdram_fixed[]; /* .sdram.fixed (bank0)       */
+extern uint8_t _ssdram_cam[],   _esdram_cam[];   /* .sdram.cam   (bank1 arena) */
 extern uint8_t _end[];                       /* top of static SRAM = heap base */
 extern uint8_t _estack[];                    /* top of SRAM (initial MSP)      */
 extern uint8_t _Min_Stack_Size[];            /* reserved main-stack bytes      */
@@ -104,7 +109,8 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	uint32_t flash_used = (sym(_sidata) - FLASH_ORIGIN)
 	                    + (sym(_edata) - sym(_sdata));
 	uint32_t dtcm_used  = sym(_elog_noinit) - sym(_slog_noinit);
-	uint32_t sdram_used = sym(_esdram) - sym(_ssdram);
+	uint32_t sdram_used = (sym(_esdram_fixed) - sym(_ssdram_fixed))
+	                    + (sym(_esdram_cam) - sym(_ssdram_cam));
 
 	uint32_t heap_arena = (uint32_t)(unsigned)mi.arena;   /* bytes sbrk'd from system */
 	uint32_t heap_base  = sym(_end);
@@ -123,7 +129,7 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	print_region(sh, "SRAM",  SRAM_ORIGIN,  SRAM_LENGTH,  sram_used,
 	             ".data/.bss/.sram1_dma + heap");
 	print_region(sh, "SDRAM", SDRAM_ORIGIN, SDRAM_LENGTH, sdram_used,
-	             ".sdram (camera/LTDC NOLOAD)");
+	             ".sdram.fixed(bank0)+.sdram.cam(bank1)");
 
 	cli_print(sh, "\r\n");
 	cli_print(sh, "heap:  base 0x%08lX  arena %lu  in-use %lu  free-pool %lu\r\n",

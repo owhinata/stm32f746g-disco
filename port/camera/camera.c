@@ -251,35 +251,40 @@ static void mode_recompute(struct camera_mode *m)
    #40).  DMA-written by DCMI, CPU-read by camera_frame_read -- coherent with no
    cache maintenance because the region never allocates cache lines. */
 static uint8_t cam_frame[CAM_FRAME_MAX_BYTES]
-	__attribute__((aligned(32), section(".sdram")));
+	__attribute__((aligned(32), section(".sdram.fixed")));
 
 /* ---- streaming (issue #46): DCMI continuous + DMA double-buffer ---------- */
 /*
  * The continuous producer feeds a frame pipeline (svc/frame_pipeline.c, the #47
- * design).  N ring slots live in .sdram next to cam_frame[]: at any instant the
- * DMA double-buffer (DBM) targets two of them (M0AR/M1AR), one holds the latest
- * published frame, and one is free to be acquired -- so N=4.  On each frame the
- * dedicated cam_producer thread (NOT an ISR, NOT the shell thread) reads CT to
- * find the just-completed buffer, acquires a free slot, repoints that buffer's
- * M-register away (HAL_DMAEx_ChangeMemory) and only THEN publishes -- so a slot
- * handed to a sink is never a live DMA target (tear-free).  The DMA TC ISR only
- * posts cam_stream_sem.  Streaming and the snapshot path share hdcmi/hdma_dcmi
- * and are mutually exclusive (cam_stream_active gate).
+ * design).  The ring slots are carved at stream start from cam_arena (below): at
+ * any instant the DMA double-buffer (DBM) targets two of them (M0AR/M1AR), one
+ * holds the latest published frame, and one is free to be acquired (so >= 4 slots
+ * is the comfortable case; >= 2 is the hard minimum for the DBM pair).  On each
+ * frame the dedicated cam_producer thread (NOT an ISR, NOT the shell thread)
+ * reads CT to find the just-completed buffer, acquires a free slot, repoints that
+ * buffer's M-register away (HAL_DMAEx_ChangeMemory) and only THEN publishes -- so
+ * a slot handed to a sink is never a live DMA target (tear-free).  The DMA TC ISR
+ * only posts cam_stream_sem.  Streaming and the snapshot path share hdcmi/
+ * hdma_dcmi and are mutually exclusive (cam_stream_active gate).
  */
-#define CAM_RING_N         4u      /* 2 DBM targets + 1 latest + 1 free        */
 #define CAM_PRODUCER_PRIO  10u     /* below IWDG petter (5), like LED (10)      */
 #define CAM_PRODUCER_STACK 2048u
 #define CAM_PRODUCER_TICK  10u     /* bounded sem wait so --secs/stop fire even
                                       when no frames arrive (sync lost), ms      */
 
-/* Ring slot stride = the largest *streamable* frame (frame_words <= 65535, i.e.
-   <= 262140 B): 480x272 RGB565 = 261120 B is the largest, rounded up to 256 KB.
-   Streaming is gated to modes that fit this (stream_start_locked); snapshot of
-   bigger modes uses cam_frame, not the ring.  Ring = 4 x 256 KB = 1 MB (#45). */
-#define CAM_RING_SLOT_CAP  (256u * 1024u)         /* 262144, >= 480x272 RGB565 */
+/* Camera DMA ring arena (issue #65): one fixed 2 MB buffer pinned by the linker
+   to FMC SDRAM internal bank1 (0xC0200000, .sdram.cam) so the DCMI ring WRITE
+   target stays in a different internal bank from the LTDC scan-out READ surface
+   (ltdc_fb, bank0) -- both banks keep a row open, cutting precharge/activate
+   thrashing (FE).  Replaces the old fixed cam_ring[4][256 KB]: at stream start
+   the slot stride is sized to the current mode (align32(frame_bytes)) and the
+   arena is partitioned into as many slots as fit, capped at
+   FRAME_PIPELINE_MAX_SLOTS -- so small modes get a deeper ring.  2 MB = the
+   largest streamable slot (262144 = 480x272 RGB565 rounded up) x 8. */
+#define CAM_ARENA_BYTES    (2u * 1024u * 1024u)
 
-static uint8_t cam_ring[CAM_RING_N][CAM_RING_SLOT_CAP]
-	__attribute__((aligned(32), section(".sdram")));
+static uint8_t cam_arena[CAM_ARENA_BYTES]
+	__attribute__((aligned(32), section(".sdram.cam")));
 
 static struct frame_pipeline cam_pipe;
 static TX_MUTEX     cam_pipe_lock;        /* frame_os mutex for the pipeline    */
@@ -297,6 +302,8 @@ static volatile int      cam_stream_err;     /* DCMI OVR -> terminal stop       
 static volatile uint32_t cam_stream_ovr;     /* DCMI overrun count              */
 static volatile uint32_t cam_ring_ovr;       /* free-slot exhaustion / lost     */
 static volatile uint32_t cam_stream_fe;      /* DMA FIFO/DME errors tolerated (#56) */
+static volatile uint32_t cam_ring_slots;     /* ring depth this stream (#65 arena) */
+static volatile uint32_t cam_ring_slot_bytes;/* ring slot stride this stream (#65) */
 static uint32_t cam_start_tick;              /* HAL tick at start (--secs)       */
 static uint32_t cam_target_frames;           /* 0 = unbounded                   */
 static uint32_t cam_target_secs;             /* 0 = unbounded                   */
@@ -1777,6 +1784,7 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
                                struct frame_sink *ext)
 {
 	int rc;
+	uint32_t slot_size, nslots;
 
 	if (cam_stream_active)
 		return CAM_ERR_BUSY;           /* already streaming */
@@ -1787,16 +1795,23 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 		if (rc != 0)
 			return rc;
 	}
-	/* A streamed frame must fit one DMA NDTR (frame_words <= 65535) and one ring
-	   slot; bigger modes and JPEG are snapshot-only (mode.streamable is 0).  The
-	   ring backing is fixed at CAM_RING_N * CAM_RING_SLOT_CAP, so re-check the
-	   slot bound here -- frame_pipeline_publish() does not validate bytes <=
-	   slot_size (#45). */
+	/* A streamed frame must fit one DMA NDTR (frame_words <= 65535); bigger modes
+	   and JPEG are snapshot-only (mode.streamable is 0). */
 	if (!mode.streamable && !mode.is_jpeg)
 		return CAM_ERR_STATE;          /* large raster modes are capture-only */
-	if (mode.frame_bytes > CAM_RING_SLOT_CAP ||
-	    (uint32_t)CAM_RING_N * mode.frame_bytes > sizeof cam_ring)
+
+	/* Partition the camera arena (cam_arena, bank1) into ring slots sized to the
+	   current mode: slot stride = align32(frame_bytes), as many slots as fit,
+	   capped at FRAME_PIPELINE_MAX_SLOTS -- so small modes get a deeper ring
+	   (#65).  REJECT (not clamp) when fewer than 2 slots fit: 0/1 slot cannot run
+	   the DBM pair, and clamping up to 2 would overflow the arena since
+	   frame_pipeline_publish() does not validate bytes <= slot_size (#45). */
+	slot_size = (mode.frame_bytes + 31u) & ~31u;
+	if (slot_size == 0u || CAM_ARENA_BYTES / slot_size < 2u)
 		return CAM_ERR_STATE;
+	nslots = CAM_ARENA_BYTES / slot_size;
+	if (nslots > FRAME_PIPELINE_MAX_SLOTS)
+		nslots = FRAME_PIPELINE_MAX_SLOTS;
 
 	rc = camera_configure_locked(colorbar != 0);
 	if (rc != 0)
@@ -1810,12 +1825,12 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	if (rc != 0)
 		return rc;
 
-	/* Build the ring + pipeline fresh and attach the counting sink (+ ext).
-	   slot_size is the ring slot STRIDE (CAM_RING_SLOT_CAP), not the frame
-	   length -- the DMA writes mode.frame_bytes into each slot's prefix and
+	/* Build the ring + pipeline fresh over the arena and attach the counting sink
+	   (+ ext).  slot_size is the ring slot STRIDE (align32(frame_bytes)), not the
+	   frame length -- the DMA writes mode.frame_bytes into each slot's prefix and
 	   publish() stamps that as the valid length. */
-	if (frame_pipeline_init(&cam_pipe, &cam_pipe_os, cam_ring,
-	                        CAM_RING_SLOT_CAP, CAM_RING_N) != 0)
+	if (frame_pipeline_init(&cam_pipe, &cam_pipe_os, cam_arena,
+	                        slot_size, nslots) != 0)
 		return CAM_ERR_STATE;
 	frame_pipeline_set_format(&cam_pipe, fmt_to_frame(mode.format),
 	                          mode.width, mode.height);
@@ -1828,6 +1843,8 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	cam_stream_ovr    = 0;
 	cam_ring_ovr      = 0;
 	cam_stream_fe     = 0;
+	cam_ring_slots    = nslots;       /* #65: observable arena partition */
+	cam_ring_slot_bytes = slot_size;
 	cam_jpeg_trunc    = 0;
 	cam_stream_err    = 0;
 	cam_stop_req      = 0;
@@ -2024,6 +2041,8 @@ int camera_stream_stats(struct camera_stream_info *out)
 	out->ring_ovr   = cam_ring_ovr;
 	out->dma_fe     = cam_stream_fe;
 	out->jpeg_trunc = cam_jpeg_trunc;
+	out->slots      = cam_ring_slots;
+	out->slot_bytes = cam_ring_slot_bytes;
 	out->elapsed_ms = cam_stream_active ? (HAL_GetTick() - cam_start_tick)
 	                                    : cam_elapsed_ms;
 	/* Coherent snapshot of the pipeline-owned counters (the producer writes them

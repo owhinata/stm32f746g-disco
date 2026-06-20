@@ -26,7 +26,7 @@
    destination for the per-frame slot copy.  Owned solely by this module, so
    the GUIX icon always has a valid image regardless of ring slot recycling. */
 static uint16_t cam_view_buf[CAM_VIEW_W * CAM_VIEW_H]
-	__attribute__((aligned(32), section(".sdram")));
+	__attribute__((aligned(32), section(".sdram.fixed")));
 static GX_PIXELMAP cam_view_pixmap;
 static bool        cam_view_inited;
 

@@ -264,7 +264,7 @@ PC: /shot.jpg is a JPEG stream -- open it directly
 
 ### SDRAM 予算
 
-最大固定フォーマット WVGA RGB565（768,000 B）を `cam_frame` に連続確保（JPEG budget も流用）、stream リングは 480x272 RGB565 を内包する 256 KB スロット × 4 = 1 MB。`.sdram` 計 2.39 MB / 8 MB。リンカに `ASSERT(_esdram-_ssdram <= 0x800000)` を追加。
+最大固定フォーマット WVGA RGB565（768,000 B）を `cam_frame` に連続確保（JPEG budget も流用）。stream リングは **#65 でカメラアリーナ `cam_arena`（2 MB、FMC 内部 bank1 @0xC0200000）から実行時にパーティション**する（旧 `cam_ring[4][256KB]` 固定を廃止）: スロット stride = `align32(frame_bytes)`、スロット数 = `min(2MB/stride, 8)` → 小モードほど深いリング。バンク配置・`ASSERT` 詳細は [SDRAM](sdram.md#fmc-65)。
 
 ## 連続取り込み（streaming, #46）
 
@@ -272,7 +272,7 @@ PC: /shot.jpg is a JPEG stream -- open it directly
 
 ### リングと DBM
 
-`.sdram` に **N=4 面**のリング（`cam_ring[4]`、`cam_frame[]` とは別）を確保し、`frame_pipeline_init` に注入する。DBM は常に 2 面を DMA ターゲット（M0AR/M1AR）にし、1 面が最新 published、1 面が次に acquire 可能（N=4 の根拠）。`HAL_DCMI_Start_DMA` の内部 DBM 分割は `Length>0xFFFF` 時のみ・かつ**フレーム内**分割なので使わず、**`HAL_DMAEx_MultiBufferStart_IT` + `HAL_DMAEx_ChangeMemory`** で **フレーム間** N 面リングを producer が明示制御する。
+`cam_arena`（bank1）から実行時に **N 面**（小モードは深く、最大 8）のリングをパーティションし、`frame_pipeline_init` に注入する（#65、`cam_frame[]` とは別バンク）。DBM は常に 2 面を DMA ターゲット（M0AR/M1AR）にし、1 面が最新 published、1 面が次に acquire 可能（快適なのは N≥4、DBM 成立の最小は N≥2）。`camera stream stats` の `ring: N slots x M B` で実値確認。`HAL_DCMI_Start_DMA` の内部 DBM 分割は `Length>0xFFFF` 時のみ・かつ**フレーム内**分割なので使わず、**`HAL_DMAEx_MultiBufferStart_IT` + `HAL_DMAEx_ChangeMemory`** で **フレーム間** N 面リングを producer が明示制御する。
 
 ### スレッド構成（ISR は通知のみ）
 

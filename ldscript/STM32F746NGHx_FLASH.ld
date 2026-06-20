@@ -205,18 +205,48 @@ SECTIONS
    * (.data copy / .bss zeroing) must never touch this region -- objects here
    * get no load image and no zero-init, and nothing survives reset.  Holds
    * large DMA-target buffers (camera frame buffer, issue #41). */
+  /* SDRAM is split into FMC internal banks (issue #65): each 2 MB slice
+   * (offset bit[22:21]) is a separate internal bank that keeps its own open
+   * row.  Two named sub-regions:
+   *   .sdram.fixed (bank0, 0xC0000000..0xC01FFFFF): fixed-lifetime / display
+   *     residents.  ltdc_fb (the LTDC scan-out READ surface) is pinned at the
+   *     very front via its own .sdram.fixed.ltdc input section so the read side
+   *     lives in bank0.
+   *   .sdram.cam   (bank1, 0xC0200000..0xC03FFFFF): the 2 MB camera DMA arena
+   *     (cam_arena), so the DCMI ring WRITE target sits in a different internal
+   *     bank from the LTDC read surface -- both banks can hold a row open,
+   *     cutting precharge/activate thrashing (a FE-reduction lever; measured).
+   * Banks 2,3 (0xC0400000..0xC07FFFFF, 4 MB) are left free (e.g. #49 NetX). */
   .sdram (NOLOAD) :
   {
     . = ALIGN(32);
     _ssdram = .;
-    KEEP(*(.sdram))
+    _ssdram_fixed = .;
+    KEEP(*(.sdram.fixed.ltdc))    /* ltdc_fb: LTDC read surface at bank0 front */
+    KEEP(*(.sdram.fixed))
+    KEEP(*(.sdram.fixed*))
+    KEEP(*(.sdram))               /* absorb any untagged legacy .sdram into bank0 */
     . = ALIGN(32);
+    _esdram_fixed = .;
+
+    . = ORIGIN(SDRAM) + 0x200000; /* advance to FMC internal bank1 (0xC0200000) */
+    _ssdram_cam = .;
+    KEEP(*(.sdram.cam))           /* cam_arena: 2 MB DCMI ring arena in bank1 */
+    . = ALIGN(32);
+    _esdram_cam = .;
     _esdram = .;
   } >SDRAM
 
-  /* Guard against a future .sdram resident overflowing the 8 MB bank (issue #45
-   * grows the camera frame/ring buffers).  >SDRAM already errors on overflow,
-   * but this makes the intent and the headroom explicit. */
+  /* The fixed residents must stay inside internal bank0 (below the 2 MB bank1
+   * boundary) -- this is the only hard HW requirement for the bank separation. */
+  ASSERT(_esdram_fixed - ORIGIN(SDRAM) <= 0x200000,
+         ".sdram.fixed (bank0 residents) must fit below the 2 MB bank1 boundary")
+  /* The camera arena must start exactly at bank1 and be exactly one 2 MB bank. */
+  ASSERT(_ssdram_cam == ORIGIN(SDRAM) + 0x200000,
+         ".sdram.cam must start at FMC internal bank1 (0xC0200000)")
+  ASSERT(_esdram_cam - _ssdram_cam == 0x200000,
+         ".sdram.cam (cam_arena) must be exactly 2 MB (one FMC internal bank)")
+  /* Overall guard: still inside the 8 MB SDRAM bank (issue #45/#65). */
   ASSERT(_esdram - _ssdram <= 0x800000, ".sdram exceeds the 8 MB SDRAM bank")
 
   /* Make sure there is room left for the heap and stack */

@@ -37,8 +37,32 @@ In the ARMv7-M default memory map, 0xC0000000 is **Device-typed (XN)**. `bsp_ini
 `MEMORY` gains `SDRAM 0xC0000000 8M` and a `.sdram (NOLOAD)` section. **The FMC is uninitialized until `sdram_init()` runs**, so the startup code (`.data` copy / `.bss` zeroing) must never touch the region -- objects placed in `.sdram` get **no load image, no zero-init, and do not survive reset**.
 
 ```c
-static uint16_t cam_frame[320*240] __attribute__((aligned(32), section(".sdram")));
+static uint16_t cam_view_buf[320*240] __attribute__((aligned(32), section(".sdram.fixed")));
 ```
+
+## FMC internal-bank placement (#65)
+
+The SDRAM has **4 internal banks** (2 MB each, selected by CPU address **offset bit[22:21]**, RM0385 §13.5.3); each bank can hold one **open row** independently. `.sdram` is split into two bank-aligned sub-regions pinned by the linker:
+
+| Sub-region | Bank | Address | Contents |
+|---|---|---|---|
+| `.sdram.fixed` (front `.sdram.fixed.ltdc`) | **bank0** | 0xC0000000–0xC01FFFFF | Fixed residents: **`ltdc_fb` (LTDC scan-out READ surface, address-pinned at the front)** / `cam_frame` (snapshot) / `cam_view_buf` / `guix_demo_img` / `sdram_bench_buf`. ~1.45 MB (< 2 MB) |
+| `.sdram.cam` | **bank1** | 0xC0200000–0xC03FFFFF | `cam_arena` (**2 MB camera DMA ring arena**, the DCMI WRITE target) |
+| (free) | bank2,3 | 0xC0400000–0xC07FFFFF | 4 MB unused (future: #49 NetX, etc.) |
+
+- **Goal (an FE-reduction lever)**: keeping the LTDC READ surface (`ltdc_fb`, bank0) and the DCMI ring WRITE target (`cam_arena`, bank1) in **different banks** lets each bank keep its own row open, avoiding the same-bank row activate/precharge thrashing that drives DMA FIFO errors (FE). Four linker `ASSERT`s enforce "fixed fits in bank0 (< 2 MB) / cam starts at bank1 / cam is exactly 2 MB / total ≤ 8 MB".
+- **The effect is measurement-dependent** (below). Even with no effect the placement is harmless -- same MPU region, only the address differs.
+- **The camera ring is dynamically partitioned**: the old `cam_ring[4][256KB]` (fixed 1 MB) is gone; at stream start the slot stride = `align32(frame_bytes)` and the slot count = `min(2MB/stride, 8)` are computed from the current mode (fewer than 2 slots is rejected), so small modes get a deeper ring. Observable via `camera stream stats`'s `ring: N slots x M B`.
+- `cam_frame` (snapshot) shares bank0 with `ltdc_fb`, but snapshot is one-shot and tolerates FE (FE/DME IRQs are disabled for it, #45); the FE-critical streaming path (bank1 vs bank0) is separated.
+
+**Measured (FE reduction, LTDC scanout ON, same conditions, `camera stream stats`'s `dma fe/s`)**:
+
+| Mode | Old layout (same bank) | #65 (bank0 LTDC / bank1 ring) | Reduction |
+|---|---|---|---|
+| QVGA RGB565 | 1193.3 fe/s | **859.3 fe/s** | **−28%** |
+| 480x272 RGB565 | 2022.0 fe/s | **1489.5 fe/s** | **−26%** |
+
+Both keep `ovr dcmi`/`ovr ring` = 0 and fps 14.8. The bank separation cut **FE by ~26–28%** -- the "uncertain" side-effect confirmed on hardware. The dynamic arena gives both modes `ring: 8 slots` (deeper than the old fixed 4).
 
 ## Initialization flow
 
@@ -60,6 +84,8 @@ sdram test [bytes]   DESTRUCTIVE write/read-back memtest (default: all 8 MB, mul
 The `devmem` region allow-list also gains the SDRAM window (0xC0000000, 8 MB), so `devmem peek/poke/dump` reach it directly (anything past the 8 MB window stays rejected).
 
 `sdram test` runs three passes: (1) the **address pattern** (each word holds its own address -- catches stuck/shorted/aliased address lines, which a single repeated value would miss), (2) 0x55555555, (3) 0xAAAAAAAA (alternating data lines in both polarities). Each pass writes the full span and then reads it back, which also exercises refresh across the multi-ms gap. **Destructive** (clobbers `.sdram` objects, e.g. a captured frame). Cancellable with Ctrl+C at 64 KB chunk boundaries.
+
+**Suspend/invalidate contract for the destruction (#65, #47 downstream)**: the test overwrites all of `.sdram` including `ltdc_fb` (bank0), so it (1) **refuses** while the camera is streaming or GUIX owns the display, (2) **suspends** LTDC scanout for the duration if it was running (`ltdc_set_scanout(false)`, so the controller does not fetch the clobbered framebuffer and corrupt the screen), (3) invalidates the snapshot frame (`camera_frame_invalidate()`), and (4) after the test (a single restore path that also covers cancel/FAIL) **clears both framebuffers to black and restores scanout to its prior state** (no leftover pattern shown). If scanout was already off (`lcd disable`), it is left untouched.
 
 Example session:
 

@@ -210,6 +210,13 @@ bool ltdc_scanout_off(void);
  *  (no display = no contention), which is the correct "scanout not active" case. */
 bool ltdc_scanout_active(void);
 
+/** Clear BOTH framebuffers to black (issue #65).  Low-level: it writes the
+ *  framebuffers directly under the LTDC lock and does NOT go through the
+ *  scanout-disabled draw refusal, so it works even while scanout is OFF.  Used by
+ *  `sdram test` to repaint the clobbered .sdram buffers before re-enabling
+ *  scanout.  No-op when the LTDC is down/faulted.  Thread-context only. */
+void ltdc_clear(void);
+
 /** Read the LTDC FIFO-underrun / transfer-error status flags (sticky since the
  *  last clear).  These are set by hardware regardless of the interrupt enable
  *  (RM0385 §18.7.9), so they work without an LTDC IRQ: a non-zero FIFO-underrun

@@ -74,7 +74,7 @@
 /* Double buffer: two 480 x 272 RGB565 frames = 2 x 261120 B in non-cacheable
    SDRAM.  ltdc_front selects the displayed one; the other is the draw target. */
 static uint16_t ltdc_fb[2][LTDC_LCD_WIDTH * LTDC_LCD_HEIGHT]
-	__attribute__((aligned(32), section(".sdram")));
+	__attribute__((aligned(32), section(".sdram.fixed.ltdc")));
 
 static LTDC_HandleTypeDef  hltdc;
 static DMA2D_HandleTypeDef hdma2d;
@@ -183,6 +183,22 @@ bool ltdc_scanout_active(void)
 bool ltdc_gui_owns(void)
 {
 	return ltdc_gui_owned;
+}
+
+/* Clear BOTH framebuffers to black (issue #65).  Low-level: it writes ltdc_fb
+   directly under ltdc_lock and does NOT go through the scanout-disabled draw
+   refusal, so it works while scanout is OFF -- a destructive `sdram test`
+   repaints the clobbered .sdram buffers with this before re-enabling scanout.
+   No-op if the LTDC never came up or is faulted.  Thread-context only. */
+void ltdc_clear(void)
+{
+	if (!ltdc_is_up())
+		return;
+	ltdc_lock_frame();
+	for (uint32_t b = 0; b < 2u; b++)
+		for (uint32_t i = 0; i < LTDC_LCD_WIDTH * LTDC_LCD_HEIGHT; i++)
+			ltdc_fb[b][i] = LTDC_RGB565_BLACK;
+	ltdc_unlock_frame();
 }
 
 uint32_t ltdc_pixel_clock_hz(void)

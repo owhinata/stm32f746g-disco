@@ -265,10 +265,14 @@ slot is not recycled mid-copy); a multi-call reader (row-by-row save) compares
   must include a measured-bandwidth and slot / display-buffer budget table.**
   (Started by the #59 budget table below; a measured throughput number is
   deferred to the #57 membench.)
-- **`.sdram` teardown**: `sdram test` clobbers `.sdram`.  As the ring and a
-  future LTDC framebuffer grow there, `camera_frame_invalidate()` alone is no
-  longer enough -> the pipeline gains a "suspend/invalidate all SDRAM-resident
-  consumers" contract (a generalisation of `camera_frame_invalidate`).
+- **`.sdram` teardown**: `sdram test` clobbers `.sdram`.  `camera_frame_invalidate()`
+  alone cannot protect the LTDC framebuffer -> a "suspend/invalidate all
+  SDRAM-resident consumers" contract.  **Implemented (#65, the minimal LTDC +
+  camera two-consumer form)**: `sdram test` refuses while the camera streams or
+  GUIX owns the display, suspends LTDC scanout with `ltdc_set_scanout(false)`, and
+  after the test clears both framebuffers to black and restores the prior scanout
+  state (see [SDRAM](../hardware/sdram.md)).  Future consumers (NetX, ...) add to
+  the same pre-guard.
 
 ### SDRAM bandwidth budget (#59)
 

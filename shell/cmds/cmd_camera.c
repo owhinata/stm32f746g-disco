@@ -961,6 +961,9 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 		          (unsigned long)(fe10 / 10u), (unsigned long)(fe10 % 10u));
 	}
 	cli_print(sh, "jpeg trunc:%lu\r\n", (unsigned long)si.jpeg_trunc);
+	if (si.slots != 0)
+		cli_print(sh, "ring:      %lu slots x %lu B (arena #65)\r\n",
+		          (unsigned long)si.slots, (unsigned long)si.slot_bytes);
 	return 0;
 }
 

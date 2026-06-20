@@ -164,7 +164,7 @@ publish の deliver 確定も detach も lock 下なので、detach は「確定
 ## 下流要件（#48/#49 で確定）
 
 - **SDRAM 帯域**: リスクは容量でなく帯域。DCMI write + LTDC scanout + DMA2D + ETH DMA + CPU read が単一 FMC SDRAM に集中する。**#48/#49 で「帯域実測 + slot / 表示バッファ予算表」を必須**とする（下記予算表 #59 で着手。実スループット計測は #57 membench へ委譲）。
-- **`.sdram` teardown**: `sdram test` は `.sdram` を破壊する。リングや将来の LTDC framebuffer が増えると `camera_frame_invalidate()` だけでは不足 → パイプラインに「全 SDRAM 常駐 consumer を停止 / 無効化する suspend/invalidate 契約」を持たせる（`camera_frame_invalidate` の一般化）。
+- **`.sdram` teardown**: `sdram test` は `.sdram` を破壊する。`camera_frame_invalidate()` だけでは LTDC framebuffer を保護できない → 「全 SDRAM 常駐 consumer を停止 / 無効化する suspend/invalidate 契約」。**実装済（#65、LTDC + camera の 2 consumer 最小実装）**: `sdram test` は camera streaming / GUIX 所有を拒否、LTDC scanout を `ltdc_set_scanout(false)` で一時停止、test 後に両 FB 黒クリア＋元状態へ復帰（[SDRAM](../hardware/sdram.md)）。将来 consumer（NetX 等）は同じ前段ガードに追記。
 
 ### SDRAM 帯域予算（#59）
 

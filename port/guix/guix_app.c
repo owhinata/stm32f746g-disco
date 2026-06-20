@@ -63,7 +63,7 @@ static GX_CONST GX_FONT *guix_font_table[] = {
 #define PIX_DEMO    1u
 #define PIX_CAMERA  2u    /* camera live-preview view buffer (guix_camera.c) */
 static uint16_t guix_demo_img[DEMO_W * DEMO_H]
-	__attribute__((aligned(32), section(".sdram")));
+	__attribute__((aligned(32), section(".sdram.fixed")));
 static GX_PIXELMAP  guix_demo_pixmap;
 static GX_PIXELMAP *guix_pixelmap_table[3];
 

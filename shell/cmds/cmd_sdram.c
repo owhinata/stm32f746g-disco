@@ -30,7 +30,8 @@
  */
 #include "cli.h"
 #include "sdram.h"
-#include "camera.h"   /* camera_frame_invalidate: the test clobbers .sdram */
+#include "camera.h"        /* camera_frame_invalidate / camera_streaming      */
+#include "ltdc_display.h"  /* suspend LTDC scanout during the destructive test */
 
 #include <stdint.h>
 
@@ -134,6 +135,8 @@ static int cmd_sdram_test(struct cli_instance *sh, int argc, char **argv)
 	uint32_t bytes = SDRAM_SIZE_BYTES;
 	uint32_t words, fail_off, fail_got;
 	int rc;
+	int ret = 0;            /* function result (set before goto restore) */
+	bool was_active = false;/* LTDC scanout was running -> restore at the end */
 
 	if (!sdram_is_up()) {
 		cli_error(sh, "sdram: not initialized\r\n");
@@ -156,6 +159,26 @@ static int cmd_sdram_test(struct cli_instance *sh, int argc, char **argv)
 		              "run 'camera stream stop' first\r\n");
 		return 1;
 	}
+
+	/* The test overwrites all of .sdram, including ltdc_fb (the LTDC scan-out
+	   READ surface, pinned to bank0 -- #65).  Generalize the #47 suspend/
+	   invalidate contract: refuse if GUIX owns the display (cannot safely
+	   suspend), otherwise stop LTDC scanout for the duration so the controller
+	   does not fetch the clobbered framebuffer (visual corruption + bus
+	   contention).  camera streaming is already refused above.  Single postcondition
+	   (clear+restore) below.  TOCTOU note: camera_streaming() is a volatile read,
+	   not a lock -- safe under the single-shell assumption (a concurrent CLI could
+	   still race a stream start; full locking is a separate issue). */
+	if (ltdc_gui_owns()) {
+		cli_error(sh, "sdram: LTDC/GUIX owns the display; run 'gui stop' first\r\n");
+		return 1;
+	}
+	was_active = ltdc_scanout_active();
+	if (was_active && ltdc_set_scanout(false) != LTDC_OK) {
+		cli_error(sh, "sdram: could not suspend LTDC scanout\r\n");
+		return 1;
+	}
+
 	cli_warn(sh, "sdram: DESTRUCTIVE test over %lu KB "
 	             "(clobbers .sdram contents, e.g. a captured frame)\r\n",
 	         (unsigned long)(bytes / 1024u));
@@ -171,7 +194,8 @@ static int cmd_sdram_test(struct cli_instance *sh, int argc, char **argv)
 		rc = test_pass(sh, base, words, patterns[p], &fail_off, &fail_got);
 		if (rc < 0) {
 			cli_print(sh, "cancelled\r\n");
-			return 1;
+			ret = 1;
+			goto restore;
 		}
 		if (rc > 0) {
 			cli_print(sh, "FAIL\r\n");
@@ -181,14 +205,27 @@ static int cmd_sdram_test(struct cli_instance *sh, int argc, char **argv)
 			          (unsigned long)fail_got,
 			          (unsigned long)(patterns[p] ? patterns[p]
 			                : (uint32_t)(uintptr_t)&base[fail_off]));
-			return 1;
+			ret = 1;
+			goto restore;
 		}
 		cli_print(sh, "OK\r\n");
 	}
 
 	cli_print(sh, "sdram: %lu KB tested, no errors\r\n",
 	          (unsigned long)(bytes / 1024u));
-	return 0;
+	ret = 0;
+
+restore:
+	/* Single postcondition (#65): if we suspended an active scanout, the test
+	   left ltdc_fb full of test patterns -- repaint both buffers black and
+	   re-enable scanout (back to the prior ON state, no garbage shown).  If
+	   scanout was already off (lcd disable), leave it untouched. */
+	if (was_active) {
+		ltdc_clear();
+		if (ltdc_set_scanout(true) != LTDC_OK)
+			cli_warn(sh, "sdram: LTDC scanout restore failed; run 'lcd enable'\r\n");
+	}
+	return ret;
 }
 
 CLI_SUBCMD_SET_CREATE(sdram_subcmds,
