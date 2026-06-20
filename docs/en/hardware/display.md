@@ -15,8 +15,8 @@ This started as **Phase 1** (#52) of the LTDC + GUIX epic (#48) — a single RGB
 | Frame rate | 566×286 clk @ 4.8 MHz ≈ **29.6 Hz** (~33.7 ms/frame) | timings below |
 | Timings (spec) | HSYNC=41 / HBP=13 / HFP=32 / VSYNC=10 / VBP=2 / VFP=2 | rk043fn48h.h |
 | Polarity | HS / VS / DE = **active-low**, PC = **IPC** (not inverted) | ST BSP / RM0385 §18.7.5 |
-| Drawing | **DMA2D** (R2M fill / M2M blit, polled to completion) | RM0385 §9 |
-| Interrupt | **reload-ready only** (`LTDC_IT_RR`, prio 9); underrun/transfer error polled | RM0385 §18.7.9 |
+| Drawing | **DMA2D** (R2M fill / M2M blit; small transfers polled, large ones interrupt-driven, #64) | RM0385 §9 |
+| Interrupt | **reload-ready** (`LTDC_IT_RR`, prio 9) + **DMA2D completion** (`DMA2D_IRQn`, prio 10, #64); underrun/transfer error polled | RM0385 §18.7.9 / §9 |
 
 The values programmed into LTDC are each **spec minus one** (`HorizontalSync=40 / VerticalSync=9 / AccumulatedHBP=53 / AccumulatedVBP=11 / AccumulatedActiveW=533 / AccumulatedActiveH=283 / TotalWidth=565 / TotalHeigh=285`).
 
@@ -97,7 +97,7 @@ Drawing is accelerated by the built-in **DMA2D**. As an AHB master it reads/writ
 - **M2M blit** — `ltdc_blit` (copy a tightly-packed RGB565 bitmap into the back buffer) / `ltdc_blit_demo` (strided self-copy of the back buffer's left half over its right half)
 - The gradient (`ltdc_gradient`) is per-column, so the CPU draws it directly
 
-Each op follows the same ST BSP `LL_FillBuffer` / `LL_ConvertLineToARGB8888` idiom: per op `HAL_DMA2D_Init` → `ConfigLayer` → `Start` → `PollForTransfer(30 ms)`.
+Each op follows the same ST BSP `LL_FillBuffer` / `LL_ConvertLineToARGB8888` idiom: per op `HAL_DMA2D_Init` → `ConfigLayer` → Start → wait for completion. The completion wait is chosen by transfer size (#64): **small transfers** (`w*h < LTDC_DMA2D_IT_MIN_PIXELS = 16384 px`) still spin in `PollForTransfer(30 ms)`, while **large transfers** (the camera 320×240 preview, full-screen 480×272 ops, …) use `HAL_DMA2D_Start_IT` + the `DMA2D_IRQn` completion interrupt (prio 10) → a semaphore so the waiting thread **blocks** (freeing its CPU / yielding to lower-priority threads). DMA2D is a single engine and every op runs under `ltdc_lock`, so at most one transfer is ever in flight. On a timeout with no completion callback, `HAL_DMA2D_Abort` is forced to leave the engine idle and unlock the HAL handle. The threshold is tunable against the `thread` CPU% on hardware.
 
 ### Tear-free flip (VBR authoritative + fail-closed)
 
@@ -165,7 +165,7 @@ sh> lcd fill red
 
 ## Bandwidth
 
-The LTDC continuously reads **only the front buffer** during the active period, every frame (double buffering does not increase the LTDC read bandwidth — it still fetches one buffer). At RGB565 and a **4.8 MHz** pixel clock (#59) the upper bound is **4.8 Mpix/s × 2 B = 9.6 MB/s** (≈7.8 MB/s effective for active fetch only). Against the SDRAM's theoretical bandwidth (16-bit @ 108 MHz = 216 MB/s) that is about 4.4%. The DMA2D fills/blits are short write bursts to the back buffer (at most ~510 KB per drawn frame), and the CPU waits on `PollForTransfer`, so they contend with the LTDC read only briefly. There is headroom alongside DCMI writes (QVGA ≈ 1.65 MB/s) and the CPU (verify on hardware: `lcd anim`/`blit`, `camera capture`/`stream` regress cleanly, underrun=no).
+The LTDC continuously reads **only the front buffer** during the active period, every frame (double buffering does not increase the LTDC read bandwidth — it still fetches one buffer). At RGB565 and a **4.8 MHz** pixel clock (#59) the upper bound is **4.8 Mpix/s × 2 B = 9.6 MB/s** (≈7.8 MB/s effective for active fetch only). Against the SDRAM's theoretical bandwidth (16-bit @ 108 MHz = 216 MB/s) that is about 4.4%. The DMA2D fills/blits are short write bursts to the back buffer (at most ~510 KB per drawn frame), so they contend with the LTDC read only briefly. Small transfers spin in `PollForTransfer`; large ones block the waiting thread on the completion interrupt instead (#64) — but either way the DMA2D engine's SDRAM occupancy (the FE contention) is the same, so making the wait interrupt-driven is a CPU/power optimisation independent of the bandwidth contention. There is headroom alongside DCMI writes (QVGA ≈ 1.65 MB/s) and the CPU (verify on hardware: `lcd anim`/`blit`, `camera capture`/`stream` regress cleanly, underrun=no).
 
 !!! note "SDRAM bandwidth contention and the camera preview (#59)"
     On **average** the LTDC read is only ~6%, but its **instantaneous bursts** contend (in FMC arbitration) with the DCMI DMA's 16-byte FIFO and induce DCMI DMA FIFO errors (FE) during camera preview. #59 mitigates this with two levers: **(A)** the LCD_CLK drop from 9.6 → 4.8 MHz in this section (less instantaneous LTDC SDRAM occupancy), and **(B)** fewer DMA2D round-trips in the preview path (see the bandwidth budget table in [frame pipeline](../architecture/frame-pipeline.md)). The figures of merit are `camera stream stats` **`dma fe/s`** and `lcd info` **underrun**. Re-evaluate with higher resolution/fps.

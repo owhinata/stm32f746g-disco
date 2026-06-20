@@ -224,6 +224,52 @@ void ltdc_clear(void);
  *  LTDC_ERRFLAG_*; when @p clear is true the flags are cleared afterwards. */
 uint32_t ltdc_errors(bool clear);
 
+/* ---- DMA2D completion: interrupt-driven for large transfers (#64) -----------
+ * The DMA2D (Chrom-ART) engine is single and every transfer in this firmware
+ * runs under ltdc_lock (recursive), so at most one transfer is ever in flight.
+ * Small transfers still poll (HAL_DMA2D_PollForTransfer) -- the IT handoff
+ * (~few us each way) would dominate their few-us run time -- but LARGE transfers
+ * (>= LTDC_DMA2D_IT_MIN_PIXELS) go interrupt-driven so the waiting thread BLOCKS
+ * on a completion semaphore (posted by DMA2D_IRQHandler) instead of spinning the
+ * CPU; lower-priority threads run / the core idles meanwhile.  These helpers are
+ * shared by the ltdc and guix DMA2D primitives.  Caller MUST hold ltdc_lock.
+ *
+ * Usage (caller configures the handle, then):
+ *     ltdc_dma2d_arm_it(&h);
+ *     if (HAL_DMA2D_Start_IT(&h, ...) == HAL_OK)
+ *         ok = ltdc_dma2d_wait_it(&h, timeout_ms);
+ *     else
+ *         ltdc_dma2d_disarm_it(&h);   // start failed: undo the arm
+ */
+struct __DMA2D_HandleTypeDef;   /* HAL's DMA2D_HandleTypeDef; opaque here */
+
+/* Destination pixel count (w*h) at/above which a transfer goes interrupt-driven
+ * rather than polled.  ~32 KB RGB565 (a 128x128 block); the camera 320x240
+ * preview blit and full-screen 480x272 ops clear it, widget fill bands do not.
+ * Tunable -- validate the cross-over on hardware with the `thread` CPU%. */
+#define LTDC_DMA2D_IT_MIN_PIXELS  16384u
+
+/** Arm interrupt-driven completion on handle @p h: drain the completion
+ *  semaphore, wire h's transfer-complete/error callbacks, clear its error code,
+ *  and record it as the in-flight handle for DMA2D_IRQHandler.  Call IMMEDIATELY
+ *  before HAL_DMA2D_Start_IT()/HAL_DMA2D_BlendingStart_IT().  Caller holds
+ *  ltdc_lock. */
+void ltdc_dma2d_arm_it(struct __DMA2D_HandleTypeDef *h);
+
+/** Block (up to @p timeout_ms) on the completion semaphore for a transfer armed
+ *  on @p h, then disarm it (always).  Returns true iff the transfer completed
+ *  without error (h->State == HAL_DMA2D_STATE_READY).  On timeout the engine is
+ *  HAL_DMA2D_Abort'd so the handle is left idle AND unlocked.  Caller holds
+ *  ltdc_lock. */
+bool ltdc_dma2d_wait_it(struct __DMA2D_HandleTypeDef *h, uint32_t timeout_ms);
+
+/** Undo an arm that never reached wait_it (e.g. HAL_DMA2D_Start_IT failed):
+ *  disable the completion interrupts, clear the in-flight handle, and
+ *  HAL_DMA2D_Abort the engine to leave it idle AND unlock the HAL handle (which
+ *  Start_IT leaves LOCKED until a completion callback runs -- skipping this would
+ *  wedge the next HAL_DMA2D_Init on __HAL_LOCK).  Caller holds ltdc_lock. */
+void ltdc_dma2d_disarm_it(struct __DMA2D_HandleTypeDef *h);
+
 /* ---- Drawing into the back buffer (#53; DMA2D-accelerated where noted). -----
  * All of these draw into the back buffer only; they do NOT present.  Call
  * ltdc_flip() afterwards to make the result visible.  No-ops when down. */

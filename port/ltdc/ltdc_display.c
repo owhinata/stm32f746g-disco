@@ -32,9 +32,11 @@
  *     frame buffers below (two of them, double-buffered).
  *
  * Drawing is DMA2D-accelerated (#53): the Chrom-ART engine does register-to-
- * memory fills (ltdc_dma2d_fill) and memory-to-memory blits (ltdc_dma2d_blit),
- * polled to completion.  DMA2D, the CPU and the LTDC read DMA all touch the same
- * MPU non-cacheable `.sdram` region, so they are coherent with no cache work.
+ * memory fills (ltdc_dma2d_fill) and memory-to-memory blits (ltdc_dma2d_blit).
+ * Small transfers are polled to completion; large ones (>= LTDC_DMA2D_IT_MIN_
+ * PIXELS) block on a DMA2D completion IRQ instead of spinning the CPU (#64).
+ * DMA2D, the CPU and the LTDC read DMA all touch the same MPU non-cacheable
+ * `.sdram` region, so they are coherent with no cache work.
  *
  * Double buffer + tear-free flip (#53): drawing targets the back buffer;
  * ltdc_flip() stages it via HAL_LTDC_SetAddress_NoReload() then HAL_LTDC_Reload
@@ -87,6 +89,13 @@ static bool         ltdc_gui_owned;   /* GUIX owns the display (#55)          */
 static bool         ltdc_disabled;    /* LTDC scanout stopped (lcd disable, #66) */
 static TX_SEMAPHORE ltdc_reload_sem;  /* posted by the reload-ready IRQ       */
 static TX_MUTEX     ltdc_lock;        /* serializes drawing + flip            */
+
+/* DMA2D interrupt-driven completion (#64).  The engine is single and serialized
+   on ltdc_lock, so at most one transfer is armed at a time; dma2d_active is the
+   handle DMA2D_IRQHandler dispatches to (NULL between transfers), and
+   dma2d_done_sem is posted by the transfer-complete/error callback. */
+static TX_SEMAPHORE dma2d_done_sem;                  /* posted on DMA2D completion */
+static DMA2D_HandleTypeDef *volatile dma2d_active;   /* in-flight handle (ISR reads) */
 
 bool ltdc_is_up(void)
 {
@@ -231,8 +240,87 @@ uint32_t ltdc_errors(bool clear)
 	return mask;
 }
 
+/* ---- DMA2D interrupt-driven completion (#64) -------------------------------
+ * Large transfers block on dma2d_done_sem instead of spinning in
+ * HAL_DMA2D_PollForTransfer (see ltdc_display.h).  HAL_DMA2D_Start_IT enables
+ * TC|TE|CE together but its IRQ handler only disables the bit of the event that
+ * fired, so the disarm below MUST explicitly clear all three: a leftover TEIE/
+ * CEIE could otherwise fire DMA2D_IRQHandler during a later POLLED transfer (it
+ * does not touch the IT enables), where it would steal the completion flag from
+ * HAL_DMA2D_PollForTransfer with a stale dma2d_active.  Between transfers we keep
+ * the invariant: dma2d_active == NULL and TC|TE|CE all disabled. */
+
+/* Transfer-complete AND transfer-error callback (same for both; the waiter reads
+   h->State to tell success from failure).  Runs in DMA2D_IRQHandler context. */
+static void dma2d_xfer_done(DMA2D_HandleTypeDef *h)
+{
+	(void)h;
+	(void)tx_semaphore_put(&dma2d_done_sem);
+}
+
+void ltdc_dma2d_arm_it(struct __DMA2D_HandleTypeDef *h_)
+{
+	DMA2D_HandleTypeDef *h = (DMA2D_HandleTypeDef *)h_;
+
+	/* Drain any stale post (e.g. a late IRQ from a previous timed-out transfer)
+	   so the wait blocks on THIS transfer.  Mirrors ltdc_flip_locked's drain. */
+	while (tx_semaphore_get(&dma2d_done_sem, TX_NO_WAIT) == TX_SUCCESS)
+		;
+	h->XferCpltCallback  = dma2d_xfer_done;
+	h->XferErrorCallback = dma2d_xfer_done;
+	h->ErrorCode         = HAL_DMA2D_ERROR_NONE;   /* TC path |= NONE never clears */
+	dma2d_active         = h;                       /* before HAL_DMA2D_Start_IT */
+}
+
+/* Tear down an arm and leave DMA2D idle + the handle unlocked.  @p completed is
+   true only when the HAL completion callback actually ran (the semaphore was
+   obtained): the handle is then already READY and __HAL_UNLOCK'd, and CR.START
+   is 0, so no abort is needed.  When false (timeout, or a start that never
+   delivered a callback) the handle is still BUSY + LOCKED from
+   HAL_DMA2D_Start_IT -- and the hardware may have self-cleared CR.START exactly
+   as we masked the IRQ, so a CR.START test would wrongly skip cleanup -- so we
+   ALWAYS HAL_DMA2D_Abort: it disables the ITs, sets State=READY and UNLOCKS the
+   handle even when START is already 0, preventing a wedged handle (the next
+   HAL_DMA2D_Init would otherwise spin on __HAL_LOCK forever). */
+static void dma2d_disarm(DMA2D_HandleTypeDef *h, bool completed)
+{
+	uint32_t pm;
+
+	/* Stop any pending/late completion IRQ from interleaving the teardown, then
+	   drop the in-flight handle, under PRIMASK.  A DMA2D IRQ taken after this
+	   sees dma2d_active == NULL and silences itself (see DMA2D_IRQHandler). */
+	pm = __get_PRIMASK();
+	__disable_irq();
+	__HAL_DMA2D_DISABLE_IT(h, DMA2D_IT_TC | DMA2D_IT_TE | DMA2D_IT_CE);
+	dma2d_active = NULL;
+	__set_PRIMASK(pm);
+
+	if (!completed || (DMA2D->CR & DMA2D_CR_START) != 0u)
+		(void)HAL_DMA2D_Abort(h);   /* unlock + idle even if START already 0 */
+	__HAL_DMA2D_CLEAR_FLAG(h, DMA2D_FLAG_TC | DMA2D_FLAG_TE | DMA2D_FLAG_CE);
+}
+
+void ltdc_dma2d_disarm_it(struct __DMA2D_HandleTypeDef *h_)
+{
+	/* No completion callback reached us (e.g. HAL_DMA2D_Start_IT failed): force
+	   the abort/unlock path so the arm cannot leave the handle wedged. */
+	dma2d_disarm((DMA2D_HandleTypeDef *)h_, false);
+}
+
+bool ltdc_dma2d_wait_it(struct __DMA2D_HandleTypeDef *h_, uint32_t timeout_ms)
+{
+	DMA2D_HandleTypeDef *h = (DMA2D_HandleTypeDef *)h_;
+	bool got, ok;
+
+	got = (tx_semaphore_get(&dma2d_done_sem, timeout_ms) == TX_SUCCESS);
+	ok  = got && (h->State == HAL_DMA2D_STATE_READY);
+	dma2d_disarm(h, got);   /* timeout (!got) -> force HAL_DMA2D_Abort to unlock */
+	return ok;
+}
+
 /* ---- DMA2D (Chrom-ART) draw primitives (ST BSP LL_FillBuffer / -------------
- * LL_ConvertLineToARGB8888 idiom: per-op Init + ConfigLayer + Start + poll). */
+ * LL_ConvertLineToARGB8888 idiom: per-op Init + ConfigLayer + Start + complete
+ * (polled for small transfers, interrupt-driven for large ones, #64)). */
 
 /* Expand an RGB565 colour to ARGB8888 (0x00RRGGBB).  R2M fills MUST pass this
    to HAL_DMA2D_Start(): the F7 HAL takes the R2M "color" argument as an
@@ -252,6 +340,26 @@ static uint32_t rgb565_to_argb8888(uint16_t c)
 	return (r << 16) | (g << 8) | b;
 }
 
+/* Kick off an already-configured 2-operand DMA2D transfer (R2M fill or M2M blit
+   -- both use HAL_DMA2D_Start/_Start_IT with the same signature) and run it to
+   completion: interrupt-driven (block) when w*h is large, else polled (spin),
+   per LTDC_DMA2D_IT_MIN_PIXELS (#64).  Returns true on a clean completion.
+   Caller holds ltdc_lock. */
+static bool dma2d_run(uint32_t pdata, uint32_t dst, uint32_t w, uint32_t h)
+{
+	if ((uint64_t)w * h >= LTDC_DMA2D_IT_MIN_PIXELS) {
+		ltdc_dma2d_arm_it(&hdma2d);
+		if (HAL_DMA2D_Start_IT(&hdma2d, pdata, dst, w, h) != HAL_OK) {
+			ltdc_dma2d_disarm_it(&hdma2d);
+			return false;
+		}
+		return ltdc_dma2d_wait_it(&hdma2d, 30);
+	}
+	if (HAL_DMA2D_Start(&hdma2d, pdata, dst, w, h) != HAL_OK)
+		return false;
+	return HAL_DMA2D_PollForTransfer(&hdma2d, 30) == HAL_OK;
+}
+
 /* Register-to-memory single-colour fill of a w x h RGB565 block, @p line_off
    u16 of padding skipped at each row end (= dst stride - w). */
 static void ltdc_dma2d_fill(uint16_t *dst, uint16_t color, uint32_t w,
@@ -266,10 +374,9 @@ static void ltdc_dma2d_fill(uint16_t *dst, uint16_t color, uint32_t w,
 	hdma2d.Init.OutputOffset = line_off;
 
 	if (HAL_DMA2D_Init(&hdma2d) == HAL_OK &&
-	    HAL_DMA2D_ConfigLayer(&hdma2d, 1) == HAL_OK &&
-	    HAL_DMA2D_Start(&hdma2d, rgb565_to_argb8888(color),
-	                    (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
-		HAL_DMA2D_PollForTransfer(&hdma2d, 30);
+	    HAL_DMA2D_ConfigLayer(&hdma2d, 1) == HAL_OK)
+		(void)dma2d_run(rgb565_to_argb8888(color), (uint32_t)(uintptr_t)dst,
+		                w, h);
 }
 
 /* Memory-to-memory copy of a w x h RGB565 block, with separate u16 row offsets
@@ -291,10 +398,9 @@ static void ltdc_dma2d_blit(uint16_t *dst, const uint16_t *src, uint32_t w,
 	hdma2d.LayerCfg[1].InputOffset    = src_off;
 
 	if (HAL_DMA2D_Init(&hdma2d) == HAL_OK &&
-	    HAL_DMA2D_ConfigLayer(&hdma2d, 1) == HAL_OK &&
-	    HAL_DMA2D_Start(&hdma2d, (uint32_t)(uintptr_t)src,
-	                    (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
-		HAL_DMA2D_PollForTransfer(&hdma2d, 30);
+	    HAL_DMA2D_ConfigLayer(&hdma2d, 1) == HAL_OK)
+		(void)dma2d_run((uint32_t)(uintptr_t)src, (uint32_t)(uintptr_t)dst,
+		                w, h);
 }
 
 /* PLLSAI -> LCD_CLK = 4.8 MHz (#59; see file header / RM0385 §5.3.24/25).
@@ -443,6 +549,14 @@ int ltdc_init(void)
 		tx_semaphore_delete(&ltdc_reload_sem);
 		return LTDC_ERR_STATE;
 	}
+	/* DMA2D completion semaphore (#64): posted by DMA2D_IRQHandler so a large
+	   transfer's caller blocks instead of spinning HAL_DMA2D_PollForTransfer. */
+	if (tx_semaphore_create(&dma2d_done_sem, "dma2d", 0) != TX_SUCCESS) {
+		LOG_ERR("dma2d completion semaphore create failed");
+		tx_mutex_delete(&ltdc_lock);
+		tx_semaphore_delete(&ltdc_reload_sem);
+		return LTDC_ERR_STATE;
+	}
 
 	rc = ltdc_clock_init();
 	if (rc != LTDC_OK)
@@ -476,6 +590,15 @@ int ltdc_init(void)
 	HAL_NVIC_SetPriority(LTDC_IRQn, 9, 0);
 	HAL_NVIC_EnableIRQ(LTDC_IRQn);
 
+	/* DMA2D completion IRQ (#64): priority 10, below DCMI/DMA2 (8) and LTDC (9)
+	   so it never preempts the camera DMA -- completion notification is not
+	   latency-critical, it just wakes the blocked draw thread.  Only armed
+	   transiently by HAL_DMA2D_Start_IT (ltdc_dma2d_arm_it); idle otherwise.
+	   ThreadX-call safety from the ISR is by the port's PRIMASK critical sections
+	   (like the camera/SD/LTDC ISRs), not by this priority value. */
+	HAL_NVIC_SetPriority(DMA2D_IRQn, 10, 0);
+	HAL_NVIC_EnableIRQ(DMA2D_IRQn);
+
 	ltdc_backlight(true);
 
 	ltdc_up = true;
@@ -486,6 +609,7 @@ int ltdc_init(void)
 	return LTDC_OK;
 
 fail_obj:
+	tx_semaphore_delete(&dma2d_done_sem);
 	tx_mutex_delete(&ltdc_lock);
 	tx_semaphore_delete(&ltdc_reload_sem);
 	return rc;
@@ -768,4 +892,32 @@ void HAL_LTDC_ReloadEventCallback(LTDC_HandleTypeDef *hltdc_cb)
 {
 	if (hltdc_cb == &hltdc)
 		(void)tx_semaphore_put(&ltdc_reload_sem);
+}
+
+/* ---- DMA2D completion IRQ (#64; armed transiently by HAL_DMA2D_Start_IT). ----
+ * Dispatches to the in-flight handle.  Between transfers dma2d_active is NULL
+ * (ltdc_dma2d_disarm_it); a DMA2D IRQ taken then is a late/stale completion from
+ * a just-disarmed transfer (e.g. a timeout that finished right as we tore down)
+ * -- silence every source it could have raised so it cannot re-pend (interrupt
+ * storm), rather than feeding HAL a NULL handle.  Wrapped in the ThreadX
+ * execution-profile enter/exit exactly like LTDC_IRQHandler. */
+void DMA2D_IRQHandler(void)
+{
+	DMA2D_HandleTypeDef *h;
+
+#if defined(TX_EXECUTION_PROFILE_ENABLE)
+	{ uint32_t pm = __get_PRIMASK(); __disable_irq();
+	  _tx_execution_isr_enter(); __set_PRIMASK(pm); }
+#endif
+	h = dma2d_active;
+	if (h != NULL) {
+		HAL_DMA2D_IRQHandler(h);
+	} else {
+		DMA2D->CR  &= ~(DMA2D_IT_TC | DMA2D_IT_TE | DMA2D_IT_CE);
+		DMA2D->IFCR =  DMA2D_FLAG_TC | DMA2D_FLAG_TE | DMA2D_FLAG_CE;
+	}
+#if defined(TX_EXECUTION_PROFILE_ENABLE)
+	{ uint32_t pm = __get_PRIMASK(); __disable_irq();
+	  _tx_execution_isr_exit(); __set_PRIMASK(pm); }
+#endif
 }

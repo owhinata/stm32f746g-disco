@@ -86,6 +86,35 @@ static uint32_t rgb565_to_argb8888(uint16_t c)
 	return (r << 16) | (g << 8) | b;
 }
 
+/* Run an already-configured 2-operand DMA2D transfer on hdma2d_gui (R2M fill or
+   M2M blit -- same HAL_DMA2D_Start/_Start_IT signature) to completion: large
+   transfers block on the completion IRQ, small ones poll (#64; threshold
+   LTDC_DMA2D_IT_MIN_PIXELS).  Guarantees DMA2D is left IDLE on failure -- the
+   camera sink's CPU fallback (cam_rect_refresh) relies on it.  Caller holds
+   ltdc_lock.  Returns true on a clean completion. */
+static bool guix_dma2d_run(uint32_t pdata, uint32_t dst, uint32_t w, uint32_t h)
+{
+	if ((uint64_t)w * h >= LTDC_DMA2D_IT_MIN_PIXELS) {
+		ltdc_dma2d_arm_it(&hdma2d_gui);
+		if (HAL_DMA2D_Start_IT(&hdma2d_gui, pdata, dst, w, h) != HAL_OK) {
+			ltdc_dma2d_disarm_it(&hdma2d_gui);    /* leaves the engine idle */
+			return false;
+		}
+		return ltdc_dma2d_wait_it(&hdma2d_gui, 30);   /* disarms -> idle */
+	}
+	if (HAL_DMA2D_Start(&hdma2d_gui, pdata, dst, w, h) != HAL_OK)
+		return false;
+	if (HAL_DMA2D_PollForTransfer(&hdma2d_gui, 30) == HAL_OK)
+		return true;
+	/* Poll timeout returns without clearing CR.START -- the engine may still be
+	   writing the destination.  Abort so a failed transfer always leaves DMA2D
+	   idle (cam_rect_refresh's CPU follow-up relies on it, and it keeps the next
+	   op's re-init clean, #59). */
+	if ((DMA2D->CR & DMA2D_CR_START) != 0u)
+		(void)HAL_DMA2D_Abort(&hdma2d_gui);
+	return false;
+}
+
 /* DMA2D register-to-memory fill of a w x h RGB565 block; @p line_off u16 skipped
    at each row end (= dst stride in px - w).  Serialized on ltdc_lock. */
 static void guix_dma2d_fill(uint16_t *dst, uint16_t color, uint32_t w,
@@ -100,10 +129,9 @@ static void guix_dma2d_fill(uint16_t *dst, uint16_t color, uint32_t w,
 	hdma2d_gui.Init.ColorMode    = DMA2D_OUTPUT_RGB565;
 	hdma2d_gui.Init.OutputOffset = line_off;
 	if (HAL_DMA2D_Init(&hdma2d_gui) == HAL_OK &&
-	    HAL_DMA2D_ConfigLayer(&hdma2d_gui, 1) == HAL_OK &&
-	    HAL_DMA2D_Start(&hdma2d_gui, rgb565_to_argb8888(color),
-	                    (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
-		HAL_DMA2D_PollForTransfer(&hdma2d_gui, 30);
+	    HAL_DMA2D_ConfigLayer(&hdma2d_gui, 1) == HAL_OK)
+		(void)guix_dma2d_run(rgb565_to_argb8888(color),
+		                     (uint32_t)(uintptr_t)dst, w, h);
 	ltdc_unlock_frame();
 }
 
@@ -129,18 +157,12 @@ static int guix_dma2d_blit(uint16_t *dst, const uint16_t *src, uint32_t w,
 	hdma2d_gui.LayerCfg[1].InputAlpha     = 0xFFu;
 	hdma2d_gui.LayerCfg[1].InputColorMode = DMA2D_INPUT_RGB565;
 	hdma2d_gui.LayerCfg[1].InputOffset    = src_off;
+	/* guix_dma2d_run completes the transfer (IT for large, poll for small) and
+	   leaves DMA2D idle on failure, so cam_rect_refresh's CPU fallback is safe. */
 	if (HAL_DMA2D_Init(&hdma2d_gui) == HAL_OK &&
 	    HAL_DMA2D_ConfigLayer(&hdma2d_gui, 1) == HAL_OK &&
-	    HAL_DMA2D_Start(&hdma2d_gui, (uint32_t)(uintptr_t)src,
-	                    (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
-		rc = (HAL_DMA2D_PollForTransfer(&hdma2d_gui, 30) == HAL_OK) ? 0 : -1;
-	/* A PollForTransfer timeout returns without clearing CR.START -- the engine
-	   may still be writing the destination.  Abort so a failed blit always
-	   leaves DMA2D idle, which a CPU follow-up to the same buffer relies on
-	   (cam_rect_refresh's fallback) and which keeps the next blit's re-init
-	   clean (#59). */
-	if (rc != 0 && (DMA2D->CR & DMA2D_CR_START) != 0u)
-		(void)HAL_DMA2D_Abort(&hdma2d_gui);
+	    guix_dma2d_run((uint32_t)(uintptr_t)src, (uint32_t)(uintptr_t)dst, w, h))
+		rc = 0;
 	ltdc_unlock_frame();
 	return rc;
 }
@@ -174,11 +196,24 @@ static void guix_dma2d_blend(uint16_t *dst, const void *src, uint32_t w,
 	hdma2d_gui.LayerCfg[0].InputOffset    = dst_off;
 	if (HAL_DMA2D_Init(&hdma2d_gui) == HAL_OK &&
 	    HAL_DMA2D_ConfigLayer(&hdma2d_gui, 0) == HAL_OK &&
-	    HAL_DMA2D_ConfigLayer(&hdma2d_gui, 1) == HAL_OK &&
-	    HAL_DMA2D_BlendingStart(&hdma2d_gui, (uint32_t)(uintptr_t)src,
-	                            (uint32_t)(uintptr_t)dst,
-	                            (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
-		HAL_DMA2D_PollForTransfer(&hdma2d_gui, 30);
+	    HAL_DMA2D_ConfigLayer(&hdma2d_gui, 1) == HAL_OK) {
+		/* Blend has three operands (BlendingStart), so it cannot use
+		   guix_dma2d_run; inline the same size-thresholded poll/IT choice (#64).
+		   Blends are icons/overlays, almost always below the threshold -> poll. */
+		if ((uint64_t)w * h >= LTDC_DMA2D_IT_MIN_PIXELS) {
+			ltdc_dma2d_arm_it(&hdma2d_gui);
+			if (HAL_DMA2D_BlendingStart_IT(&hdma2d_gui,
+			        (uint32_t)(uintptr_t)src, (uint32_t)(uintptr_t)dst,
+			        (uint32_t)(uintptr_t)dst, w, h) == HAL_OK)
+				(void)ltdc_dma2d_wait_it(&hdma2d_gui, 30);
+			else
+				ltdc_dma2d_disarm_it(&hdma2d_gui);
+		} else if (HAL_DMA2D_BlendingStart(&hdma2d_gui,
+		               (uint32_t)(uintptr_t)src, (uint32_t)(uintptr_t)dst,
+		               (uint32_t)(uintptr_t)dst, w, h) == HAL_OK) {
+			HAL_DMA2D_PollForTransfer(&hdma2d_gui, 30);
+		}
+	}
 	ltdc_unlock_frame();
 }
 
