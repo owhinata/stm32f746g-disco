@@ -7,7 +7,8 @@
  * @brief   GUIX bring-up / lifecycle on ThreadX (issue #55, Epic #48).
  *
  * Ties the GUIX 565rgb display driver (guix_display), the FT5336 input thread
- * (guix_touch) and the demo UI (guix_app) together and starts GUIX on ThreadX.
+ * (guix_touch) and the app's widget tree (built via a registered builder, e.g.
+ * the ui/ camera app -- #61) together and starts GUIX on ThreadX.
  * Started ON at boot (issue #60): tx_application_define() calls guix_start()
  * after the LTDC/touch bring-up, symmetric with the camera producer.  This is
  * safe before the scheduler -- guix_first_start() only does memory setup +
@@ -36,9 +37,22 @@ extern "C" {
 #define GUIX_ERR        -1   /* a GUIX API call failed                       */
 #define GUIX_ERR_STATE  -2   /* LTDC display is down (cannot start)          */
 
+/** The application (ui/) supplies the GUIX widget-tree builder; guix_first_start()
+ *  calls it once after creating the display/canvas/root, then does
+ *  gx_widget_show(root).  @p display / @p root are void* (GX_DISPLAY* /
+ *  GX_WINDOW_ROOT*) so this header stays free of GUIX types and guix_glue does
+ *  not depend on the ui layer (dependency inversion, #43/#61).  Returns 0 on
+ *  success, nonzero (a GX status) on failure. */
+typedef int (*guix_app_builder_fn)(void *display, void *root);
+
+/** Register the widget-tree builder.  Call once (camera_ui_init from
+ *  tx_application_define) before the first guix_start(). */
+void guix_register_app_builder(guix_app_builder_fn fn);
+
 /** Start (or resume) the GUIX UI: takes over the LCD + FT5336 touch.  Requires
- *  the LTDC display to be up.  Idempotent while running.  Returns GUIX_OK,
- *  GUIX_ERR_STATE (display down) or GUIX_ERR (GUIX API failure). */
+ *  the LTDC display to be up and an app builder registered.  Idempotent while
+ *  running.  Returns GUIX_OK, GUIX_ERR_STATE (display down) or GUIX_ERR (GUIX API
+ *  failure / no builder registered). */
 int guix_start(void);
 
 /** Stop the GUIX UI: park input, blank the screen, hand the display back to the

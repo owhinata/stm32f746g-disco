@@ -299,7 +299,7 @@ Raster is fixed-length, so the **DBM + TC interrupt** delimits each frame; **JPE
 - A failed `HAL_DCMI_Stop` / re-arm is **terminal** (`cam_stream_err` → teardown). `--frames`/`--secs` targets are re-checked after publishing so no extra capture is armed.
 - Frames with **no SOI/EOI** are dropped and counted in `camera stream stats` as **`jpeg trunc`**; free-slot exhaustion is `ovr ring`. Frames that arrive in the Stop..re-arm gap are not captured (DCMI is disabled) and **by design are not counted**.
 - **Retrieval**: each JPEG publish mirrors the finalised frame into the (idle during streaming) `cam_frame`, so `camera save` / `camera send` can pull the latest JPEG frame during or after the stream.
-- **No preview**: the F746 has no JPEG decode path, so `gui camera on` while `camera format jpeg` is explicitly refused (`camera format rgb565` first). The intended consumer is #49 (network streaming — JPEG compression keeps high resolutions within bandwidth).
+- **No preview**: the F746 has no JPEG decode path, so the camera UI live preview (boot / `gui start`) is explicitly refused while `camera format jpeg` (`camera format rgb565` first). The intended consumer is #49 (network streaming — JPEG compression keeps high resolutions within bandwidth).
 
 ```
 camera format jpeg; camera res qvga
@@ -308,9 +308,9 @@ camera stream stats               # frames/fps, jpeg trunc
 camera save fs /shot.jpg          # save the latest frame as JPEG (SOI/EOI consistent)
 ```
 
-### GUIX live preview (#56)
+### GUIX live preview (#56/#61)
 
-`gui camera on` attaches a GUIX push sink to this streaming pipeline and shows the QVGA frames **at native scale** on the LTDC (GUIX) screen. Preview **forces QVGA RGB565** (`camera_preview_start` calls `camera_set_format_locked(QVGA,RGB565)` under the same lock), so it always matches the #56 sink (QVGA RGB565 only) regardless of the last `camera res/format` (the mode is left at QVGA RGB565 afterwards). While the preview owns the stream, `camera stream start/stop` and `camera res/format` are refused. See [GUIX › Camera live preview](../rtos/guix.md#camera-live-preview-56) for details.
+The GUIX camera UI (#61) attaches a GUIX push sink to this streaming pipeline at **boot / `gui start`** and shows the QVGA frames **at native scale** on the LTDC (GUIX) screen (since #61 this is the default UI, so live video shows right after power-on). Preview **forces QVGA RGB565** (`camera_preview_start` calls `camera_set_format_locked(QVGA,RGB565)` under the same lock), so it always matches the #56 sink (QVGA RGB565 only) regardless of the last `camera res/format`. While the preview owns the stream, `camera stream start/stop` and `camera res/format/set` are refused (escape hatch: `gui stop`). See [GUIX › Camera live preview](../rtos/guix.md#camera-live-preview-5661) for details.
 
 ## References
 

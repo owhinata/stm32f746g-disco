@@ -42,7 +42,7 @@
 #include "camera.h"
 #include "ltdc_display.h"
 #include "touch.h"
-#include "guix_glue.h"
+#include "guix_camera_ui.h"
 #include "iwdg.h"
 
 #include <stddef.h>
@@ -206,21 +206,24 @@ void tx_application_define(void *first_unused_memory)
 	if (touch_init() != 0)
 		printf("touch: init failed (touch command disabled)\r\n");
 
-	/* GUIX boot start (issue #60): bring the GUI up ON at boot, symmetric with
-	 * the camera producer (created at boot, idle-sleeping) instead of the lazy
-	 * `gui start`.  Gated on the LTDC display being up -- the canvas lives in the
-	 * .sdram frame buffer (guix_start() re-checks ltdc_is_up()/scanout too).
-	 * After touch_init() so the FT5336 input thread attaches at boot.  Fail-soft:
-	 * on any GUIX error the shell keeps running and `gui start` can retry.  Safe
-	 * before the scheduler -- guix_start() only does memory setup + ThreadX object
-	 * creation (the GUIX system + input threads): gx_system_initialize() creates
-	 * the system thread TX_DONT_START and gx_system_start() resumes it, with no
-	 * blocking wait (the uncontended LTDC mutex never suspends).  The first actual
-	 * paint (DMA2D blit) is deferred to the GUIX thread once scheduling runs, so
-	 * no draw-completion wait happens in this init context. */
+	/* GUIX camera UI (issues #60/#61).  Register the widget-tree builder first --
+	 * no I/O, so safe here -- then bring the UI up ON at boot, symmetric with the
+	 * camera producer (created at boot, idle-sleeping) instead of the lazy `gui
+	 * start`.  Gated on the LTDC display being up (the canvas lives in the .sdram
+	 * frame buffer; camera_ui_start() -> guix_start() re-checks).  After
+	 * touch_init() so the FT5336 input thread attaches at boot.  Fail-soft: on any
+	 * GUIX error the shell keeps running and `gui start` can retry.
+	 *
+	 * Safe before the scheduler: camera_ui_start() only starts GUIX (memory setup
+	 * + ThreadX object creation, no blocking wait -- gx_system_initialize() creates
+	 * the system thread TX_DONT_START, gx_system_start() resumes it) and posts a
+	 * one-shot autostart event.  The camera probe (blocking I2C) and the first
+	 * paint (DMA2D) run LATER on the GUIX thread once scheduling is live, never in
+	 * this init context. */
+	camera_ui_init();
 	if (ltdc_is_up()) {
-		int guix_rc = guix_start();
-		if (guix_rc != GUIX_OK)
+		int guix_rc = camera_ui_start();
+		if (guix_rc != 0)
 			printf("guix: boot start failed (%d); use 'gui start' to retry\r\n",
 			       guix_rc);
 	}

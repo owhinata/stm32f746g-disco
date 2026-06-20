@@ -273,9 +273,8 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/port/sdram/sdram.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_display.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_touch.c"
-    "${CMAKE_SOURCE_DIR}/port/guix/guix_app.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_glue.c"
-    "${CMAKE_SOURCE_DIR}/port/guix/guix_camera.c"
+    "${CMAKE_SOURCE_DIR}/ui/guix_camera_ui.c"
     "${CMAKE_SOURCE_DIR}/lib/ov5640/ov5640.c"
     "${CMAKE_SOURCE_DIR}/lib/ov5640/ov5640_reg.c"
     "${CMAKE_SOURCE_DIR}/port/levelx/lx_nor_qspi_driver.c"
@@ -308,6 +307,7 @@ target_include_directories(threadx PRIVATE
     "${CMAKE_SOURCE_DIR}/port/filex"
     "${CMAKE_SOURCE_DIR}/port/levelx"
     "${CMAKE_SOURCE_DIR}/port/guix"
+    "${CMAKE_SOURCE_DIR}/ui"               # ui/ presentation layer (#61): guix_camera_ui.h
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"      # cli_instance.h -> cli_internal.h
     "${CMAKE_SOURCE_DIR}/shell/backend"   # CLI_BACKEND_*_DEFINE macros

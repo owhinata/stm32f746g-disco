@@ -1,10 +1,10 @@
 # GUIX (Eclipse ThreadX GUIX integration)
 
-On top of the board's 4.3″ 480×272 LCD (LTDC, #52/#53) and the FT5336 capacitive touch panel (I2C3, #54), this brings up **Eclipse ThreadX GUIX** (the GUI framework). GUIX runs as a ThreadX thread; its 565rgb display driver is bound to the LTDC tear-free double buffer + DMA2D, its input driver to the FT5336, and it shows a basic widget UI (text + button + two-screen transition). **Phase 4** of the LTDC + GUIX epic (#48), issue #55.
+On top of the board's 4.3″ 480×272 LCD (LTDC, #52/#53) and the FT5336 capacitive touch panel (I2C3, #54), this brings up **Eclipse ThreadX GUIX** (the GUI framework). GUIX runs as a ThreadX thread; its 565rgb display driver is bound to the LTDC tear-free double buffer + DMA2D, its input driver to the FT5336. The UI is a **single camera live-preview screen** (#61): just a `GX_ICON` drawing the QVGA frame native 1:1 centred, with no demo screens or on-screen widgets (control widgets come in #68). Introduced as Phase 4 of the LTDC + GUIX epic (#48, #55), extended with the camera compositing (#56), boot-ON (#60), and the camera-only UI (#61).
 
 - Submodule: `lib/guix` ([eclipse-threadx/guix](https://github.com/eclipse-threadx/guix) v6.5.1, **MIT**). A read-only mirror like `threadx`/`filex`/`levelx`.
-- Glue: `port/guix/`; shell command `gui` (`shell/cmds/cmd_gui.c`).
-- Started ON at boot (#60): GUIX takes over the LCD and touch from `tx_application_define()` at boot, resident and symmetric with the camera producer. Run `gui stop` to release the display so the `lcd`/`touch` test commands work, and `gui start` to resume.
+- Driver/glue: `port/guix/` (display / input / lifecycle). The camera UI app itself lives in the presentation layer `ui/guix_camera_ui.c` (#61, layering #43). Shell command `gui` (`shell/cmds/cmd_gui.c`).
+- Started ON at boot (#60/#61): GUIX takes over the LCD and touch from `tx_application_define()` at boot, so **live video shows right after power-on**, resident and symmetric with the camera producer. Run `gui stop` to release the display so the `lcd`/`touch`/`camera` test commands work, and `gui start` to resume.
 
 ## Configuration
 
@@ -90,15 +90,17 @@ Stopping is **cooperative**: the thread checks an `active` flag and parks itself
 
 ## Lifecycle (`gui` command)
 
-`port/guix/guix_glue.c`. `gx_system_initialize()` + display/canvas/widget creation + `gx_system_start()` happen **exactly once** (the GUIX system thread and its global objects are never torn down).
+GUIX itself is brought up in `port/guix/guix_glue.c`; the camera UI app (widget tree + sink + preview control) is `ui/guix_camera_ui.c`. `gx_system_initialize()` + display/canvas/widget creation + `gx_system_start()` happen **exactly once** (the GUIX system thread and its global objects are never torn down).
 
-**Started ON at boot (#60)**: that first `guix_start()` is called from **`tx_application_define()` (before the scheduler starts)**, not from `gui start`, right after the LTDC/touch bring-up. This is safe — `guix_first_start()` does **only memory setup + ThreadX object creation** with no blocking wait (`gx_system_initialize()` creates the GUIX system thread **`TX_DONT_START`**, `gx_system_start()` just `tx_thread_resume()`s it, and the LTDC mutex is uncontended at boot so it never suspends). **The first actual paint runs on the GUIX thread once scheduling starts**, so no DMA2D completion wait (#64) happens in this init context. Failure is fail-soft (the shell keeps running and `gui start` can retry).
+**Dependency inversion (#61)**: after creating the display/canvas/root, `guix_first_start()` delegates the widget-tree build to a builder the `ui/` layer registered (`guix_register_app_builder()`, arguments are `void*`). So `port/guix/guix_glue` never includes a `ui/` header, preserving the `port <- ui` direction.
 
-- `gui start` — first time: the init above → take ownership → `gx_widget_show(root)` → `gx_system_start()` → start the input thread (already done at boot by #60). On a later restart (after stop): **no re-initialise**; re-take ownership → resync the canvas onto the back buffer → re-show → post one `GX_EVENT_REDRAW` to wake the sleeping GUIX thread and force a full repaint.
-- `gui stop` — park input → `gx_widget_hide(root)` → blank the screen to black via DMA2D (the public `ltdc_fill` is a no-op while owned, so the owner path) → release ownership (the `lcd` drawing path works again).
+**Started ON at boot (#60) + camera autostart (#61)**: the first `guix_start()` is called from **`tx_application_define()` (before the scheduler)**, not from `gui start`, right after the LTDC/touch bring-up. This is safe — `guix_first_start()` does **only memory setup + ThreadX object creation** with no blocking wait (`gx_system_initialize()` creates the GUIX system thread **`TX_DONT_START`**, `gx_system_start()` just `tx_thread_resume()`s it, and the LTDC mutex is uncontended at boot so it never suspends). The **camera probe is blocking I2C and cannot run in this init context**, so `camera_ui_start()` only brings GUIX up and posts `GX_EVENT_CAMERA_AUTOSTART`; the **probe + first paint run later on the GUIX thread** once scheduling is live (see below). Failure is fail-soft (the shell keeps running and `gui start` can retry).
+
+- `gui start` / boot — `camera_ui_start()`: `guix_start()` (first time: init above + take ownership + `gx_widget_show(root)` + `gx_system_start()` + start the input thread; on a restart it re-takes ownership, resyncs the canvas, re-shows and posts one `GX_EVENT_REDRAW`) → post `GX_EVENT_CAMERA_AUTOSTART` → the GUIX thread starts the preview.
+- `gui stop` — `camera_ui_stop()`: stop the preview (stop the stream + detach the sink + bounded drain) → park input → `gx_widget_hide(root)` → blank the screen to black via DMA2D (owner path) → release ownership (the `lcd` drawing path works again).
 - `gui info` — state, GUIX system-thread priority, display handle, canvas address.
 
-The UI (`port/guix/guix_app.c`) is hand-coded (no GUIX Studio). The colour/font tables are built by hand, and text uses GUIX's built-in `_gx_system_font_8bpp` (compiled from `lib/guix/common/src/gx_system_font_8bpp.c`). Screen 0 (title + "Next" button) and screen 1 ("Back" button) are child windows of the root; a button's `GX_EVENT_CLICKED` is handled by the parent window's event process, which switches screens with `gx_widget_show/hide`. All widgets are static, so GUIX needs no memory allocator.
+The UI (`ui/guix_camera_ui.c`) is hand-coded (no GUIX Studio). The colour/font/pixelmap tables are built by hand. It is a **single screen**: one child window of the root (black fill) holding only `cam_icon` (a `GX_ICON`, QVGA native centred). There are no demo screens, buttons or text (control widgets come in #68). All widgets are static, so GUIX needs no memory allocator.
 
 ## Memory / flash
 
@@ -108,26 +110,28 @@ The UI (`port/guix/guix_app.c`) is hand-coded (no GUIX Studio). The colour/font 
 | RAM | GUIX thread stack 8 KB + input stack 1 KB + GUIX statics | ~32% of 256 KB |
 | SDRAM | canvas: none (reuses the existing LTDC double buffer) | camera preview (#56) adds a +150 KB view buffer (320×240×2) |
 
-## Camera live preview (#56)
+## Camera live preview (#56/#61)
 
-`port/guix/guix_camera.c`. The QVGA RGB565 frames the DCMI streaming producer (#46, `port/camera`) publishes into the `frame_pipeline` are shown live on the GUIX screen at **native scale (no scaling)**.
+`ui/guix_camera_ui.c` (relocated and merged from `port/guix/guix_camera.c` in #61). The QVGA RGB565 frames the DCMI streaming producer (#46, `port/camera`) publishes into the `frame_pipeline` are shown live on the GUIX **sole screen** at **native scale (no scaling)**. Since #61 this is the default UI.
 
 Data flow:
 
 1. A **push sink** (`guix_cam_sink`, `FRAME_POLICY_DROP`) is attached to the pipeline by `camera_preview_start()`; its `consume()` runs on the producer thread (prio 10).
 2. `consume()` copies the ring slot into a **private view buffer `cam_view_buf` (320×240, non-cacheable `.sdram`) by DMA2D M2M** (`guix_display_copy_rgb565`, under ltdc_lock), then immediately `put`s the slot (synchronous — it never holds a pin across threads). Only on a successful copy does it set a coalesce flag and post `GX_EVENT_CAMERA_FRAME` to the root (`gx_system_event_send`, thread-safe). A failed send leaves the flag clear so the next frame retries (no freeze).
 3. The GUIX system thread (prio 14) **root event handler** receives `GX_EVENT_CAMERA_FRAME` and calls `gx_system_dirty_mark(cam_icon)` (dirty marking is GUIX-thread-only — other threads only send events).
-4. Redrawing `cam_icon` (a `GX_ICON` on screen 2 at (80,16)) calls `guix_pixelmap_draw`, which **blits the view buffer into the back buffer by DMA2D M2M at native scale**; `guix_buffer_toggle` then presents it tear-free via SRCR.VBR.
+4. Redrawing `cam_icon` (a `GX_ICON` on the sole screen at (80,16)) calls `guix_pixelmap_draw`, which **blits the view buffer into the back buffer by DMA2D M2M at native scale**; `guix_buffer_toggle` then presents it tear-free via SRCR.VBR.
 
 The **single view buffer** decouples GUIX redraws (touch, screen change, first show) from the ring slot lifetime. The slot→view and view→back blits are both **serialized DMA2D under ltdc_lock**, so even though the producer (prio 10) can preempt GUIX (prio 14) there is no intra-frame tear (ltdc_lock is TX_INHERIT, which also prevents priority inversion).
 
-**Ownership model** (same shape as `ltdc_gui_take`): while the preview runs, `cam_ext_sink` is set and the public `camera stream start/stop` are refused (`CAM_ERR_STATE`); conversely `gui camera on` fails while a plain `camera stream` runs. The **async teardown** (DCMI overrun etc.) also detaches and releases `cam_ext_sink`, so a later `frame_pipeline_init` never memsets a still-attached sink. `gui camera off` (or screen 2's Back button) stops the stream (owner-only) then bounded-drains any in-flight `consume()`.
+**Ownership model** (same shape as `ltdc_gui_take`): while the preview runs, `cam_ext_sink` is set and the public `camera stream start/stop` are refused (`CAM_ERR_STATE`), and `camera res/format/set` return `CAM_ERR_BUSY`. The **async teardown** (DCMI overrun etc.) also detaches and releases `cam_ext_sink`, so a later `frame_pipeline_init` never memsets a still-attached sink. **Escape hatch**: to run those shell commands, `gui stop` tears the UI down (releasing ownership) → run the command → `gui start` resumes (#61).
 
-Shell control:
+**Autostart and start/stop race (#61)**: the preview probe/configure is blocking I2C, so `camera_ui_start()` posts `GX_EVENT_CAMERA_AUTOSTART` and the **GUIX thread** runs `camera_preview_start()` in that handler (shared by boot and `gui start`). A volatile-flag protocol guards the GUIX-thread start against a shell-thread `gui stop`:
 
-- `gui camera on` — auto `gui start` if the UI is down → start streaming + attach the sink → switch to screen 2 (run on the shell thread, as it does the sensor probe/configure).
-- `gui camera off` — return to screen 0 → stop the stream + detach/drain the sink.
-- Screen 2's **Back button** also stops and returns (`guix_camera_off` only does a bounded drain, so it is safe to call from the GUIX thread).
+- the AUTOSTART handler no-ops on `stop_requested || !guix_is_up() || start_in_progress || preview_running` (`stop_requested` is cleared only in `camera_ui_start` before the post; the handler never clears it).
+- `camera_ui_stop()` sets `stop_requested=1` then **always** calls `camera_preview_stop()` (which serialises on `cam_lock`, waiting out a probe in progress, and stops only if we own the stream) + a bounded drain.
+- if a stop races a start mid-probe, the handler re-checks `stop_requested` after a successful start and rolls back immediately (without latching `preview_running`).
+
+During the probe (~150-250 ms with a camera, ~1 s without) GUIX dispatch stalls, but the LTDC frame buffer was blanked black at boot so it reads as black→live; the iwdg (prio 5) and touch (prio 13) threads run independently, so the watchdog is unaffected.
 
 **Bandwidth**: even at QVGA, the LTDC continuous read + DCMI write + the DMA2D blits per displayed frame all share the SDRAM (16-bit FMC @108 MHz). The average fits the budget, but on hardware monitor `camera stream stats` `dcmi_ovr` / `cam_ring_ovr` / `dma fe/s` and the LTDC underrun and confirm they stay near 0.
 
@@ -135,19 +139,19 @@ Shell control:
     It originally ran DMA2D three times per displayed frame (slot→view, view→back, toggle copy-forward), which contributed to the SDRAM contention and the DCMI DMA FIFO errors (FE).  #59 removed two of them:
 
     - **B1**: `consume()` **coalesces** the slot→view copy while `cam_redraw_pending` is set (the previous frame is not yet drawn); the slot is always `put`.  It helps exactly when frames outpace the redraw — the contended case.
-    - **B2**: the camera rect is fully repainted every frame, so the `guix_buffer_toggle` **copy-forward is eliminated in steady state**.  Consistency is held by a **per-buffer stale flag (`cam_buf_stale[2]`, invariant "false ⟺ that buffer's camera rect == latest view") plus a pre-flip corrective copy**.  Each stale-flag transition stays in the same `ltdc_lock` section as its DMA2D copy, so the producer advancing the view cannot cause a false-negative.  The toggle's B2 paths are gated on `cam_visible` (toggled by SHOW/HIDE) so camera pixels are never stamped onto another screen.  The LCD_CLK was also lowered 9.6→4.8 MHz ([display](../hardware/display.md)).  The figure of merit is `dma fe/s`.
+    - **B2**: the camera rect is fully repainted every frame, so the `guix_buffer_toggle` **copy-forward is eliminated in steady state**.  Consistency is held by a **per-buffer stale flag (`cam_buf_stale[2]`, invariant "false ⟺ that buffer's camera rect == latest view") plus a pre-flip corrective copy**.  Each stale-flag transition stays in the same `ltdc_lock` section as its DMA2D copy, so the producer advancing the view cannot cause a false-negative.  The toggle's B2 paths are gated on `cam_visible` (toggled by preview start/stop; before #61, by screen SHOW/HIDE).  The LCD_CLK was also lowered 9.6→4.8 MHz ([display](../hardware/display.md)).  The figure of merit is `dma fe/s`.
 
 ## Usage
 
 ```text
-sh> gui info          # state: running right from boot (GUI ON at boot, #60)
-# tap "Next >" -> screen 2; "< Back" returns.
-sh> gui camera on     # live camera preview (320x240 native)
-sh> gui camera off    # stop the preview (screen 2's Back button also stops it)
+# power-on shows the live camera preview right away (GUI ON at boot, #60/#61)
+sh> gui info          # state: running (camera UI active)
 sh> lcd fill red      # refused while GUIX runs (display owned by gui)
-sh> gui stop          # blank the screen and hand the LCD back to `lcd`
-sh> lcd info          # after gui stop the LCD/touch test commands work
-sh> gui start         # resume the GUIX UI (takes over LCD + touch again)
+sh> camera res qvga   # same: CAM_ERR_BUSY while the preview owns the camera
+sh> gui stop          # stop the UI + preview and hand the LCD back to `lcd`
+sh> lcd info          # after gui stop the lcd/touch/camera test commands work
+sh> camera capture    # ditto
+sh> gui start         # resume the camera UI (preview comes back)
 ```
 
 ## Implementation notes

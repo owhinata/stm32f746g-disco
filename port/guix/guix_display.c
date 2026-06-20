@@ -19,8 +19,7 @@
  *     it between the two LTDC buffers in the toggle is exactly how GUIX hardware
  *     double buffering is meant to work.
  */
-#include "guix_display.h"
-#include "guix_camera.h"         /* CAM_VIEW_* preview geometry (#59 B2) */
+#include "guix_display.h"        /* CAM_VIEW_* preview geometry (#59 B2) */
 #include "ltdc_display.h"
 
 #include "gx_display.h"          /* _gx_display_driver_565rgb_setup proto */

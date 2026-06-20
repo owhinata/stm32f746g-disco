@@ -9,7 +9,6 @@
 #include "guix_glue.h"
 #include "guix_display.h"
 #include "guix_touch.h"
-#include "guix_app.h"
 
 #include "ltdc_display.h"
 #include "touch.h"
@@ -29,6 +28,16 @@ static GX_WINDOW_ROOT guix_root;
 
 static bool guix_inited;          /* gx_system_initialize() done (one-shot) */
 static bool guix_active;          /* UI currently running                   */
+
+/* App-supplied widget-tree builder (dependency inversion, #61): guix_first_start
+   calls it after creating the display/canvas/root, so this port layer never
+   includes the ui/ app header. */
+static guix_app_builder_fn guix_app_builder;
+
+void guix_register_app_builder(guix_app_builder_fn fn)
+{
+	guix_app_builder = fn;
+}
 
 static int guix_first_start(void)
 {
@@ -72,13 +81,16 @@ static int guix_first_start(void)
 		LOG_ERR("gx_window_root_create failed");
 		goto fail;
 	}
-	if (guix_app_create(&guix_display, &guix_root) != GX_SUCCESS) {
-		LOG_ERR("guix_app_create failed");
+	if (guix_app_builder == NULL) {
+		LOG_ERR("no GUIX app builder registered (camera_ui_init not called?)");
+		goto fail;
+	}
+	if (guix_app_builder(&guix_display, &guix_root) != 0) {
+		LOG_ERR("GUIX app builder failed");
 		goto fail;
 	}
 
 	gx_widget_show(&guix_root);          /* show the whole tree (visible + clips) */
-	guix_app_show_screen(0);             /* then hide screen 1, leaving screen 0  */
 	if (gx_system_start() != GX_SUCCESS) {
 		LOG_ERR("gx_system_start failed");
 		goto fail;

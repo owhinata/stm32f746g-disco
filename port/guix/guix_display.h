@@ -31,6 +31,15 @@
 extern "C" {
 #endif
 
+/* Live-preview geometry (issue #56): QVGA RGB565 drawn native 1:1, centred on
+   the 480x272 panel.  Lives here (the port display layer) rather than in the ui
+   camera app because the buffer-toggle B2 paths below consume it -- keeping it in
+   port preserves the port <- ui dependency direction (#43/#61). */
+#define CAM_VIEW_W  320
+#define CAM_VIEW_H  240
+#define CAM_VIEW_X  80    /* (480 - 320) / 2 */
+#define CAM_VIEW_Y  16    /* (272 - 240) / 2 */
+
 /** GUIX display-driver setup callback passed to gx_display_create(): lays down
  *  the software 565rgb driver, then installs the DMA2D-accelerated overrides and
  *  the tear-free buffer toggle.  Returns GX_SUCCESS. */
@@ -53,16 +62,16 @@ int guix_display_copy_rgb565(uint16_t *dst, const uint16_t *src, uint32_t w,
 /** Arm the preview-path copy-forward optimization for a session and register the
  *  camera view buffer (whose content is the latest captured frame).  Both LTDC
  *  buffers start "stale" so the first frames are corrected before present.
- *  Call from guix_camera before the stream starts; runs under ltdc_lock. */
+ *  Call from the camera UI (ui/) before the stream starts; runs under ltdc_lock. */
 void guix_display_cam_preview_begin(uint16_t *view_buf);
 
 /** Disarm the optimization at preview teardown (runs under ltdc_lock). */
 void guix_display_cam_preview_end(void);
 
-/** Gate the buffer-toggle B2 paths to when the camera screen is on display.
- *  Call with true on CAMERA_SHOW and false on CAMERA_HIDE, from the GUIX thread
- *  (root handler), so the corrective copy / copy-forward skip never touch the
- *  camera rect while another screen owns it.  Runs under ltdc_lock. */
+/** Gate the buffer-toggle B2 paths to when the camera preview is on display.  Call
+ *  with true when the preview starts and false when it stops (#61: the camera is
+ *  the sole screen, so this tracks the preview lifecycle; pre-#61 it tracked the
+ *  camera screen SHOW/HIDE).  Runs under ltdc_lock. */
 void guix_display_cam_set_visible(bool on);
 
 /** Store a freshly captured frame (@p src, CAM_VIEW_W x CAM_VIEW_H RGB565) into
