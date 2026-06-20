@@ -270,6 +270,7 @@ struct camera_stream_info {
 	uint32_t dcmi_ovr;   /* DCMI FIFO overruns                               */
 	uint32_t ring_ovr;   /* ring exhaustion / lost completions               */
 	uint32_t dma_fe;     /* DMA FIFO/DME errors tolerated (non-fatal, #56)   */
+	uint32_t jpeg_trunc; /* JPEG stream frames dropped: no SOI/EOI (#63)     */
 	uint32_t elapsed_ms; /* run duration (live, or frozen at stop)           */
 };
 

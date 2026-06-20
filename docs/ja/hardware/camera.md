@@ -200,8 +200,8 @@ type 'help camera set' for the list of settings
 ### snapshot と stream の非対称（HW 制約由来）
 
 - **snapshot は全モード可**: VGA/WVGA は 1 フレームが DMA NDTR 上限（65535 words）を超えるが、`HAL_DCMI_Start_DMA` が単一連続バッファへ **intra-frame DBM banding**（VGA=4×38400w, WVGA=4×48000w）して取り込む。FRAME はバンド最終で 1 回発火。
-- **stream は frame_words ≤ 65535 のモードのみ**（QQVGA/QVGA/480x272 の RGB565・YUV422 等）。producer の手動 DBM は各 M-reg が full-slot を NDTR で指すため、これを超えるモードは `camera info` で `capture only` と表示し `camera stream start` を拒否する。
-- **JPEG は snapshot-only・解像度 ≤ VGA**。可変長リング管理は別系統のため stream には載せない。
+- **raster stream は frame_words ≤ 65535 のモードのみ**（QQVGA/QVGA/480x272 の RGB565・YUV422 等）。producer の手動 DBM は各 M-reg が full-slot を NDTR で指すため、これを超えるモード（VGA/WVGA raster）は `mode.streamable=0`＝`camera info` で `capture only` と表示し `camera stream start` を拒否する（`mode.streamable=0` は **raster DBM 経路の対象外**という意味）。
+- **JPEG（≤ VGA）は別経路で stream 可能**（#63、下記「JPEG streaming」）。可変長ゆえ DBM/TC ではなく **snapshot-loop**（DCMI SNAPSHOT を 1 フレームずつ + FRAME 割込み）で取り込む。JPEG snapshot も従来通り可。
 
 ### フレームレート（per-mode HTS/VTS + fps 切替 15/30、#45/#67）
 
@@ -295,6 +295,24 @@ camera stream stats                                   FPS / frames / overrun
 `start` は即座に戻り、CLI プロンプトを奪わない。取り込みは producer スレッドが回し、`--frames`/`--secs` 到達・`stream stop`・**DMA 転送エラー (TE)** のいずれかで自動停止する。stream と `camera capture` は同一 DCMI/DMA を共有するため**排他**（stream 中の capture は busy）。
 
 **DMA エラーの扱い (#56)**: double-buffer arm（`HAL_DMAEx_MultiBufferStart_IT`）は、snapshot 経路（`HAL_DMA_Start_IT`）が有効化しない **FIFO error 割込み**を有効化する。FIFO threshold/burst が不整合な構成なら FE はストリームを HW disable し得るが、本実装の `FIFO_THRESHOLD_FULL + MBURST_INC4` は整合構成であり、LTDC がフレームバッファを常時リードする SDRAM 競合下で観測される FE（FIFO overrun/underrun）/ DME は**ストリームを停止させない**（snapshot は単に割込みを見ていないだけ）。したがってこれらは**計数して継続**（`stats` の `dma fe`、QVGA で数千/秒オーダー）し、ハードがストリームを実際に停止させる **TE のみを terminal** として扱う。DCMI FIFO オーバーラン (`ovr dcmi`) は別系統で、これは本来 0 近傍。**#59** はこのプレビュー時 FE を緩和した（LCD_CLK 9.6→4.8MHz + DMA2D copy-forward 全廃、指標は `stats` の `dma fe/s`。詳細は [GUIX](../rtos/guix.md) / [display](display.md)）。
+
+### JPEG streaming（snapshot-loop, #63）
+
+raster は固定長なので **DBM + TC 割込み**でフレーム境界を取れるが、**JPEG は可変長**で DMA 予算より短く終わり TC がフレーム境界で上がらない。そこで JPEG は別経路 = **snapshot-loop**:
+
+- **DCMI SNAPSHOT(CM=1) を 1 フレームずつ** ring スロットへ arm（`HAL_DCMI_Start_DMA`）。snapshot と同じく **FRAME 割込み**を明示 enable し、それが可変長フレームの境界通知になる（`HAL_DCMI_FrameEventCallback` が `cam_stream_active` 時に `cam_stream_sem` を post）。
+- producer スレッドが FRAME 起床で **`HAL_DCMI_Stop` → NDTR 読み → `eff=(budget−NDTR)×4` → SOI/EOI トリム**（snapshot の JPEG finalize と共通の `jpeg_trim`）→ その長さで **publish** → 次の空きスロットへ **再 arm**。各フレーム後 DCMI は自動停止するので、再 arm までの間に DCMI FIFO がオーバーフローしない（CM=0 連続の途中張替より安全）。
+- `HAL_DCMI_Stop` / 再 arm の失敗は **terminal**（`cam_stream_err`→teardown）。`--frames`/`--secs` 到達は publish 後に再評価し余分な capture を arm しない。
+- **SOI/EOI 不整合フレーム**は drop し `camera stream stats` の **`jpeg trunc`** に計上、空きスロット枯渇は `ovr ring`。Stop〜再 arm のギャップ中に来るフレームは DCMI 停止中で取り込まれず、**設計上カウントされない**。
+- **取り出し**: JPEG publish 毎に確定フレームを（streaming 中は idle な）`cam_frame` へミラーするので、`camera save` / `camera send` が streaming 中・停止後とも最新 JPEG フレームを取り出せる。
+- **プレビュー非対応**: F746 に JPEG decode 経路は無いため、`camera format jpeg` 中の `gui camera on` は明示拒否（`camera format rgb565` 後に preview）。本命の消費先は #49（ネット streaming = JPEG 圧縮で高解像も帯域内）。
+
+```
+camera format jpeg; camera res qvga
+camera stream start --secs 5      # 連続 JPEG（snapshot-loop）
+camera stream stats               # frames/fps、jpeg trunc
+camera save fs /shot.jpg          # 最新フレームを JPEG 保存（SOI/EOI 整合）
+```
 
 ### GUIX ライブプレビュー（#56）
 

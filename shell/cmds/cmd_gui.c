@@ -23,6 +23,7 @@
 #include "cli.h"
 #include "guix_glue.h"
 #include "guix_camera.h"
+#include "camera.h"
 
 #include <string.h>
 
@@ -82,6 +83,15 @@ static int cmd_gui_camera(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	}
 	if (strcmp(argv[1], "on") == 0) {
+		struct camera_mode m;
+
+		/* JPEG has no LCD decode path (#63): give a clear reason instead of the
+		   generic "preview start failed" (camera_preview_start also rejects it). */
+		if (camera_get_mode(&m) == 0 && m.is_jpeg) {
+			cli_error(sh, "gui: JPEG cannot be previewed (no LCD decode path); "
+			              "use `camera format rgb565` first\r\n");
+			return 1;
+		}
 		if (guix_camera_on() != GUIX_OK) {
 			cli_error(sh, "gui: camera preview start failed "
 			              "(camera busy / no sensor / display down?)\r\n");

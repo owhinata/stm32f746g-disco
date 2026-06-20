@@ -302,6 +302,8 @@ static uint32_t cam_target_frames;           /* 0 = unbounded                   
 static uint32_t cam_target_secs;             /* 0 = unbounded                   */
 static uint32_t cam_last_ct;                 /* CT at last serviced completion  */
 static struct frame_desc *cam_m0, *cam_m1;   /* slots currently in M0AR/M1AR    */
+static struct frame_desc *cam_jpeg_slot;     /* JPEG stream: the single DMA target (#63) */
+static volatile uint32_t cam_jpeg_trunc;     /* JPEG stream: frames with no SOI/EOI (#63) */
 
 /* ---- locking ------------------------------------------------------------ */
 /* Public API entries take the mutex here; all real work below lives in
@@ -975,30 +977,27 @@ static void snapshot_dma_reinit(void)
 	__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
 }
 
-/* Determine the valid length of a JPEG snapshot.  @p eff_bytes is how many bytes
-   the DMA actually wrote (budget - NDTR, in bytes); the real stream is shorter
-   because the DCMI zero-pads the last 32-bit word.  Verify the SOI (0xFFD8) at
-   the start and scan backward within eff_bytes for the EOI marker (0xFFD9),
-   setting info.frame_bytes to EOI+2.  No EOI -> the frame was truncated.  Only
-   the captured range is scanned (the .sdram buffer is NOLOAD: it can hold an
-   older/garbage tail beyond eff_bytes). */
-static int jpeg_finalize_locked(uint32_t eff_bytes)
+/* Validate + EOI-trim a JPEG frame in @p buf.  @p eff_bytes is how many bytes the
+   DMA actually wrote (budget - NDTR, in bytes); the real stream is shorter because
+   the DCMI zero-pads the last 32-bit word.  Verify the SOI (0xFFD8) at the start
+   and scan backward within eff_bytes for the EOI marker (0xFFD9); on success
+   *valid receives the trimmed length (EOI+2).  No SOI/EOI -> truncated (CAM_ERR_HAL).
+   Only the captured range is scanned (the .sdram buffer is NOLOAD: it can hold an
+   older/garbage tail beyond eff_bytes).  Silent: the caller logs / counts -- this
+   serves both the snapshot finalize and the JPEG streaming producer (#63). */
+static int jpeg_trim(const uint8_t *buf, uint32_t eff_bytes, uint32_t *valid)
 {
 	uint32_t i;
 
-	if (eff_bytes < 4u ||
-	    cam_frame[0] != 0xFFu || cam_frame[1] != 0xD8u) {
-		LOG_ERR("JPEG SOI missing (eff=%lu)", (unsigned long)eff_bytes);
-		return CAM_ERR_HAL;
-	}
+	if (eff_bytes < 4u || buf[0] != 0xFFu || buf[1] != 0xD8u)
+		return CAM_ERR_HAL;                    /* no SOI */
 	for (i = eff_bytes; i >= 2u; i--) {
-		if (cam_frame[i - 2u] == 0xFFu && cam_frame[i - 1u] == 0xD9u) {
-			info.frame_bytes = i;          /* include the EOI marker */
+		if (buf[i - 2u] == 0xFFu && buf[i - 1u] == 0xD9u) {
+			*valid = i;                        /* include the EOI marker */
 			return 0;
 		}
 	}
-	LOG_ERR("JPEG EOI missing (truncated, eff=%lu)", (unsigned long)eff_bytes);
-	return CAM_ERR_HAL;
+	return CAM_ERR_HAL;                        /* no EOI: truncated */
 }
 
 static int camera_capture_locked(int colorbar)
@@ -1102,16 +1101,18 @@ static int camera_capture_locked(int colorbar)
 	if (mode.is_jpeg) {
 		/* The DMA was aborted mid-stream by Stop; NDTR holds the untransferred
 		   word count, so (budget - NDTR) words were written.  Read it AFTER Stop
-		   (not before -- the abort flushes the FIFO and settles NDTR), then trim
-		   to the JPEG EOI. */
+		   (not before -- the abort settles NDTR), then trim to the JPEG EOI. */
 		uint32_t ndtr = __HAL_DMA_GET_COUNTER(&hdma_dcmi);
 		uint32_t eff  = (mode.frame_words - ndtr) * 4u;
+		uint32_t valid;
 
-		rc = jpeg_finalize_locked(eff);
+		rc = jpeg_trim(cam_frame, eff, &valid);
 		if (rc != 0) {
+			LOG_ERR("JPEG finalize failed (eff=%lu)", (unsigned long)eff);
 			info.frame_valid = 0;
 			return rc;
 		}
+		info.frame_bytes = valid;              /* trimmed JPEG stream length */
 	} else {
 		info.frame_bytes = mode.frame_bytes;   /* raster: full frame valid */
 	}
@@ -1543,6 +1544,13 @@ static void cam_stream_teardown(void)
 		cam_stream_active = 0;
 		cam_elapsed_ms = HAL_GetTick() - cam_start_tick;
 		(void)HAL_DCMI_Stop(&hdcmi);          /* aborts the DMA internally */
+		/* The JPEG snapshot-loop arms DCMI_IT_FRAME, but HAL_DCMI_Stop does NOT
+		   clear interrupt-enables (HAL only disables FRAME inside the FRAME IRQ).
+		   A timeout-driven stop (--secs / stop) tears down between FRAMEs with
+		   FRAME still armed, so a later raster stream -- which assumes FRAME is
+		   disabled -- would take a spurious cam_stream_sem.  Disable it here (#63;
+		   a no-op for the raster path that never enabled it). */
+		__HAL_DCMI_DISABLE_IT(&hdcmi, DCMI_IT_FRAME);
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		/* Async stop (OVR/DMA error/auto-stop) while a GUIX preview owns the
 		   stream: detach its sink too and release ownership, so the next
@@ -1625,6 +1633,118 @@ static void cam_stream_service(int had_sem)
 		cam_ring_ovr += seen - (uint32_t)published;
 }
 
+/* ---- JPEG variable-length streaming (issue #63) -------------------------- */
+/*
+ * JPEG cannot ride the raster DBM/TC path: a JPEG frame is shorter than the DMA
+ * budget, so the transfer-complete interrupt never fires at the frame boundary.
+ * Instead each frame is a single DCMI SNAPSHOT (CM=1) into one ring slot, and the
+ * DCMI FRAME interrupt (the same end-of-frame the snapshot path uses) delimits it.
+ * After each frame the DCMI stops capturing on its own, so re-arming into the next
+ * slot cannot overrun the FIFO mid-gap (a CM=0 continuous re-point would).  The
+ * producer thread owns all of Stop / finalize / publish / re-arm; the ISR only
+ * posts cam_stream_sem.  Frames that fall in the Stop..re-arm gap are dropped.
+ */
+
+/* Arm one JPEG snapshot DMA into @p slot and enable the FRAME interrupt (the
+   variable-length boundary).  Mirrors the snapshot arm sequence; returns the HAL
+   status so the caller can treat a failed (re-)arm as terminal. */
+static HAL_StatusTypeDef cam_jpeg_arm(struct frame_desc *slot)
+{
+	HAL_StatusTypeDef st;
+
+	__HAL_DCMI_CLEAR_FLAG(&hdcmi, DCMI_FLAG_ERRRI | DCMI_FLAG_OVRRI |
+	                              DCMI_FLAG_FRAMERI | DCMI_FLAG_LINERI |
+	                              DCMI_FLAG_VSYNCRI);
+	__HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_ERR | DCMI_IT_OVR | DCMI_IT_FRAME);
+	st = HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)slot->data,
+	                        CAM_JPEG_BUDGET_WORDS);
+	if (st != HAL_OK)
+		return st;
+	/* The banding path enables the DMA FIFO/direct-mode error interrupts; under
+	   SDRAM contention HAL's DCMI_DMAError would abort the capture, so silence the
+	   non-fatal FE/DME the way the snapshot path does (#45 R8). */
+	__HAL_DMA_DISABLE_IT(&hdma_dcmi, DMA_IT_FE);
+	__HAL_DMA_DISABLE_IT(&hdma_dcmi, DMA_IT_DME);
+	return HAL_OK;
+}
+
+/* Copy the just-finalised JPEG frame into the (idle during streaming) snapshot
+   buffer so `camera save` / `camera send` -- which read cam_frame via
+   camera_frame_read -- can pull a live or last streamed frame.  Brief cam_lock
+   (the teardown pattern) keeps camera_frame_read from seeing a torn frame; called
+   AFTER publish so the lock order stays cam_lock -> cam_pipe_lock (never nested). */
+static void mirror_to_cam_frame(const struct frame_desc *slot, uint32_t valid)
+{
+	if (valid > CAM_FRAME_MAX_BYTES)
+		return;                          /* cannot happen (budget < cam_frame) */
+	(void)tx_mutex_get(&cam_lock, TX_WAIT_FOREVER);
+	memcpy(cam_frame, slot->data, valid);
+	info.frame_bytes = valid;
+	info.frame_valid = 1;
+	cam_frame_gen++;
+	(void)tx_mutex_put(&cam_lock);
+}
+
+/* Stop conditions shared by both stream services. */
+static int cam_stream_should_stop(void)
+{
+	return cam_stop_req || cam_stream_err ||
+	       (cam_target_frames && cam_pipe.stats.published >= cam_target_frames) ||
+	       (cam_target_secs &&
+	        (HAL_GetTick() - cam_start_tick) >= cam_target_secs * 1000u);
+}
+
+/* Service one JPEG frame: finalise the current slot (Stop -> NDTR -> EOI trim),
+   publish it at its real length, mirror it for save/send, then re-arm into a free
+   slot.  Every HAL failure (Stop / re-arm) is terminal -> teardown, so the stream
+   never sticks "active" with no frame coming.  Producer-thread only. */
+static void cam_stream_service_jpeg(int had_sem)
+{
+	uint32_t ndtr, eff, valid;
+	struct frame_desc *freed;
+
+	/* Stop conditions FIRST (stop/error/target share cam_stream_sem with FRAME). */
+	if (cam_stream_should_stop()) {
+		cam_stream_teardown();
+		return;
+	}
+	if (!had_sem)
+		return;                          /* bounded-timeout wake, no frame yet */
+
+	/* FRAME arrived: the slot is no longer a live DMA target once stopped. */
+	if (HAL_DCMI_Stop(&hdcmi) != HAL_OK) {
+		cam_stream_err = 1;
+		cam_stream_teardown();
+		return;
+	}
+	ndtr = __HAL_DMA_GET_COUNTER(&hdma_dcmi);
+	eff  = (CAM_JPEG_BUDGET_WORDS - ndtr) * 4u;
+	if (jpeg_trim(cam_jpeg_slot->data, eff, &valid) == 0) {
+		freed = frame_pipeline_acquire(&cam_pipe);
+		if (freed != NULL) {
+			frame_pipeline_publish(&cam_pipe, cam_jpeg_slot, valid,
+			                       FRAME_FMT_JPEG, mode.width, mode.height, 0u);
+			mirror_to_cam_frame(cam_jpeg_slot, valid);
+			cam_jpeg_slot = freed;       /* fill a fresh slot next */
+		} else {
+			cam_ring_ovr++;              /* no free slot: drop, reuse this slot */
+		}
+	} else {
+		cam_jpeg_trunc++;                /* no SOI/EOI: drop, reuse this slot */
+	}
+
+	/* Re-evaluate stop after publishing so a --frames/--secs target does not arm
+	   one extra capture. */
+	if (cam_stream_should_stop()) {
+		cam_stream_teardown();
+		return;
+	}
+	if (cam_jpeg_arm(cam_jpeg_slot) != HAL_OK) {
+		cam_stream_err = 1;
+		cam_stream_teardown();
+	}
+}
+
 /* Dedicated producer (priority 10).  When no stream is running it sleeps
    indefinitely (0 CPU) on the start semaphore; while active it bounded-waits on
    the completion semaphore so --secs / stop / OVR fire even if frames stop
@@ -1641,7 +1761,10 @@ static void cam_producer_entry(ULONG arg)
 		}
 		UINT got = tx_semaphore_get(&cam_stream_sem, CAM_PRODUCER_TICK);
 
-		cam_stream_service(got == TX_SUCCESS);
+		if (mode.is_jpeg)
+			cam_stream_service_jpeg(got == TX_SUCCESS);
+		else
+			cam_stream_service(got == TX_SUCCESS);
 	}
 }
 
@@ -1669,8 +1792,8 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	   ring backing is fixed at CAM_RING_N * CAM_RING_SLOT_CAP, so re-check the
 	   slot bound here -- frame_pipeline_publish() does not validate bytes <=
 	   slot_size (#45). */
-	if (!mode.streamable)
-		return CAM_ERR_STATE;
+	if (!mode.streamable && !mode.is_jpeg)
+		return CAM_ERR_STATE;          /* large raster modes are capture-only */
 	if (mode.frame_bytes > CAM_RING_SLOT_CAP ||
 	    (uint32_t)CAM_RING_N * mode.frame_bytes > sizeof cam_ring)
 		return CAM_ERR_STATE;
@@ -1702,18 +1825,10 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		return CAM_ERR_STATE;
 	}
-	cam_m0 = frame_pipeline_acquire(&cam_pipe);
-	cam_m1 = frame_pipeline_acquire(&cam_pipe);
-	if (cam_m0 == NULL || cam_m1 == NULL) {
-		if (ext != NULL)
-			frame_pipeline_detach(&cam_pipe, ext);
-		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
-		return CAM_ERR_STATE;
-	}
-
 	cam_stream_ovr    = 0;
 	cam_ring_ovr      = 0;
 	cam_stream_fe     = 0;
+	cam_jpeg_trunc    = 0;
 	cam_stream_err    = 0;
 	cam_stop_req      = 0;
 	cam_last_ct       = 0;
@@ -1722,6 +1837,47 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	cam_target_frames = frames;
 	cam_target_secs   = secs;
 	drain_stream_sem();
+
+	if (mode.is_jpeg) {
+		/* JPEG snapshot-loop (#63): one ring slot is the live DMA target and the
+		   DCMI FRAME ISR delimits each variable-length frame (no DBM, no TC).  ext
+		   is always NULL here -- preview forces RGB565 and rejects JPEG. */
+		cam_jpeg_slot = frame_pipeline_acquire(&cam_pipe);
+		if (cam_jpeg_slot == NULL) {
+			frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
+			return CAM_ERR_STATE;
+		}
+		cam_stream_active = 1;             /* arm the ISR + producer */
+		if (cam_jpeg_arm(cam_jpeg_slot) != HAL_OK) {
+			/* cam_lock is held, so cam_stream_teardown() (which re-takes it) must
+			   not run here -- roll back by hand like the raster DMA-start failure. */
+			cam_stream_active = 0;
+			(void)HAL_DCMI_Stop(&hdcmi);
+			__HAL_DCMI_DISABLE_IT(&hdcmi, DCMI_IT_FRAME);  /* cam_jpeg_arm armed it */
+			(void)HAL_DMA_DeInit(&hdma_dcmi);
+			hdma_dcmi.Init.Mode = DMA_NORMAL;
+			(void)HAL_DMA_Init(&hdma_dcmi);
+			__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
+			frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
+			drain_stream_sem();
+			LOG_ERR("JPEG stream arm failed");
+			return CAM_ERR_HAL;
+		}
+		cam_ext_sink = NULL;
+		(void)tx_semaphore_put(&cam_start_sem);
+		LOG_INF("stream start jpeg (frames=%lu secs=%lu)",
+		        (unsigned long)frames, (unsigned long)secs);
+		return 0;
+	}
+
+	cam_m0 = frame_pipeline_acquire(&cam_pipe);
+	cam_m1 = frame_pipeline_acquire(&cam_pipe);
+	if (cam_m0 == NULL || cam_m1 == NULL) {
+		if (ext != NULL)
+			frame_pipeline_detach(&cam_pipe, ext);
+		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
+		return CAM_ERR_STATE;
+	}
 
 	/* Manual DBM start (the HAL's own >64KB path is intra-frame banding, not
 	   inter-frame double buffering).  Order: callbacks -> DMA DBM start ->
@@ -1786,6 +1942,13 @@ int camera_preview_start(struct frame_sink *s)
 	rc = op_lock();
 	if (rc != 0)
 		return rc;
+	/* JPEG has no LCD decode path (#63): reject preview rather than silently
+	   switching the user's selected format to RGB565.  `camera format rgb565`
+	   first, then `gui camera on`. */
+	if (mode.is_jpeg) {
+		op_unlock();
+		return CAM_ERR_PARAM;
+	}
 	/* Preview forces QVGA RGB565 (the #56 GUIX sink's only accepted geometry)
 	   regardless of the last `camera res/format`.  Same lock: call the locked
 	   helper, never the public camera_set_format (which would re-take cam_lock).
@@ -1860,6 +2023,7 @@ int camera_stream_stats(struct camera_stream_info *out)
 	out->dcmi_ovr   = cam_stream_ovr;
 	out->ring_ovr   = cam_ring_ovr;
 	out->dma_fe     = cam_stream_fe;
+	out->jpeg_trunc = cam_jpeg_trunc;
 	out->elapsed_ms = cam_stream_active ? (HAL_GetTick() - cam_start_tick)
 	                                    : cam_elapsed_ms;
 	/* Coherent snapshot of the pipeline-owned counters (the producer writes them
@@ -2111,6 +2275,14 @@ void DMA2_Stream1_IRQHandler(void)
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *h)
 {
 	(void)h;
+	/* JPEG streaming (#63) delimits each variable-length frame by FRAME (the
+	   raster stream leaves FRAME disabled, so this only fires for a JPEG stream);
+	   wake the producer to finalise + re-arm.  Mode-exclusive with the snapshot
+	   gate below. */
+	if (cam_stream_active) {
+		(void)tx_semaphore_put(&cam_stream_sem);
+		return;
+	}
 	if (!cam_xfer_active)
 		return;
 	(void)tx_semaphore_put(&cam_done);

@@ -200,8 +200,8 @@ type 'help camera set' for the list of settings
 ### Snapshot vs stream asymmetry (a hardware constraint)
 
 - **Snapshot supports every mode**: a VGA/WVGA frame exceeds the DMA NDTR limit (65535 words), but `HAL_DCMI_Start_DMA` transparently **bands it intra-frame** (DBM into one contiguous buffer: VGA = 4×38400w, WVGA = 4×48000w), firing FRAME once at the end.
-- **Streaming only supports modes with frame_words ≤ 65535** (QQVGA/QVGA/480x272 in RGB565/YUV422). The producer's manual DBM points each M-register at a whole slot via NDTR, so larger modes are flagged `capture only` in `camera info` and `camera stream start` is refused.
-- **JPEG is snapshot-only and gated to ≤ VGA** (variable-length ring management is a separate concern).
+- **Raster streaming only supports modes with frame_words ≤ 65535** (QQVGA/QVGA/480x272 in RGB565/YUV422). The producer's manual DBM points each M-register at a whole slot via NDTR, so larger raster modes (VGA/WVGA) have `mode.streamable=0` — flagged `capture only` in `camera info` and refused by `camera stream start` (`mode.streamable=0` means "outside the raster DBM path").
+- **JPEG (≤ VGA) streams via a separate path** (#63, see "JPEG streaming" below). Being variable-length it uses a **snapshot-loop** (one DCMI SNAPSHOT per frame + the FRAME interrupt) rather than DBM/TC. JPEG snapshot still works as before.
 
 ### Frame rate (per-mode HTS/VTS + 15/30 fps knob, #45/#67)
 
@@ -289,6 +289,24 @@ camera stream stats                                   FPS / frames / overruns
 `start` returns immediately and never occupies the CLI prompt; the producer thread runs the capture and auto-stops on `--frames`/`--secs`, `stream stop`, or a **DMA transfer error (TE)**. Streaming and `camera capture` share one DCMI/DMA and are mutually exclusive (capture is rejected as busy while streaming).
 
 **DMA error handling (#56)**: the double-buffer arm (`HAL_DMAEx_MultiBufferStart_IT`) enables the **FIFO-error interrupt** the snapshot path (`HAL_DMA_Start_IT`) leaves off. With an incompatible FIFO-threshold/burst an FE can hardware-disable the stream, but this implementation's `FIFO_THRESHOLD_FULL + MBURST_INC4` is a valid combination, so the FE (FIFO overrun/underrun) / DME observed under the SDRAM contention from the LTDC continuously reading the framebuffer do **not** halt the stream (the snapshot path simply never observes them). They are therefore **counted and tolerated** (`stats` `dma fe`, thousands/s at QVGA), and only a **TE — which the hardware uses to actually stop the stream — is terminal**. A DCMI FIFO overrun (`ovr dcmi`) is a separate path and should stay near zero. **#59** mitigates this preview-time FE (LCD_CLK 9.6→4.8 MHz + dropping the DMA2D copy-forward; `stats` `dma fe/s` is the figure of merit — see [GUIX](../rtos/guix.md) / [display](display.md)).
+
+### JPEG streaming (snapshot-loop, #63)
+
+Raster is fixed-length, so the **DBM + TC interrupt** delimits each frame; **JPEG is variable-length** and ends short of the DMA budget, so TC never fires at the frame boundary. JPEG therefore takes a separate path — a **snapshot-loop**:
+
+- Each frame is **one DCMI SNAPSHOT (CM=1)** armed into a ring slot (`HAL_DCMI_Start_DMA`). As in the snapshot path, the **FRAME interrupt** is explicitly enabled and becomes the variable-length frame boundary (`HAL_DCMI_FrameEventCallback` posts `cam_stream_sem` while `cam_stream_active`).
+- On the FRAME wake the producer thread does **`HAL_DCMI_Stop` → read NDTR → `eff=(budget−NDTR)×4` → SOI/EOI trim** (shared with the snapshot finalize via `jpeg_trim`) → **publish** at that length → **re-arm** into a free slot. The DCMI stops capturing after each frame, so the FIFO cannot overrun during the re-arm gap (a CM=0 continuous re-point would).
+- A failed `HAL_DCMI_Stop` / re-arm is **terminal** (`cam_stream_err` → teardown). `--frames`/`--secs` targets are re-checked after publishing so no extra capture is armed.
+- Frames with **no SOI/EOI** are dropped and counted in `camera stream stats` as **`jpeg trunc`**; free-slot exhaustion is `ovr ring`. Frames that arrive in the Stop..re-arm gap are not captured (DCMI is disabled) and **by design are not counted**.
+- **Retrieval**: each JPEG publish mirrors the finalised frame into the (idle during streaming) `cam_frame`, so `camera save` / `camera send` can pull the latest JPEG frame during or after the stream.
+- **No preview**: the F746 has no JPEG decode path, so `gui camera on` while `camera format jpeg` is explicitly refused (`camera format rgb565` first). The intended consumer is #49 (network streaming — JPEG compression keeps high resolutions within bandwidth).
+
+```
+camera format jpeg; camera res qvga
+camera stream start --secs 5      # continuous JPEG (snapshot-loop)
+camera stream stats               # frames/fps, jpeg trunc
+camera save fs /shot.jpg          # save the latest frame as JPEG (SOI/EOI consistent)
+```
 
 ### GUIX live preview (#56)
 

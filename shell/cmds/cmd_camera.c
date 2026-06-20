@@ -870,15 +870,16 @@ static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
 		}
 	}
 
-	/* Clearer message than the generic CAM_ERR_STATE: large modes and JPEG are
-	   capture-only (the ring slot / one DMA NDTR cannot hold the frame).  Also warn
-	   when 30 fps is selected but clamped to 15 because the LTDC is scanning out
-	   (the stream still runs, just at 15 fps) -- `lcd disable` for 30 fps (#67). */
+	/* Clearer message than the generic CAM_ERR_STATE: only large RASTER modes are
+	   capture-only (the ring slot / one DMA NDTR cannot hold the frame).  JPEG
+	   streams via the variable-length snapshot-loop producer (#63), so it is NOT
+	   rejected here.  Also warn when 30 fps is selected but clamped to 15 because
+	   the LTDC is scanning out (the stream still runs, just at 15 fps, #67). */
 	{
 		struct camera_mode m;
 
 		if (camera_get_mode(&m) == 0) {
-			if (!m.streamable) {
+			if (!m.streamable && !m.is_jpeg) {
 				cli_error(sh, "camera: %ux%u %s is capture-only -- too large to "
 				          "stream; use a smaller resolution\r\n",
 				          (unsigned)m.width, (unsigned)m.height,
@@ -959,6 +960,7 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 		cli_print(sh, "dma fe/s:  %lu.%lu\r\n",
 		          (unsigned long)(fe10 / 10u), (unsigned long)(fe10 % 10u));
 	}
+	cli_print(sh, "jpeg trunc:%lu\r\n", (unsigned long)si.jpeg_trunc);
 	return 0;
 }
 
