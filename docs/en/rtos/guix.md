@@ -156,7 +156,7 @@ Putting the settings on their own page (rather than an overlay on top of the liv
 - While the settings screen covers the preview, `cam_icon` is hidden, so the `CAMERA_FRAME` handler **clears `cam_redraw_pending = 0` first** and only then skips the dirty-mark (so the producer's coalescing never stalls and live resumes reliably on Back). The producer keeps streaming while settings is up (the view-store DMA2D cost remains; a future optimization could suppress it).
 - The initial page reset (preview shown, settings hidden) runs in the **AUTOSTART handler (GUIX thread, after `gx_widget_show(root)`)** so a non-GUIX thread never touches the widget tree; `gx_widget_show(root)` leaves both screens visible, and the reset forces preview-only on both the boot and `gui start` paths.
 
-> **Known limitation (#70):** changing image quality in a dark scene can drop the preview fps — the camera re-clamps the sensor VTS to the stretched AEC exposure on every settings apply (#67). This is a camera-side behaviour shared with `camera set`; its fix is tracked in #70.
+> **Image quality vs fps (#70):** changing image quality (brightness/contrast/effect/flip/zoom/…) keeps the preview fps — only night mode and resolution changes reprogram the sensor timing, and turning night mode off restores the daylight AEC ceiling so the fps returns to the per-mode target. (Earlier this dropped fps on every quality apply in a dark scene.)
 
 ## Usage
 

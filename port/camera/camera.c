@@ -159,10 +159,21 @@ static struct camera_settings settings = {
 	.awb        = CAM_AWB_AUTO, .effect = CAM_FX_NONE,
 	.flip       = CAM_FLIP_FLIP, .zoom = 1, .night = 0,
 };
-/* Set whenever the cache changes; cleared only after a successful apply.  Lets
-   a live capture re-apply when a previous immediate apply failed (I2C glitch),
-   so the cache and the sensor never silently diverge. */
+/* Set whenever the SDE/flip/zoom/night cache changes; cleared only after a
+   successful settings_apply_all_locked().  Lets a live capture re-apply when a
+   previous immediate apply failed (I2C glitch), so the cache and the sensor never
+   silently diverge. */
 static int settings_dirty;
+
+/* Companion to settings_dirty, but for the sensor *timing* (AEC max-exposure
+   ceiling restore + VTS reclamp).  SDE/geometry changes do NOT touch timing, so
+   their no-timing apply must not clear a pending timing retry -- a separate flag
+   (#70) keeps "SDE applied OK but the VTS/ceiling step failed" recoverable.  Set
+   only inside settings_and_timing_apply_locked() on any failure of that full
+   timing apply and cleared there on full success; apply_if_live_locked() falls
+   back to a full timing apply while it is set, and camera_configure_locked()
+   retries on it. */
+static int timing_dirty;
 
 /* ---- capture mode: resolution / pixel format / fps (issue #45) ----------- */
 /*
@@ -417,11 +428,39 @@ static int write_hts_vts(uint16_t hts, uint16_t vts)
 	return 0;
 }
 
+/* OV5640 daylight default for both AEC max-exposure pairs (common table value,
+   ov5640.c).  OV5640_NightModeConfig(ENABLE) raises both to ~0x0B88; its DISABLE
+   only clears the auto-frame-rate bit and does NOT restore this, so night-off
+   would otherwise leave the ceiling (and thus the VTS reclamp) stuck high (#70). */
+#define CAM_AEC_MAX_DEFAULT  0x03D8u
+
+/* Restore the two AEC max-exposure ceilings (0x3A02/03 and 0x3A14/15) to the
+   daylight default.  Only the VTS-driving ceilings are reset; the night banding
+   steps / max-bands (0x3A08-0E) do not affect VTS and are out of scope (#70).
+   Caller holds cam_lock and the sensor is configured.  Returns 0 on success. */
+static int restore_aec_max_default_locked(void)
+{
+	uint8_t b;
+
+	b = (uint8_t)(CAM_AEC_MAX_DEFAULT >> 8);
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_AEC_CTRL02, &b, 1) != OV5640_OK)
+		return -1;
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_AEC_MAX_EXPO_HIGH, &b, 1) != OV5640_OK)
+		return -1;
+	b = (uint8_t)CAM_AEC_MAX_DEFAULT;
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_AEC_CTRL03, &b, 1) != OV5640_OK)
+		return -1;
+	if (cam_io_write(CAM_I2C_ADDR, OV5640_AEC_MAX_EXPO_LOW, &b, 1) != OV5640_OK)
+		return -1;
+	return 0;
+}
+
 /* AEC needs VTS to cover the max exposure (in lines) or frames clip / band.  The
    OV5640 holds two max-exposure pairs (0x3A02/03 and 0x3A14/15, default 0x3D8 =
    984; night mode raises BOTH to ~0x0B88).  Write the mode's HTS and an effective
    VTS = max(mode.vts base, max exposure + margin) so the auto-exposure always has
-   room, and refresh the live fps target.  mode.vts stays the fps-table base, so
+   room, and refresh the live fps target.  mode.vts stays the fps-table base, and
+   settings_and_timing_apply_locked() restores the ceiling on night-off (#70), so
    turning night mode off drops the effective VTS back to the table value.  Caller
    holds cam_lock and the sensor is configured. */
 #define CAM_VTS_EXP_MARGIN  16u
@@ -667,29 +706,64 @@ io_err:
 }
 
 /* Apply the cached quality settings AND refresh the exposure-aware VTS in one
-   shot: every settings application can change night mode, which raises the AEC
-   max exposure, so the VTS clamp must run right after (otherwise a live `camera
-   set night on` starves the auto-exposure at the fps-table VTS).  Caller holds
+   shot.  This is the only path that touches sensor timing, so it is used by the
+   operations that actually change the AEC ceiling or base VTS: night toggle,
+   resolution/format change, and configure (SDE/geometry-only setters use the
+   no-timing apply_if_live_locked()).  night ON raised both AEC max-exposure pairs
+   to ~0x0B88 inside settings_apply_all_locked(); when night is OFF the vendored
+   DISABLE leaves them stuck high, so restore the daylight ceiling here before the
+   VTS clamp reads it -- otherwise the effective VTS (and fps) never come back down
+   (#70).  Timing failures re-arm timing_dirty (NOT settings_dirty, which the SDE
+   block already cleared) so a later live setter / configure retries just the
+   timing step without an SDE-only apply silently dropping it.  Caller holds
    cam_lock with the sensor configured and the mode committed. */
 static int settings_and_timing_apply_locked(void)
 {
 	int rc = settings_apply_all_locked();   /* clears settings_dirty on success */
 
-	if (rc != 0)
+	if (rc != 0) {
+		timing_dirty = 1;
 		return rc;
+	}
+	if (settings.night == 0 && restore_aec_max_default_locked() != 0) {
+		timing_dirty = 1;     /* do NOT clamp VTS off a stale night ceiling */
+		LOG_ERR("OV5640 AEC ceiling restore failed (I2C)");
+		return CAM_ERR_HAL;
+	}
 	rc = apply_vts_locked();
-	if (rc != 0)
-		settings_dirty = 1;   /* SDE applied but timing not: re-arm so the next
-		                         configure re-applies settings AND re-clamps VTS,
-		                         keeping the night-mode AEC / VTS pairing intact */
-	return rc;
+	if (rc != 0) {
+		timing_dirty = 1;
+		return rc;
+	}
+	timing_dirty = 0;         /* SDE and timing both match the sensor now */
+	return 0;
 }
 
 /* Apply now if the sensor is live; otherwise the cache is enough.  Cache-only
    when not configured (the next capture's lazy configure re-applies it after
    OV5640_Init wipes the SDE block) or while the colorbar test pattern is up
-   (returning to live re-applies, and we must not disturb its SDE_CTRL4). */
+   (returning to live re-applies, and we must not disturb its SDE_CTRL4).
+
+   For SDE/geometry-only setters (brightness..zoom) this does NOT reclamp the VTS:
+   those settings cannot change the AEC max exposure, so re-running the exposure-
+   aware VTS clamp on every tweak only risked dropping fps for no reason (#70).
+   The one exception is a pending timing retry (timing_dirty): then fall back to
+   the full timing apply so a prior failed ceiling-restore / VTS clamp recovers on
+   the next live operation instead of waiting for the next configure. */
 static int apply_if_live_locked(void)
+{
+	if (!info.configured || cam_colorbar != 0)
+		return 0;
+	if (timing_dirty)
+		return settings_and_timing_apply_locked();
+	return settings_apply_all_locked();
+}
+
+/* Like apply_if_live_locked() but always refreshes the timing (AEC ceiling +
+   VTS): used by the operations that change the AEC max exposure / base VTS --
+   night toggle and defaults reset (resolution/format and configure call
+   settings_and_timing_apply_locked() directly). */
+static int apply_with_timing_if_live_locked(void)
 {
 	if (!info.configured || cam_colorbar != 0)
 		return 0;
@@ -748,10 +822,13 @@ static int camera_configure_locked(int colorbar)
 		cam_colorbar = colorbar;
 	}
 
-	/* Mode unchanged but a prior live apply failed (settings_dirty): retry so
-	   the sensor matches the cache.  Skipped in colorbar mode -- quality is
-	   irrelevant there and would disturb the test pattern's SDE_CTRL4. */
-	if (!colorbar && settings_dirty) {
+	/* Mode unchanged but a prior live apply failed: retry so the sensor matches
+	   the cache.  settings_dirty covers the SDE/geometry/night cache; timing_dirty
+	   covers a failed AEC-ceiling restore / VTS clamp (which an SDE-only apply does
+	   not re-run, #70).  Either one means a full timing apply is owed.  Skipped in
+	   colorbar mode -- quality is irrelevant there and would disturb the test
+	   pattern's SDE_CTRL4. */
+	if (!colorbar && (settings_dirty || timing_dirty)) {
 		int rc = settings_and_timing_apply_locked();
 
 		if (rc != 0)
@@ -1429,7 +1506,7 @@ int camera_set_night(int on)
 		return rc;
 	settings.night = on ? 1u : 0u;
 	settings_dirty = 1;
-	rc = apply_if_live_locked();
+	rc = apply_with_timing_if_live_locked();   /* night changes the AEC ceiling (#70) */
 	op_unlock();
 	return rc;
 }
@@ -1450,7 +1527,7 @@ int camera_set_defaults(void)
 	settings.zoom       = 1;
 	settings.night      = 0;
 	settings_dirty      = 1;
-	rc = apply_if_live_locked();
+	rc = apply_with_timing_if_live_locked();   /* night->off must restore ceiling/VTS (#70) */
 	op_unlock();
 	return rc;
 }

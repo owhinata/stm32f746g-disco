@@ -156,7 +156,7 @@ probe（カメラ有 ~150-250ms、無 ~1s）の間は GUIX dispatch が止まる
 - 設定画面が preview を覆っている間は `cam_icon` が隠れるので、`CAMERA_FRAME` ハンドラは **`cam_redraw_pending=0` を先にクリア**してから dirty_mark を skip（producer の coalesce を詰まらせず、Back で live が確実に戻る）。設定表示中も producer は stream 継続（view-store の DMA2D コストは残る。将来抑止する余地あり）。
 - 初期ページリセット（preview 表示・settings 非表示）は **AUTOSTART ハンドラ（GUIX スレッド、`gx_widget_show(root)` の後）**で行う（非 GUIX スレッドから widget ツリーを触らない）。`gx_widget_show(root)` は両画面を visible にするが、このリセットが boot/`gui start` 両経路で preview 単独へ強制する。
 
-> **既知の制約（#70）:** 暗所で画質を変えると preview の fps が落ちることがある — カメラが設定適用のたびにセンサ VTS を伸びた AEC 露出へ再クランプするため（#67）。`camera set` と共通のカメラ側挙動で、修正は #70 で扱う。
+> **画質変更と fps（#70）:** 画質変更（brightness/contrast/effect/flip/zoom/…）は preview の fps を落とさない — センサのタイミングを変えるのは night モードと解像度切替のみで、night を off にすると昼光時の AEC 上限が復帰して fps が mode 既定へ戻る。（以前は暗所で画質適用のたびに fps が落ちていた。）
 
 ## 使い方
 
