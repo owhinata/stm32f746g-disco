@@ -298,16 +298,20 @@ struct frame_sink;       /* svc/frame_pipeline.h */
 struct frame_desc;       /* svc/frame.h          */
 
 /**
- * Start streaming for a GUIX live preview and attach @p s as an external push
- * sink (in addition to the internal stats sink).  Equivalent to
- * camera_stream_start(colorbar=0, unbounded) but also takes **preview
- * ownership**: while it holds, the public `camera stream start/stop` are
- * refused (CAM_ERR_BUSY).  Returns 0 on success or a negative CAM_ERR_* (e.g.
- * a plain stream / preview already running, no sensor, SDRAM down).  The
- * producer's async teardown (DCMI overrun) also releases ownership and detaches
- * @p s, so the slot/pin contract survives a later frame_pipeline_init().
+ * Start streaming for a GUIX live preview at resolution @p res (RGB565, the
+ * GUIX sink's only format) and attach @p s as an external push sink (in addition
+ * to the internal stats sink).  @p res must be a streamable small mode
+ * (CAM_RES_QQVGA / QVGA / 480x272); larger modes return CAM_ERR_PARAM (#69).
+ * Equivalent to camera_stream_start(colorbar=0, unbounded) but also takes
+ * **preview ownership**: while it holds, the public `camera stream start/stop`
+ * are refused (CAM_ERR_BUSY).  Changing resolution mid-preview is not possible
+ * (set_format is BUSY while streaming) -- stop, then start again with the new
+ * @p res.  Returns 0 on success or a negative CAM_ERR_* (e.g. a plain stream /
+ * preview already running, no sensor, SDRAM down).  The producer's async
+ * teardown (DCMI overrun) also releases ownership and detaches @p s, so the
+ * slot/pin contract survives a later frame_pipeline_init().
  */
-int camera_preview_start(struct frame_sink *s);
+int camera_preview_start(struct frame_sink *s, enum camera_res res);
 
 /**
  * Release preview ownership taken by camera_preview_start(@p s): detach @p s and

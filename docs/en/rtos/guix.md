@@ -1,6 +1,6 @@
 # GUIX (Eclipse ThreadX GUIX integration)
 
-On top of the board's 4.3″ 480×272 LCD (LTDC, #52/#53) and the FT5336 capacitive touch panel (I2C3, #54), this brings up **Eclipse ThreadX GUIX** (the GUI framework). GUIX runs as a ThreadX thread; its 565rgb display driver is bound to the LTDC tear-free double buffer + DMA2D, its input driver to the FT5336. The UI has **two full-screen pages** (#61/#68): a **preview page** — just a `GX_ICON` drawing the QVGA frame native 1:1 centred, a clean live image — and a **settings page** reached by **tapping the live image** (a static panel, no live image, holding the 9 OV5640 image-quality controls + Back). Introduced as Phase 4 of the LTDC + GUIX epic (#48, #55), extended with the camera compositing (#56), boot-ON (#60), the camera-only UI (#61), and the two-page control UI (#68).
+On top of the board's 4.3″ 480×272 LCD (LTDC, #52/#53) and the FT5336 capacitive touch panel (I2C3, #54), this brings up **Eclipse ThreadX GUIX** (the GUI framework). GUIX runs as a ThreadX thread; its 565rgb display driver is bound to the LTDC tear-free double buffer + DMA2D, its input driver to the FT5336. The UI has **two full-screen pages** (#61/#68): a **preview page** — just a `GX_ICON` drawing the camera frame (default 480x272 full screen, resolution-selectable #69) native 1:1 centred, a clean live image — and a **settings page** reached by **tapping the live image** (a static panel, no live image, holding the 9 OV5640 image-quality controls, a preview-resolution selector (#69) and Back). Introduced as Phase 4 of the LTDC + GUIX epic (#48, #55), extended with the camera compositing (#56), boot-ON (#60), the camera-only UI (#61), the two-page control UI (#68), and selectable preview resolution (#69).
 
 - Submodule: `lib/guix` ([eclipse-threadx/guix](https://github.com/eclipse-threadx/guix) v6.5.1, **MIT**). A read-only mirror like `threadx`/`filex`/`levelx`.
 - Driver/glue: `port/guix/` (display / input / lifecycle). The camera UI app itself lives in the presentation layer `ui/guix_camera_ui.c` (#61, layering #43). Shell command `gui` (`shell/cmds/cmd_gui.c`).
@@ -100,7 +100,7 @@ GUIX itself is brought up in `port/guix/guix_glue.c`; the camera UI app (widget 
 - `gui stop` — `camera_ui_stop()`: stop the preview (stop the stream + detach the sink + bounded drain) → park input → `gx_widget_hide(root)` → blank the screen to black via DMA2D (owner path) → release ownership (the `lcd` drawing path works again).
 - `gui info` — state, GUIX system-thread priority, display handle, canvas address.
 
-The UI (`ui/guix_camera_ui.c`) is hand-coded (no GUIX Studio). The colour/font/pixelmap tables are built by hand. It is **two screens** — sibling child windows of the root (the #55 multi-screen show/hide idiom): `preview_screen` (black fill) holding `cam_icon` (a `GX_ICON`, QVGA native centred), and `settings_screen` (dark fill) holding the 9 control rows + a Back button, hidden by default (#68). Exactly one is shown at a time. All widgets are static, so GUIX needs no memory allocator.
+The UI (`ui/guix_camera_ui.c`) is hand-coded (no GUIX Studio). The colour/font/pixelmap tables are built by hand. It is **two screens** — sibling child windows of the root (the #55 multi-screen show/hide idiom): `preview_screen` (black fill) holding `cam_icon` (a `GX_ICON`, the camera frame native-scale centred, resolution-selectable #69), and `settings_screen` (dark fill) holding the 9 control rows + a Back button, hidden by default (#68). Exactly one is shown at a time. All widgets are static, so GUIX needs no memory allocator.
 
 ## Memory / flash
 
@@ -108,7 +108,7 @@ The UI (`ui/guix_camera_ui.c`) is hand-coded (no GUIX Studio). The colour/font/p
 |--------|-----------|-------|
 | FLASH | ~107 KB (170→277 KB, 26.5% of 1 MB) | GUIX core (after gc-sections + binres exclusion) |
 | RAM | GUIX thread stack 8 KB + input stack 1 KB + GUIX statics | ~32% of 256 KB |
-| SDRAM | canvas: none (reuses the existing LTDC double buffer) | camera preview (#56) adds a +150 KB view buffer (320×240×2) |
+| SDRAM | canvas: none (reuses the existing LTDC double buffer) | camera preview (#56) adds a +255 KB view buffer (480×272×2, sized for the largest selectable preview, #69) |
 
 ## Camera live preview (#56/#61)
 
@@ -117,7 +117,7 @@ The UI (`ui/guix_camera_ui.c`) is hand-coded (no GUIX Studio). The colour/font/p
 Data flow:
 
 1. A **push sink** (`guix_cam_sink`, `FRAME_POLICY_DROP`) is attached to the pipeline by `camera_preview_start()`; its `consume()` runs on the producer thread (prio 10).
-2. `consume()` copies the ring slot into a **private view buffer `cam_view_buf` (320×240, non-cacheable `.sdram`) by DMA2D M2M** (`guix_display_copy_rgb565`, under ltdc_lock), then immediately `put`s the slot (synchronous — it never holds a pin across threads). Only on a successful copy does it set a coalesce flag and post `GX_EVENT_CAMERA_FRAME` to the root (`gx_system_event_send`, thread-safe). A failed send leaves the flag clear so the next frame retries (no freeze).
+2. `consume()` copies the ring slot into a **private view buffer `cam_view_buf` (max 480×272, non-cacheable `.sdram`; the live copy is the selected resolution, #69) by DMA2D M2M** (`guix_display_copy_rgb565`, under ltdc_lock), then immediately `put`s the slot (synchronous — it never holds a pin across threads). Only on a successful copy does it set a coalesce flag and post `GX_EVENT_CAMERA_FRAME` to the root (`gx_system_event_send`, thread-safe). A failed send leaves the flag clear so the next frame retries (no freeze).
 3. The GUIX system thread (prio 14) **root event handler** receives `GX_EVENT_CAMERA_FRAME` and calls `gx_system_dirty_mark(cam_icon)` (dirty marking is GUIX-thread-only — other threads only send events).
 4. Redrawing `cam_icon` (a `GX_ICON` on the sole screen at (80,16)) calls `guix_pixelmap_draw`, which **blits the view buffer into the back buffer by DMA2D M2M at native scale**; `guix_buffer_toggle` then presents it tear-free via SRCR.VBR.
 
@@ -148,6 +148,7 @@ During the probe (~150-250 ms with a camera, ~1 s without) GUIX dispatch stalls,
 Putting the settings on their own page (rather than an overlay on top of the live image) keeps both clean: the preview shows only the camera, so the #59 B2 copy-forward never re-stamps the camera rect over a widget; and the settings panel is static and always readable (no live image bleeding through, no compositing race).
 
 - **Image quality (all 9 OV5640 `camera set` controls)**: brightness / contrast / saturation / hue (`[-]`/`[+]` buttons + a numeric value), awb / effect / flip / zoom / night (cycle buttons whose label shows the current value). Applied **live over I2C while the preview owns the camera** (`apply_if_live_locked`; the SDE bus is independent of the DCMI capture path), so unlike `camera res/format` these are not refused with BUSY.
+- **Preview resolution (#69)**: a `Resolution` cycle button (160x120 / 320x240 / 480x272, all RGB565 / 15 fps — format and fps stay fixed). Unlike the quality controls, a live re-format is `CAM_ERR_BUSY` (the ring is the live DMA target), so this **stops → re-formats → restarts** the preview: it tears the stream down, waits for it to go idle, resizes the view pixmap + `cam_icon` and re-arms the `guix_display` camera-rect geometry, then restarts at the new resolution (the new image appears on `Back`). 480x272 fills the whole panel (no border); smaller modes sit centred. The selection persists across `gui stop`/`gui start`; the GUI preview boots at **480x272** (the shell capture/stream path keeps its own QVGA default).
 
 ### How the two-page flow works
 - `cam_icon` is BORDER_NONE so it takes no touch; a `GX_EVENT_PEN_DOWN` on `preview_screen` reaches its handler → re-read the live values (`controls_sync`, so a `camera set` made meanwhile is reflected) → `guix_display_cam_set_visible(false)` (stop the B2 camera copy-forward so the producer no longer re-stamps the rect) → hide preview / show settings.
@@ -162,7 +163,8 @@ Putting the settings on their own page (rather than an overlay on top of the liv
 
 ```text
 # power-on shows the live camera preview right away (GUI ON at boot, #60/#61)
-# tap the image -> settings page (9 quality controls + Back); Back returns to the live preview (#68)
+# tap the image -> settings page (9 quality controls + Resolution + Back); Back returns to the live preview (#68/#69)
+# Resolution cycles 160x120 / 320x240 / 480x272 (stop->reformat->restart; #69)
 sh> gui info          # state: running (camera UI active)
 sh> lcd fill red      # refused while GUIX runs (display owned by gui)
 sh> camera res qvga   # same: CAM_ERR_BUSY while the preview owns the camera

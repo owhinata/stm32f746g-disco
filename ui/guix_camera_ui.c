@@ -87,6 +87,7 @@ static GX_PIXELMAP *guix_pixelmap_table[2];
 #define ID_BIP_PLUS      0x44u   /* +0..3                                         */
 #define ID_CYC           0x48u   /* +0..4: awb/effect/flip/zoom/night             */
 #define ID_BACK          0x50u
+#define ID_RES           0x51u   /* resolution cycle (stop->set->restart, #69)    */
 
 /* Prompts are NON-transparent (own opaque dark fill) so the text is always
    readable, and left/centre aligned for clarity. */
@@ -109,6 +110,8 @@ static GX_TEXT_BUTTON   bip_minus[N_BIP], bip_plus[N_BIP];
 static GX_NUMERIC_PROMPT bip_value[N_BIP];
 static GX_PROMPT        cyc_label[N_CYC];
 static GX_TEXT_BUTTON   cyc_btn[N_CYC];
+static GX_PROMPT        res_label;
+static GX_TEXT_BUTTON   btn_res;          /* preview resolution cycle (#69)        */
 static GX_TEXT_BUTTON   btn_back;
 
 /* true while the settings screen is up (preview hidden).  The CAMERA_FRAME
@@ -119,6 +122,7 @@ static void camera_ui_autostart(void);   /* forward: called by the root handler 
 static void controls_sync(void);         /* forward: re-read settings into caches */
 static void controls_update_display(void);
 static void enter_preview(void);         /* forward: Back / autostart -> preview  */
+static void cycle_resolution(void);      /* forward: settings -> next resolution   */
 
 /* ---- Control metadata. enum setters are wrapped so the table is int(*)(int). - */
 static int set_awb_i(int v)    { return camera_set_awb((enum camera_awb)v); }
@@ -163,8 +167,30 @@ static GX_CONST struct {
 };
 static int cyc_cur[N_CYC];        /* current index into names[]                    */
 
+/* ---- preview resolution (#69): the GUI cycles these three streamable RGB565
+   modes (format/fps stay fixed).  geometry is centred on the 480x272 panel; the
+   view buffer below is sized for the largest (480x272) so a switch never
+   reallocates -- only the live geometry passed to guix_display changes. */
+static GX_CONST struct {
+	enum camera_res res;
+	uint16_t w, h;
+	GX_CONST GX_CHAR *name;
+} res_tbl[] = {
+	{ CAM_RES_QQVGA,   160, 120, "160x120" },
+	{ CAM_RES_QVGA,    320, 240, "320x240" },
+	{ CAM_RES_480x272, 480, 272, "480x272" },
+};
+#define N_RES        ((int)(sizeof res_tbl / sizeof res_tbl[0]))
+#define RES_VIEW_X(i)  ((uint16_t)((LTDC_LCD_WIDTH  - res_tbl[i].w) / 2))
+#define RES_VIEW_Y(i)  ((uint16_t)((LTDC_LCD_HEIGHT - res_tbl[i].h) / 2))
+/* GUI preview boots full-screen (480x272, index 2) so the panel shows edge-to-edge
+   live video by default (#69); the selection then persists across gui stop/start.
+   The shell capture/stream path keeps its own QVGA default (`mode`), independent
+   of this GUI preview resolution. */
+static int cur_res_idx = 2;       /* index into res_tbl; default 480x272 (#69)     */
+
 /* ---- Camera view buffer + frame_pipeline push sink (#56/#61) -------------- */
-static uint16_t cam_view_buf[CAM_VIEW_W * CAM_VIEW_H]
+static uint16_t cam_view_buf[CAM_VIEW_W_MAX * CAM_VIEW_H_MAX]
 	__attribute__((aligned(32), section(".sdram.fixed")));
 static GX_PIXELMAP cam_view_pixmap;
 static bool        cam_view_inited;
@@ -181,7 +207,8 @@ static struct frame_sink guix_cam_sink;
 static int cam_sink_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t h)
 {
 	(void)ctx;
-	if (fmt != FRAME_FMT_RGB565 || w != CAM_VIEW_W || h != CAM_VIEW_H)
+	if (fmt != FRAME_FMT_RGB565 ||
+	    w != res_tbl[cur_res_idx].w || h != res_tbl[cur_res_idx].h)
 		return -1;
 	return 0;
 }
@@ -228,11 +255,13 @@ static GX_PIXELMAP *camera_pixmap(void)
 		cam_view_pixmap.gx_pixelmap_format        = GX_COLOR_FORMAT_565RGB;
 		cam_view_pixmap.gx_pixelmap_flags         = 0;
 		cam_view_pixmap.gx_pixelmap_data          = (GX_UBYTE *)cam_view_buf;
-		cam_view_pixmap.gx_pixelmap_data_size     = sizeof cam_view_buf;
 		cam_view_pixmap.gx_pixelmap_aux_data      = GX_NULL;
 		cam_view_pixmap.gx_pixelmap_aux_data_size = 0;
-		cam_view_pixmap.gx_pixelmap_width         = CAM_VIEW_W;
-		cam_view_pixmap.gx_pixelmap_height        = CAM_VIEW_H;
+		/* width/height/data_size are set per selected resolution (#69). */
+		cam_view_pixmap.gx_pixelmap_width  = res_tbl[cur_res_idx].w;
+		cam_view_pixmap.gx_pixelmap_height = res_tbl[cur_res_idx].h;
+		cam_view_pixmap.gx_pixelmap_data_size =
+			(ULONG)res_tbl[cur_res_idx].w * res_tbl[cur_res_idx].h * 2u;
 		cam_view_inited = true;
 	}
 	return &cam_view_pixmap;
@@ -318,6 +347,7 @@ static bool settings_signal(ULONG type)
 			cyc_next(i); return true;
 		}
 	}
+	if (type == GX_SIGNAL(ID_RES, GX_EVENT_CLICKED)) { cycle_resolution(); return true; }
 	if (type == GX_SIGNAL(ID_BACK, GX_EVENT_CLICKED)) { enter_preview(); return true; }
 	return false;
 }
@@ -382,44 +412,109 @@ static void preview_teardown(void)
 	cam_redraw_pending = 0;
 }
 
-/* GUIX-thread preview start (GX_EVENT_CAMERA_AUTOSTART).  Also forces the UI back
-   to the preview screen on every (re)start -- this runs on the GUIX thread after
-   guix_start's gx_widget_show(root) (which would otherwise leave BOTH screens
-   visible), so it is the right place to hide settings_screen that the show
-   re-exposed (a non-GUIX thread must not touch the widget tree). */
-static void camera_ui_autostart(void)
+/* Rebuild the GUIX view pixmap + camera-icon geometry for res_tbl[idx] (#69).
+   Runs on the GUIX thread.  The view buffer is max-sized (480x272), so only the
+   pixmap width/height/data_size and the icon rectangle change -- the data pointer
+   is unchanged.  Safe while the preview screen is hidden (settings up): Back's
+   full-screen dirty repaints the icon at its new size and the exposed border. */
+static void apply_view_geometry(int idx)
+{
+	uint16_t w = res_tbl[idx].w, h = res_tbl[idx].h;
+	uint16_t x = RES_VIEW_X(idx), y = RES_VIEW_Y(idx);
+	GX_RECTANGLE rc;
+
+	cam_view_pixmap.gx_pixelmap_width     = w;
+	cam_view_pixmap.gx_pixelmap_height    = h;
+	cam_view_pixmap.gx_pixelmap_data_size = (ULONG)w * h * 2u;
+	rc.gx_rectangle_left   = (GX_VALUE)x;
+	rc.gx_rectangle_top    = (GX_VALUE)y;
+	rc.gx_rectangle_right  = (GX_VALUE)(x + w - 1);
+	rc.gx_rectangle_bottom = (GX_VALUE)(y + h - 1);
+	gx_widget_resize(&cam_icon, &rc);
+}
+
+/* Shared GUIX-thread preview start: arm B2 with res_tbl[idx]'s geometry and start
+   the camera stream, honouring the start/stop race protocol.  @p visible is true
+   for a normal preview-screen start and false when restarting under the settings
+   screen (the camera rect stays hidden until Back).  Returns 0 on success. */
+static int preview_start_core(int idx, bool visible)
 {
 	int rc;
 
-	enter_preview();                /* preview shown, settings hidden, B2 per state */
-
 	if (stop_requested || !guix_is_up() || start_in_progress || preview_running)
-		return;
+		return -1;
 	start_in_progress = 1;
 	preview_running = 1;             /* set before attach; only ever cleared after */
 
-	guix_display_cam_set_visible(true);
-	guix_display_cam_preview_begin(cam_view_buf);
+	guix_display_cam_set_visible(visible);
+	if (guix_display_cam_preview_begin(cam_view_buf, res_tbl[idx].w, res_tbl[idx].h,
+	                                   RES_VIEW_X(idx), RES_VIEW_Y(idx)) != 0) {
+		preview_running = 0;
+		guix_display_cam_set_visible(false);
+		start_in_progress = 0;
+		LOG_ERR("camera preview geometry invalid");
+		return -1;
+	}
 	cam_redraw_pending = 0;
 
-	rc = camera_preview_start(&guix_cam_sink);
+	rc = camera_preview_start(&guix_cam_sink, res_tbl[idx].res);
 	if (rc != 0) {
 		preview_running = 0;
 		guix_display_cam_set_visible(false);
 		guix_display_cam_preview_end();
 		LOG_ERR("camera preview start failed (%d)", rc);
 		start_in_progress = 0;
-		return;
+		return rc;
 	}
 	if (stop_requested) {            /* gui stop raced the probe -> roll back */
 		preview_teardown();
 		preview_running = 0;
 		start_in_progress = 0;
 		LOG_INF("camera preview start raced gui stop; rolled back");
-		return;
+		return -1;
 	}
 	start_in_progress = 0;
-	LOG_INF("camera preview on");
+	return 0;
+}
+
+/* GUIX-thread preview start (GX_EVENT_CAMERA_AUTOSTART).  Also forces the UI back
+   to the preview screen on every (re)start -- this runs on the GUIX thread after
+   guix_start's gx_widget_show(root) (which would otherwise leave BOTH screens
+   visible), so it is the right place to hide settings_screen that the show
+   re-exposed (a non-GUIX thread must not touch the widget tree).  Resumes at the
+   current resolution (boot default QVGA; a prior `gui stop` keeps the selection). */
+static void camera_ui_autostart(void)
+{
+	enter_preview();                /* preview shown, settings hidden, B2 per state */
+	apply_view_geometry(cur_res_idx);
+	if (preview_start_core(cur_res_idx, true) == 0)
+		LOG_INF("camera preview on");
+}
+
+/* settings: cycle to the next preview resolution (stop -> set_format -> restart;
+   a live re-format is CAM_ERR_BUSY).  Runs on the GUIX thread.  camera_preview_stop
+   only REQUESTS the producer's async teardown, so wait until the stream is fully
+   idle (camera_streaming() == 0) before restarting -- otherwise the restart's
+   set_format returns CAM_ERR_BUSY (#69).  On a wait timeout, abort WITHOUT
+   touching cur_res_idx / the widgets so label, icon and stream stay consistent
+   (the user can recover with `gui stop`/`gui start`). */
+static void cycle_resolution(void)
+{
+	int next = (cur_res_idx + 1) % N_RES;
+	int i;
+
+	preview_teardown();
+	for (i = 0; i < 100 && camera_streaming(); i++)
+		tx_thread_sleep(1);
+	if (camera_streaming()) {
+		LOG_WRN("resolution change aborted: stream did not stop");
+		return;
+	}
+	cur_res_idx = next;
+	apply_view_geometry(next);
+	gx_text_button_text_set(&btn_res, res_tbl[next].name);
+	if (preview_start_core(next, false) != 0)
+		LOG_WRN("resolution change: preview restart failed");
 }
 
 /* ---- widget-tree builder (registered with guix_glue) ---------------------- */
@@ -513,6 +608,7 @@ static void controls_update_display(void)
 		gx_numeric_prompt_value_set(&bip_value[i], bip_cur[i]);
 	for (i = 0; i < N_CYC; i++)
 		gx_text_button_text_set(&cyc_btn[i], cyc_meta[i].names[cyc_cur[i]]);
+	gx_text_button_text_set(&btn_res, res_tbl[cur_res_idx].name);
 }
 
 static int camera_ui_build(void *display_v, void *root_v)
@@ -551,11 +647,12 @@ static int camera_ui_build(void *display_v, void *root_v)
 	preview_screen.gx_widget_selected_fill_color    = C_BG;
 	preview_screen.gx_widget_event_process_function = preview_screen_event;
 
-	/* Camera image (native, centred).  BORDER_NONE (not ENABLED) so it does not
-	   intercept the tap that opens the settings screen. */
+	/* Camera image (native, centred for the boot resolution; resized per selection
+	   by apply_view_geometry).  BORDER_NONE (not ENABLED) so it does not intercept
+	   the tap that opens the settings screen. */
 	status = gx_icon_create(&cam_icon, "cam", &preview_screen, PIX_CAMERA,
 	                        GX_STYLE_BORDER_NONE, ID_CAM_ICON,
-	                        CAM_VIEW_X, CAM_VIEW_Y);
+	                        RES_VIEW_X(cur_res_idx), RES_VIEW_Y(cur_res_idx));
 	if (status != GX_SUCCESS)
 		return (int)status;
 
@@ -598,6 +695,13 @@ static int camera_ui_build(void *display_v, void *root_v)
 		status |= mk_button(&cyc_btn[i], st, cyc_meta[i].names[cyc_cur[i]],
 		                    (USHORT)(ID_CYC + i), 370, y, 476, y + ROW_H);
 	}
+	/* Left column row 4 (below the 4 bipolar controls): preview resolution (#69).
+	   A dedicated control, not a cyc_meta entry -- changing resolution needs
+	   stop -> set_format -> restart (a live re-format is BUSY), not a live setter. */
+	y = ROW_Y(N_BIP);
+	status |= mk_prompt(&res_label, st, "Resolution", 6, y, 112, y + ROW_H);
+	status |= mk_button(&btn_res, st, res_tbl[cur_res_idx].name,
+	                    ID_RES, 116, y, 220, y + ROW_H);
 	/* Back centred along the bottom. */
 	status |= mk_button(&btn_back, st, "Back", ID_BACK, 190, 230, 290, 266);
 #undef ROW_Y

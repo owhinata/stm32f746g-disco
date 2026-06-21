@@ -131,7 +131,7 @@ wrote bar.png (320x240)
 
 ## 画質設定（camera set, #44）
 
-`camera set` で OV5640 内蔵 ISP の画質を調整する（B-CAMS-OMV はモジュール側に LED/AF を持たず、制御できるのはセンサ ISP 設定のみ）。設定は `port/camera` の **RAM キャッシュ**に保持し、センサが live なら即時 I2C 適用、未設定なら次回 capture の遅延 configure で一括適用する（`OV5640_Init` が SDE レジスタ群を書き潰すため、毎回 init 後に再適用が必要）。これらは**共有制御層**で、shell の `camera set` と GUIX カメラ UI の設定画面（#68、ライブ映像タップで遷移）の双方が同じ `camera_set_*` を叩く。**flip の既定は `flip`**（`CAM_FLIP_FLIP`、#68）= このボードのカメラモジュール実装向きで起動時プレビュー/capture が正立する（他の設定は中立）。`camera set flip none` で無効化可。
+`camera set` で OV5640 内蔵 ISP の画質を調整する（B-CAMS-OMV はモジュール側に LED/AF を持たず、制御できるのはセンサ ISP 設定のみ）。設定は `port/camera` の **RAM キャッシュ**に保持し、センサが live なら即時 I2C 適用、未設定なら次回 capture の遅延 configure で一括適用する（`OV5640_Init` が SDE レジスタ群を書き潰すため、毎回 init 後に再適用が必要）。これらは**共有制御層**で、shell の `camera set` と GUIX カメラ UI の設定画面（#68、ライブ映像タップで遷移）の双方が同じ `camera_set_*` を叩く。同設定画面は**ライブプレビューの解像度**（qqvga / qvga / 480x272、RGB565、#69）も切り替える（live 再フォーマットは BUSY なので stop → 再フォーマット → restart。[GUIX](../rtos/guix.md) 参照）。**flip の既定は `flip`**（`CAM_FLIP_FLIP`、#68）= このボードのカメラモジュール実装向きで起動時プレビュー/capture が正立する（他の設定は中立）。`camera set flip none` で無効化可。
 
 | 設定 | 値 | 内容 |
 |------|----|------|
@@ -316,7 +316,7 @@ camera save fs /shot.jpg          # 最新フレームを JPEG 保存（SOI/EOI 
 
 ### GUIX ライブプレビュー（#56/#61）
 
-GUIX カメラ UI（#61）は **boot / `gui start`** でこの streaming パイプラインに GUIX の push sink を attach し、QVGA を **等倍のまま** LTDC 画面（GUIX）に表示する（#61 以降これが既定 UI で、起動直後にライブ映像が出る）。プレビュー開始時に **QVGA RGB565 を強制**（`camera_preview_start` が同一 lock 下で `camera_set_format_locked(QVGA,RGB565)` を呼ぶ）するため、直前の `camera res/format` に依らず #56 の sink（QVGA RGB565 専用）と一致する。プレビュー所有中は `camera stream start/stop` と `camera res/format/set` が拒否される（逃げ道は `gui stop`）。詳細は [GUIX のカメラライブプレビュー節](../rtos/guix.md) を参照。
+GUIX カメラ UI（#61）は **boot / `gui start`** でこの streaming パイプラインに GUIX の push sink を attach し、フレームを **等倍のまま** LTDC 画面（GUIX）に表示する（#61 以降これが既定 UI で、起動直後にライブ映像が出る）。プレビューは **RGB565・選択可能な解像度**（qqvga / qvga / 480x272、GUI 既定は **480x272 全画面** #69。`camera_preview_start(s, res)` が同一 lock 下で `camera_set_format_locked(res, RGB565)` を呼ぶ）で、GUIX 設定画面が stop → 再フォーマット → restart で切り替える（#69）。プレビュー所有中は `camera stream start/stop` と `camera res/format/fps` が CAM_ERR_BUSY で拒否される（画質 `camera set` は live で適用される。逃げ道は `gui stop`）。詳細は [GUIX のカメラ設定画面](../rtos/guix.md#カメラ設定画面-68) を参照。
 
 ## 参照
 

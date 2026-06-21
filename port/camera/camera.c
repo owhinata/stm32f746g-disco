@@ -2043,27 +2043,33 @@ int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 	return rc;
 }
 
-int camera_preview_start(struct frame_sink *s)
+int camera_preview_start(struct frame_sink *s, enum camera_res res)
 {
 	int rc;
 
 	if (s == NULL)
 		return CAM_ERR_PARAM;
+	/* Preview only accepts the streamable small modes (qqvga/qvga/480x272): the
+	   bigger raster modes are capture-only (frame_words > 65535) and would set the
+	   mode then fail at stream arm, leaving the mode changed (#69).  Format is
+	   fixed RGB565 (the #56 GUIX sink's only geometry); fps stays the LTDC-clamped
+	   15 fps while the panel scans out. */
+	if (res > CAM_RES_480x272)
+		return CAM_ERR_PARAM;
 	rc = op_lock();
 	if (rc != 0)
 		return rc;
 	/* JPEG has no LCD decode path (#63): reject preview rather than silently
-	   switching the user's selected format to RGB565.  `camera format rgb565`
-	   first, then `gui camera on`. */
+	   switching the user's selected format to RGB565. */
 	if (mode.is_jpeg) {
 		op_unlock();
 		return CAM_ERR_PARAM;
 	}
-	/* Preview forces QVGA RGB565 (the #56 GUIX sink's only accepted geometry)
-	   regardless of the last `camera res/format`.  Same lock: call the locked
-	   helper, never the public camera_set_format (which would re-take cam_lock).
-	   The set_format gate passes because no stream/preview owns the DCMI yet. */
-	rc = camera_set_format_locked(CAM_RES_QVGA, CAM_FMT_RGB565);
+	/* Set the requested preview resolution (RGB565) regardless of the last
+	   `camera res/format`.  Same lock: call the locked helper, never the public
+	   camera_set_format (which would re-take cam_lock).  The set_format gate passes
+	   because no stream/preview owns the DCMI yet. */
+	rc = camera_set_format_locked((uint8_t)res, CAM_FMT_RGB565);
 	if (rc == 0)
 		rc = stream_start_locked(0, 0, 0, s);
 	op_unlock();

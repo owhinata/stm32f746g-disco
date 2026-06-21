@@ -286,11 +286,6 @@ static VOID guix_horizontal_line_draw(GX_DRAW_CONTEXT *context, INT xstart,
  * Every stale-flag transition is kept in the SAME ltdc_lock section as the DMA2D
  * copy it reflects, so the producer thread cannot advance cam_view_buf between a
  * copy and its flag update (a false-negative would present stale pixels). */
-#define CAM_RECT_L  (CAM_VIEW_X)
-#define CAM_RECT_T  (CAM_VIEW_Y)
-#define CAM_RECT_R  (CAM_VIEW_X + CAM_VIEW_W - 1)
-#define CAM_RECT_B  (CAM_VIEW_Y + CAM_VIEW_H - 1)
-
 static bool      cam_preview_active;   /* session armed (begin..end): store() ok  */
 static bool      cam_visible;          /* camera screen on display (SHOW..HIDE):
                                           gates the toggle's corrective + skip so
@@ -298,23 +293,29 @@ static bool      cam_visible;          /* camera screen on display (SHOW..HIDE):
                                           drop a forward-copy on, another screen  */
 static uint16_t *cam_view_data;        /* cam_view_buf base (registered by begin) */
 static bool      cam_buf_stale[2];     /* per LTDC buffer; invariant above        */
+/* Camera icon geometry on the panel (set by begin(), #69 variable resolution).
+   Defaults to the QVGA centred placement; rect/blit helpers read these instead of
+   the compile-time CAM_VIEW_* constants so the preview can run at qqvga/qvga/
+   480x272.  CAM_RECT bounds are cam_x..cam_x+cam_w-1 / cam_y..cam_y+cam_h-1. */
+static uint16_t  cam_x = CAM_VIEW_X, cam_y = CAM_VIEW_Y;
+static uint16_t  cam_w = CAM_VIEW_W, cam_h = CAM_VIEW_H;
 
 /* True if screen-space rect r lies fully inside the camera icon rect. */
 static bool rect_in_cam(const GX_RECTANGLE *r)
 {
-	return r->gx_rectangle_left   >= (GX_VALUE)CAM_RECT_L &&
-	       r->gx_rectangle_top    >= (GX_VALUE)CAM_RECT_T &&
-	       r->gx_rectangle_right  <= (GX_VALUE)CAM_RECT_R &&
-	       r->gx_rectangle_bottom <= (GX_VALUE)CAM_RECT_B;
+	return r->gx_rectangle_left   >= (GX_VALUE)cam_x &&
+	       r->gx_rectangle_top    >= (GX_VALUE)cam_y &&
+	       r->gx_rectangle_right  <= (GX_VALUE)(cam_x + cam_w - 1) &&
+	       r->gx_rectangle_bottom <= (GX_VALUE)(cam_y + cam_h - 1);
 }
 
 /* True if screen-space clip rect r fully COVERS the camera icon rect. */
 static bool rect_covers_cam(const GX_RECTANGLE *r)
 {
-	return r->gx_rectangle_left   <= (GX_VALUE)CAM_RECT_L &&
-	       r->gx_rectangle_top    <= (GX_VALUE)CAM_RECT_T &&
-	       r->gx_rectangle_right  >= (GX_VALUE)CAM_RECT_R &&
-	       r->gx_rectangle_bottom >= (GX_VALUE)CAM_RECT_B;
+	return r->gx_rectangle_left   <= (GX_VALUE)cam_x &&
+	       r->gx_rectangle_top    <= (GX_VALUE)cam_y &&
+	       r->gx_rectangle_right  >= (GX_VALUE)(cam_x + cam_w - 1) &&
+	       r->gx_rectangle_bottom >= (GX_VALUE)(cam_y + cam_h - 1);
 }
 
 /* Corrective copy of the full camera rect (cam_view_buf -> @p fb at the icon
@@ -333,9 +334,9 @@ static int cam_rect_refresh(uint16_t *fb)
 
 	if (fb == NULL || cam_view_data == NULL)
 		return -1;
-	dst = fb + (uint32_t)CAM_RECT_T * LTDC_LCD_WIDTH + CAM_RECT_L;
-	if (guix_dma2d_blit(dst, cam_view_data, CAM_VIEW_W, CAM_VIEW_H,
-	                    LTDC_LCD_WIDTH - CAM_VIEW_W, 0u) == 0)
+	dst = fb + (uint32_t)cam_y * LTDC_LCD_WIDTH + cam_x;
+	if (guix_dma2d_blit(dst, cam_view_data, cam_w, cam_h,
+	                    LTDC_LCD_WIDTH - cam_w, 0u) == 0)
 		return 0;
 	/* DMA2D failed.  guix_dma2d_blit aborts a timed-out transfer, so the engine
 	   is normally idle now; only run the CPU copy once that is confirmed (START
@@ -345,24 +346,37 @@ static int cam_rect_refresh(uint16_t *fb)
 	if ((DMA2D->CR & DMA2D_CR_START) != 0u)
 		return -1;
 	src = cam_view_data;
-	for (y = 0; y < CAM_VIEW_H; y++) {
-		memcpy(dst, src, (size_t)CAM_VIEW_W * sizeof(uint16_t));
+	for (y = 0; y < cam_h; y++) {
+		memcpy(dst, src, (size_t)cam_w * sizeof(uint16_t));
 		dst += LTDC_LCD_WIDTH;
-		src += CAM_VIEW_W;
+		src += cam_w;
 	}
 	return 0;
 }
 
-/* Register the view buffer and arm B2 for a preview session.  Both LTDC buffers
-   start stale so the first frames are corrected before present. */
-void guix_display_cam_preview_begin(uint16_t *view_buf)
+/* Register the view buffer + camera-rect geometry and arm B2 for a preview
+   session (#69 variable resolution).  Both LTDC buffers start stale so the first
+   frames are corrected before present.  Returns 0 on success, -1 if the geometry
+   is invalid (NULL buffer, zero size, or out of the 480x272 panel) -- in which
+   case B2 is left DISARMED (cam_view_data NULL) so a bad offset can never reach
+   the DMA2D blits.  Runs under ltdc_lock. */
+int guix_display_cam_preview_begin(uint16_t *view_buf, uint16_t w, uint16_t h,
+                                   uint16_t x, uint16_t y)
 {
+	if (view_buf == NULL || w == 0u || h == 0u ||
+	    (uint32_t)x + w > LTDC_LCD_WIDTH || (uint32_t)y + h > LTDC_LCD_HEIGHT)
+		return -1;
 	ltdc_lock_frame();
 	cam_view_data      = view_buf;
+	cam_x              = x;
+	cam_y              = y;
+	cam_w              = w;
+	cam_h              = h;
 	cam_buf_stale[0]   = true;
 	cam_buf_stale[1]   = true;
 	cam_preview_active = true;
 	ltdc_unlock_frame();
+	return 0;
 }
 
 void guix_display_cam_preview_end(void)
@@ -389,9 +403,10 @@ void guix_display_cam_set_visible(bool on)
 	ltdc_unlock_frame();
 }
 
-/* Store a freshly captured frame into the view buffer and mark BOTH LTDC buffers
-   stale, atomically under ltdc_lock (#59 B2).  Returns 0 on a completed DMA2D
-   copy, -1 otherwise. */
+/* Store a freshly captured frame (cam_w x cam_h RGB565, the current preview
+   resolution #69) into the view buffer and mark BOTH LTDC buffers stale,
+   atomically under ltdc_lock (#59 B2).  Returns 0 on a completed DMA2D copy,
+   -1 otherwise. */
 int guix_display_cam_view_store(const uint16_t *src)
 {
 	int rc;
@@ -401,7 +416,7 @@ int guix_display_cam_view_store(const uint16_t *src)
 		ltdc_unlock_frame();
 		return -1;
 	}
-	rc = guix_dma2d_blit(cam_view_data, src, CAM_VIEW_W, CAM_VIEW_H, 0u, 0u);
+	rc = guix_dma2d_blit(cam_view_data, src, cam_w, cam_h, 0u, 0u);
 	if (rc == 0) {
 		cam_buf_stale[0] = true;
 		cam_buf_stale[1] = true;

@@ -35,10 +35,16 @@ extern "C" {
    the 480x272 panel.  Lives here (the port display layer) rather than in the ui
    camera app because the buffer-toggle B2 paths below consume it -- keeping it in
    port preserves the port <- ui dependency direction (#43/#61). */
-#define CAM_VIEW_W  320
+#define CAM_VIEW_W  320   /* boot-default preview geometry (QVGA, centred) */
 #define CAM_VIEW_H  240
 #define CAM_VIEW_X  80    /* (480 - 320) / 2 */
 #define CAM_VIEW_Y  16    /* (272 - 240) / 2 */
+
+/* Largest preview the UI can select (#69): full panel 480x272.  The view buffer
+   is sized to this so a resolution switch never reallocates; the live geometry is
+   passed to guix_display_cam_preview_begin() per session. */
+#define CAM_VIEW_W_MAX  480
+#define CAM_VIEW_H_MAX  272
 
 /** GUIX display-driver setup callback passed to gx_display_create(): lays down
  *  the software 565rgb driver, then installs the DMA2D-accelerated overrides and
@@ -59,11 +65,15 @@ int guix_display_copy_rgb565(uint16_t *dst, const uint16_t *src, uint32_t w,
 
 /* ---- camera live-preview copy-forward elimination (#59 Lever B2) ---------- */
 
-/** Arm the preview-path copy-forward optimization for a session and register the
- *  camera view buffer (whose content is the latest captured frame).  Both LTDC
- *  buffers start "stale" so the first frames are corrected before present.
+/** Arm the preview-path copy-forward optimization for a session: register the
+ *  camera view buffer (whose content is the latest captured frame) and the
+ *  on-panel camera-rect geometry @p w x @p h at (@p x, @p y) -- variable per
+ *  preview resolution (#69).  Both LTDC buffers start "stale" so the first frames
+ *  are corrected before present.  Returns 0, or -1 if the geometry is invalid
+ *  (NULL buffer / zero size / outside the 480x272 panel), leaving B2 disarmed.
  *  Call from the camera UI (ui/) before the stream starts; runs under ltdc_lock. */
-void guix_display_cam_preview_begin(uint16_t *view_buf);
+int guix_display_cam_preview_begin(uint16_t *view_buf, uint16_t w, uint16_t h,
+                                   uint16_t x, uint16_t y);
 
 /** Disarm the optimization at preview teardown (runs under ltdc_lock). */
 void guix_display_cam_preview_end(void);
@@ -74,9 +84,9 @@ void guix_display_cam_preview_end(void);
  *  camera screen SHOW/HIDE).  Runs under ltdc_lock. */
 void guix_display_cam_set_visible(bool on);
 
-/** Store a freshly captured frame (@p src, CAM_VIEW_W x CAM_VIEW_H RGB565) into
- *  the view buffer via DMA2D and mark BOTH LTDC buffers stale, atomically under
- *  ltdc_lock.  Returns 0 on a completed copy, -1 otherwise. */
+/** Store a freshly captured frame (@p src, the current preview resolution RGB565,
+ *  #69) into the view buffer via DMA2D and mark BOTH LTDC buffers stale, atomically
+ *  under ltdc_lock.  Returns 0 on a completed copy, -1 otherwise. */
 int guix_display_cam_view_store(const uint16_t *src);
 
 #ifdef __cplusplus
