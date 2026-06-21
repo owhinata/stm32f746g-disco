@@ -149,13 +149,15 @@ static int cam_colorbar = -1;          /* last pattern mode; -1 unknown */
 static uint32_t cam_frame_gen;         /* bumped per successful capture */
 static struct camera_info info;
 
-/* Quality settings (issue #44): RAM cache, all neutral by default.  Survives
-   power cycles so a `camera set` made while powered off still takes effect at
-   the next capture; cleared back to these defaults only by camera_set_defaults. */
+/* Quality settings (issue #44): RAM cache, neutral by default EXCEPT flip, which
+   defaults to CAM_FLIP_FLIP so the live preview / capture comes out upright for
+   this board's camera-module mounting orientation (issue #68).  Survives power
+   cycles so a `camera set` made while powered off still takes effect at the next
+   capture; cleared back to these defaults only by camera_set_defaults. */
 static struct camera_settings settings = {
 	.brightness = 0, .contrast = 0, .saturation = 0, .hue = 0,
 	.awb        = CAM_AWB_AUTO, .effect = CAM_FX_NONE,
-	.flip       = CAM_FLIP_NONE, .zoom = 1, .night = 0,
+	.flip       = CAM_FLIP_FLIP, .zoom = 1, .night = 0,
 };
 /* Set whenever the cache changes; cleared only after a successful apply.  Lets
    a live capture re-apply when a previous immediate apply failed (I2C glitch),
@@ -1444,7 +1446,7 @@ int camera_set_defaults(void)
 	settings.hue        = 0;
 	settings.awb        = CAM_AWB_AUTO;
 	settings.effect     = CAM_FX_NONE;
-	settings.flip       = CAM_FLIP_NONE;
+	settings.flip       = CAM_FLIP_FLIP;   /* upright for this board's mounting (#68) */
 	settings.zoom       = 1;
 	settings.night      = 0;
 	settings_dirty      = 1;

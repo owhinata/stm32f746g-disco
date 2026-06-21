@@ -131,7 +131,7 @@ Channels are expanded to 8 bits by bit replication (full-scale 5/6-bit values ma
 
 ## Image-quality settings (camera set, #44)
 
-`camera set` adjusts the OV5640's built-in ISP (the B-CAMS-OMV has no module-side LED/AF, so only the sensor ISP is controllable). Settings live in a **RAM cache** in `port/camera`: applied over I2C immediately when the sensor is live, or cached and applied in one pass by the next capture's lazy configure (`OV5640_Init` rewrites the SDE register block, so the cache must be re-applied after every init).
+`camera set` adjusts the OV5640's built-in ISP (the B-CAMS-OMV has no module-side LED/AF, so only the sensor ISP is controllable). Settings live in a **RAM cache** in `port/camera`: applied over I2C immediately when the sensor is live, or cached and applied in one pass by the next capture's lazy configure (`OV5640_Init` rewrites the SDE register block, so the cache must be re-applied after every init). This is a **shared control layer**: both the `camera set` shell commands and the GUIX camera UI settings screen (#68, reached by tapping the live image) call the same `camera_set_*`. **flip defaults to `flip`** (`CAM_FLIP_FLIP`, #68) for this board's camera-module mounting, so the boot preview / capture come out upright (the other settings default to neutral); use `camera set flip none` to disable it.
 
 | Setting | Value | Meaning |
 |---------|-------|---------|
@@ -144,7 +144,7 @@ Channels are expanded to 8 bits by bit replication (full-scale 5/6-bit values ma
 | `flip` | none / mirror / flip / both | mirror / vertical flip |
 | `zoom` | 1 / 2 / 4 / 8 | digital zoom (ISP scaling, QVGA-capable) |
 | `night` | on / off | night mode (AEC stretches 15→3.75 fps) |
-| `default` | — | reset every setting to neutral |
+| `default` | — | reset to neutral (flip defaults to `flip`, #68) |
 
 Each setting is a **subcommand** of `camera set` (`camera_set_subcmds` in `shell/cmds/cmd_camera.c`), so the hierarchical help (#37) lists them all and gives per-setting usage; omitting the value auto-prints that subcommand's usage.
 

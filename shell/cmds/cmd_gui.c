@@ -12,9 +12,10 @@
  *               `lcd` (so the `lcd`/`touch`/`camera` test commands can run).
  *   gui info    GUIX state / system-thread priority / display / canvas.
  *
- * Since #61 the UI is a single-screen live camera preview (the demo screens and
- * the `gui camera on|off` sub-command are gone -- the preview now follows the UI
- * lifecycle: `gui start` / boot brings it up, `gui stop` tears it down).  The UI
+ * Since #61 the UI is the camera UI (the demo screens and the `gui camera on|off`
+ * sub-command are gone -- the preview now follows the UI lifecycle: `gui start` /
+ * boot brings it up, `gui stop` tears it down); #68 added a settings page reached
+ * by tapping the live image (image-quality controls + Back).  The UI
  * is started ON at boot (#60); while it runs the `lcd` drawing commands are
  * refused (the display is owned by GUIX) -- run `gui stop` first.  The camera UI
  * itself lives in ui/guix_camera_ui.c (presentation layer).

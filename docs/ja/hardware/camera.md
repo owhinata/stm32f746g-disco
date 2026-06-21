@@ -131,7 +131,7 @@ wrote bar.png (320x240)
 
 ## 画質設定（camera set, #44）
 
-`camera set` で OV5640 内蔵 ISP の画質を調整する（B-CAMS-OMV はモジュール側に LED/AF を持たず、制御できるのはセンサ ISP 設定のみ）。設定は `port/camera` の **RAM キャッシュ**に保持し、センサが live なら即時 I2C 適用、未設定なら次回 capture の遅延 configure で一括適用する（`OV5640_Init` が SDE レジスタ群を書き潰すため、毎回 init 後に再適用が必要）。
+`camera set` で OV5640 内蔵 ISP の画質を調整する（B-CAMS-OMV はモジュール側に LED/AF を持たず、制御できるのはセンサ ISP 設定のみ）。設定は `port/camera` の **RAM キャッシュ**に保持し、センサが live なら即時 I2C 適用、未設定なら次回 capture の遅延 configure で一括適用する（`OV5640_Init` が SDE レジスタ群を書き潰すため、毎回 init 後に再適用が必要）。これらは**共有制御層**で、shell の `camera set` と GUIX カメラ UI の設定画面（#68、ライブ映像タップで遷移）の双方が同じ `camera_set_*` を叩く。**flip の既定は `flip`**（`CAM_FLIP_FLIP`、#68）= このボードのカメラモジュール実装向きで起動時プレビュー/capture が正立する（他の設定は中立）。`camera set flip none` で無効化可。
 
 | 設定 | 値 | 内容 |
 |------|----|------|
@@ -144,7 +144,7 @@ wrote bar.png (320x240)
 | `flip` | none / mirror / flip / both | ミラー / 上下反転 |
 | `zoom` | 1 / 2 / 4 / 8 | デジタルズーム（ISP スケーリング、QVGA 対応） |
 | `night` | on / off | ナイトモード（AEC で 15→3.75fps へ自動延長） |
-| `default` | — | 全設定を中立値へリセット |
+| `default` | — | 中立値へリセット（flip は既定 `flip`, #68） |
 
 各設定は `camera set` 配下の**サブコマンド**（`shell/cmds/cmd_camera.c` の `camera_set_subcmds`）なので、階層 help（#37）で一覧・個別 usage が引ける。値を省くと該当サブコマンドの usage が自動表示される。
 

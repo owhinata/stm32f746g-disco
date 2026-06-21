@@ -1,6 +1,6 @@
 # GUIX (Eclipse ThreadX GUIX integration)
 
-On top of the board's 4.3″ 480×272 LCD (LTDC, #52/#53) and the FT5336 capacitive touch panel (I2C3, #54), this brings up **Eclipse ThreadX GUIX** (the GUI framework). GUIX runs as a ThreadX thread; its 565rgb display driver is bound to the LTDC tear-free double buffer + DMA2D, its input driver to the FT5336. The UI is a **single camera live-preview screen** (#61): just a `GX_ICON` drawing the QVGA frame native 1:1 centred, with no demo screens or on-screen widgets (control widgets come in #68). Introduced as Phase 4 of the LTDC + GUIX epic (#48, #55), extended with the camera compositing (#56), boot-ON (#60), and the camera-only UI (#61).
+On top of the board's 4.3″ 480×272 LCD (LTDC, #52/#53) and the FT5336 capacitive touch panel (I2C3, #54), this brings up **Eclipse ThreadX GUIX** (the GUI framework). GUIX runs as a ThreadX thread; its 565rgb display driver is bound to the LTDC tear-free double buffer + DMA2D, its input driver to the FT5336. The UI has **two full-screen pages** (#61/#68): a **preview page** — just a `GX_ICON` drawing the QVGA frame native 1:1 centred, a clean live image — and a **settings page** reached by **tapping the live image** (a static panel, no live image, holding the 9 OV5640 image-quality controls + Back). Introduced as Phase 4 of the LTDC + GUIX epic (#48, #55), extended with the camera compositing (#56), boot-ON (#60), the camera-only UI (#61), and the two-page control UI (#68).
 
 - Submodule: `lib/guix` ([eclipse-threadx/guix](https://github.com/eclipse-threadx/guix) v6.5.1, **MIT**). A read-only mirror like `threadx`/`filex`/`levelx`.
 - Driver/glue: `port/guix/` (display / input / lifecycle). The camera UI app itself lives in the presentation layer `ui/guix_camera_ui.c` (#61, layering #43). Shell command `gui` (`shell/cmds/cmd_gui.c`).
@@ -100,7 +100,7 @@ GUIX itself is brought up in `port/guix/guix_glue.c`; the camera UI app (widget 
 - `gui stop` — `camera_ui_stop()`: stop the preview (stop the stream + detach the sink + bounded drain) → park input → `gx_widget_hide(root)` → blank the screen to black via DMA2D (owner path) → release ownership (the `lcd` drawing path works again).
 - `gui info` — state, GUIX system-thread priority, display handle, canvas address.
 
-The UI (`ui/guix_camera_ui.c`) is hand-coded (no GUIX Studio). The colour/font/pixelmap tables are built by hand. It is a **single screen**: one child window of the root (black fill) holding only `cam_icon` (a `GX_ICON`, QVGA native centred). There are no demo screens, buttons or text (control widgets come in #68). All widgets are static, so GUIX needs no memory allocator.
+The UI (`ui/guix_camera_ui.c`) is hand-coded (no GUIX Studio). The colour/font/pixelmap tables are built by hand. It is **two screens** — sibling child windows of the root (the #55 multi-screen show/hide idiom): `preview_screen` (black fill) holding `cam_icon` (a `GX_ICON`, QVGA native centred), and `settings_screen` (dark fill) holding the 9 control rows + a Back button, hidden by default (#68). Exactly one is shown at a time. All widgets are static, so GUIX needs no memory allocator.
 
 ## Memory / flash
 
@@ -141,10 +141,28 @@ During the probe (~150-250 ms with a camera, ~1 s without) GUIX dispatch stalls,
     - **B1**: `consume()` **coalesces** the slot→view copy while `cam_redraw_pending` is set (the previous frame is not yet drawn); the slot is always `put`.  It helps exactly when frames outpace the redraw — the contended case.
     - **B2**: the camera rect is fully repainted every frame, so the `guix_buffer_toggle` **copy-forward is eliminated in steady state**.  Consistency is held by a **per-buffer stale flag (`cam_buf_stale[2]`, invariant "false ⟺ that buffer's camera rect == latest view") plus a pre-flip corrective copy**.  Each stale-flag transition stays in the same `ltdc_lock` section as its DMA2D copy, so the producer advancing the view cannot cause a false-negative.  The toggle's B2 paths are gated on `cam_visible` (toggled by preview start/stop; before #61, by screen SHOW/HIDE).  The LCD_CLK was also lowered 9.6→4.8 MHz ([display](../hardware/display.md)).  The figure of merit is `dma fe/s`.
 
+## Camera settings screen (#68)
+
+`ui/guix_camera_ui.c`. The UI is **two full-screen pages**: a clean live `preview_screen` and a static `settings_screen`. **Tapping the live image opens the settings screen; its Back button returns to the preview.** The GUI calls the `port/camera` control API (`camera_set_*`) directly — the **same shared control layer** as the `camera set` shell commands (no duplicated logic).
+
+Putting the settings on their own page (rather than an overlay on top of the live image) keeps both clean: the preview shows only the camera, so the #59 B2 copy-forward never re-stamps the camera rect over a widget; and the settings panel is static and always readable (no live image bleeding through, no compositing race).
+
+- **Image quality (all 9 OV5640 `camera set` controls)**: brightness / contrast / saturation / hue (`[-]`/`[+]` buttons + a numeric value), awb / effect / flip / zoom / night (cycle buttons whose label shows the current value). Applied **live over I2C while the preview owns the camera** (`apply_if_live_locked`; the SDE bus is independent of the DCMI capture path), so unlike `camera res/format` these are not refused with BUSY.
+
+### How the two-page flow works
+- `cam_icon` is BORDER_NONE so it takes no touch; a `GX_EVENT_PEN_DOWN` on `preview_screen` reaches its handler → re-read the live values (`controls_sync`, so a `camera set` made meanwhile is reflected) → `guix_display_cam_set_visible(false)` (stop the B2 camera copy-forward so the producer no longer re-stamps the rect) → hide preview / show settings.
+- **Back** (`settings_screen` handler, `GX_SIGNAL(ID_BACK, CLICKED)`) hides settings / shows preview → `guix_display_cam_set_visible(preview_running)` (re-arm B2, which marks both LTDC buffers stale so the live image is restored) → `gx_system_dirty_mark(cam_icon)` for an immediate repaint.
+- The quality buttons notify the `settings_screen` handler via `GX_SIGNAL(id, GX_EVENT_CLICKED)`; it applies `camera_set_*` and updates the value display. These run on the GUIX system thread, which blocks for the duration of the SDE I2C write (taps are not rapid, so this is acceptable).
+- While the settings screen covers the preview, `cam_icon` is hidden, so the `CAMERA_FRAME` handler **clears `cam_redraw_pending = 0` first** and only then skips the dirty-mark (so the producer's coalescing never stalls and live resumes reliably on Back). The producer keeps streaming while settings is up (the view-store DMA2D cost remains; a future optimization could suppress it).
+- The initial page reset (preview shown, settings hidden) runs in the **AUTOSTART handler (GUIX thread, after `gx_widget_show(root)`)** so a non-GUIX thread never touches the widget tree; `gx_widget_show(root)` leaves both screens visible, and the reset forces preview-only on both the boot and `gui start` paths.
+
+> **Known limitation (#70):** changing image quality in a dark scene can drop the preview fps — the camera re-clamps the sensor VTS to the stretched AEC exposure on every settings apply (#67). This is a camera-side behaviour shared with `camera set`; its fix is tracked in #70.
+
 ## Usage
 
 ```text
 # power-on shows the live camera preview right away (GUI ON at boot, #60/#61)
+# tap the image -> settings page (9 quality controls + Back); Back returns to the live preview (#68)
 sh> gui info          # state: running (camera UI active)
 sh> lcd fill red      # refused while GUIX runs (display owned by gui)
 sh> camera res qvga   # same: CAM_ERR_BUSY while the preview owns the camera

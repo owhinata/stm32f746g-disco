@@ -4,14 +4,15 @@
  */
 /**
  * @file    guix_camera_ui.h
- * @brief   Camera live-preview GUIX app (issue #61): the single-screen camera UI
- *          that merges the former guix_app (widget tree) and guix_camera (frame
- *          sink + preview controller) into one application-layer module.
+ * @brief   Camera GUIX app (issues #61/#68): the camera UI that merges the former
+ *          guix_app (widget tree) and guix_camera (frame sink + preview
+ *          controller) into one application-layer module.
  *
  * This is the presentation layer (ui/), above port/guix.  The board boots with
- * the UI ON (#60) showing only the live camera preview (QVGA RGB565, drawn native
- * 1:1 centred on the 480x272 panel); there are no demo screens or on-screen
- * widgets (control widgets come in #68).  Lifecycle:
+ * the UI ON (#60) showing the live camera preview (QVGA RGB565, drawn native 1:1
+ * centred on the 480x272 panel).  The UI has two full-screen pages (#68): the
+ * clean live preview, and a settings page reached by tapping the image that holds
+ * the OV5640 image-quality controls + Back (see guix_camera_ui.c).  Lifecycle:
  *
  *   camera_ui_init()   register the GUIX widget-tree builder with guix_glue
  *                      (boot-safe: no GUIX/camera I/O).  Call once from

@@ -1,6 +1,6 @@
 # GUIX（Eclipse ThreadX GUIX 統合）
 
-ボード搭載 4.3″ 480×272 LCD（LTDC、#52/#53）と FT5336 容量タッチ（I2C3、#54）の上に、**Eclipse ThreadX GUIX**（GUI フレームワーク）を載せる。GUIX を ThreadX スレッドとして起動し、565rgb ディスプレイドライバを LTDC の tear-free ダブルバッファ + DMA2D に、入力ドライバを FT5336 に接続する。UI は **カメラライブプレビュー専用の単一画面**（#61）: QVGA を等倍中央に表示する `GX_ICON` のみで、デモ画面や on-screen ウィジェットは無い（制御 widget は #68）。LTDC + GUIX エピック（#48）の Phase 4（#55）として導入し、#56 でカメラ合成、#60 で boot ON、#61 でカメラ UI 専用化した。
+ボード搭載 4.3″ 480×272 LCD（LTDC、#52/#53）と FT5336 容量タッチ（I2C3、#54）の上に、**Eclipse ThreadX GUIX**（GUI フレームワーク）を載せる。GUIX を ThreadX スレッドとして起動し、565rgb ディスプレイドライバを LTDC の tear-free ダブルバッファ + DMA2D に、入力ドライバを FT5336 に接続する。UI は **2 つの全画面ページ**（#61/#68）: **プレビューページ**（QVGA を等倍中央に表示する `GX_ICON` のみのクリーンなライブ映像）と、**ライブ映像をタップして開く設定ページ**（ライブ映像を出さない静的パネルに OV5640 の画質 9 種 + Back を置く）。LTDC + GUIX エピック（#48）の Phase 4（#55）として導入し、#56 でカメラ合成、#60 で boot ON、#61 でカメラ UI 専用化、#68 で 2 ページ制御 UI 化した。
 
 - submodule: `lib/guix`（[eclipse-threadx/guix](https://github.com/eclipse-threadx/guix) v6.5.1、**MIT**）。`threadx`/`filex`/`levelx` と同じ read-only ミラー。
 - ドライバ/グルー: `port/guix/`（display / 入力 / lifecycle）。カメラ UI アプリ本体は presentation 層 `ui/guix_camera_ui.c`（#61、レイヤ規約 #43）。シェルコマンドは `gui`（`shell/cmds/cmd_gui.c`）。
@@ -100,7 +100,7 @@ GUIX 本体の bring-up は `port/guix/guix_glue.c`、カメラ UI アプリ（w
 - `gui stop` … `camera_ui_stop()`: preview を停止（stream 停止 + sink detach + bounded drain）→ 入力スレッド park → `gx_widget_hide(root)` → DMA2D で画面を黒 blank（owner 経路）→ 所有権解放（`lcd` 描画が再び通る）。
 - `gui info` … 状態・GUIX システムスレッド優先度・display handle・canvas アドレス。
 
-UI（`ui/guix_camera_ui.c`）は GUIX Studio を使わず手書き。色/フォント/pixelmap テーブルを手で組む。**単一画面**: root の子ウィンドウ 1 つ（黒背景）に `cam_icon`（`GX_ICON`, QVGA 等倍中央）だけを置く。デモ画面・ボタン・テキストは無い（制御 widget は #68）。全ウィジェット static なので GUIX のメモリアロケータは不要。
+UI（`ui/guix_camera_ui.c`）は GUIX Studio を使わず手書き。色/フォント/pixelmap テーブルを手で組む。**2 画面**: root の兄弟子ウィンドウ（#55 の多画面 show/hide イディオム）として `preview_screen`（黒背景, `cam_icon`= `GX_ICON`, QVGA 等倍中央）と `settings_screen`（暗背景, 制御 9 行 + Back ボタン、既定 hidden, #68）を持ち、常にどちらか一方だけを表示する。全ウィジェット static なので GUIX のメモリアロケータは不要。
 
 ## メモリ / フラッシュ
 
@@ -141,10 +141,28 @@ probe（カメラ有 ~150-250ms、無 ~1s）の間は GUIX dispatch が止まる
     - **B1**: `consume()` は `cam_redraw_pending` 中（前フレーム未描画）は slot→view コピーを**コアレス**（slot は必ず `put`）。フレームが redraw を上回る競合時にこそ効く。
     - **B2**: カメラ矩形は毎フレーム全面再描画されるので `guix_buffer_toggle` の **copy-forward を定常で全廃**。整合は **per-buffer の stale フラグ（`cam_buf_stale[2]`、不変条件「false ⟺ その面のカメラ矩形 == 最新 view」）+ flip 直前の corrective copy** で担保する。stale フラグの遷移は対応する DMA2D コピーと同一 `ltdc_lock` 区間に閉じ込め、producer が view を進めても false-negative を出さない。toggle の B2 経路は `cam_visible`（preview 開始/停止で開閉、#61 以前は画面 SHOW/HIDE）でゲートする。あわせて LCD_CLK を 9.6→4.8 MHz に下げた（[display](../hardware/display.md)）。指標は `dma fe/s`。
 
+## カメラ設定画面（#68）
+
+`ui/guix_camera_ui.c`。UI は **2 つの全画面ページ**: クリーンなライブ `preview_screen` と静的な `settings_screen`。**ライブ映像をタップすると設定画面が開き、Back ボタンでプレビューへ戻る**。`port/camera` の制御 API（`camera_set_*`）を GUI から直接叩く＝`camera set` シェルコマンドと**同一の共有制御層**（ロジック重複なし）。
+
+設定をライブ映像上のオーバーレイではなく専用ページに分離したことで両者がクリーンになる: プレビューはカメラ映像だけ（#59 B2 copy-forward が widget の上にカメラ矩形を再スタンプしない）、設定パネルは静的で常に可読（ライブ映像が透けない・合成競合なし）。
+
+- **画質調整（OV5640 `camera set` 全 9 種）**: brightness / contrast / saturation / hue（`[-]`/`[+]` ボタン + 数値表示）、awb / effect / flip / zoom / night（サイクルボタン、ラベルが現在値）。**preview 所有のまま I2C で live 適用**（`apply_if_live_locked`、SDE バスは DCMI キャプチャと独立）。`camera res/format` と違い preview 所有中も BUSY にならない。
+
+### 2 ページ遷移の仕組み
+- `cam_icon` は BORDER_NONE で touch を取らないので、`preview_screen` の `GX_EVENT_PEN_DOWN` はそのハンドラに届く → live 値を再読込（`controls_sync`、その間の `camera set` を反映）→ `guix_display_cam_set_visible(false)`（B2 カメラ copy-forward を止め、producer が矩形を再スタンプしないように）→ preview を hide / settings を show。
+- **Back**（`settings_screen` ハンドラ, `GX_SIGNAL(ID_BACK, CLICKED)`）は settings を hide / preview を show → `guix_display_cam_set_visible(preview_running)`（B2 を再アーム、両 LTDC バッファを stale にしてライブ映像を復元）→ `gx_system_dirty_mark(cam_icon)` で即時再描画。
+- 画質ボタンは `GX_SIGNAL(id, GX_EVENT_CLICKED)` を `settings_screen` ハンドラが受け、`camera_set_*` 適用 + 値表示更新。これら制御は GUIX システムスレッド上で走り、`camera_set_*` の SDE I2C 書き込み中だけ dispatch がブロックする（tap は連打でないので許容）。
+- 設定画面が preview を覆っている間は `cam_icon` が隠れるので、`CAMERA_FRAME` ハンドラは **`cam_redraw_pending=0` を先にクリア**してから dirty_mark を skip（producer の coalesce を詰まらせず、Back で live が確実に戻る）。設定表示中も producer は stream 継続（view-store の DMA2D コストは残る。将来抑止する余地あり）。
+- 初期ページリセット（preview 表示・settings 非表示）は **AUTOSTART ハンドラ（GUIX スレッド、`gx_widget_show(root)` の後）**で行う（非 GUIX スレッドから widget ツリーを触らない）。`gx_widget_show(root)` は両画面を visible にするが、このリセットが boot/`gui start` 両経路で preview 単独へ強制する。
+
+> **既知の制約（#70）:** 暗所で画質を変えると preview の fps が落ちることがある — カメラが設定適用のたびにセンサ VTS を伸びた AEC 露出へ再クランプするため（#67）。`camera set` と共通のカメラ側挙動で、修正は #70 で扱う。
+
 ## 使い方
 
 ```text
 # 電源投入で起動直後にカメラライブプレビューが出る（boot で GUI ON, #60/#61）
+# 映像をタップ → 設定ページ（画質 9 種 + Back）。Back でライブプレビューへ戻る（#68）
 sh> gui info          # state: running（カメラ UI 稼働中）
 sh> lcd fill red      # GUIX 稼働中は拒否される（display owned by gui）
 sh> camera res qvga   # 同上：preview 所有中は CAM_ERR_BUSY

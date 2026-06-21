@@ -158,7 +158,8 @@ enum camera_flip {    /* mirror / flip orientation */
 #define CAM_HUE_MIN    (-6)   /* hue index; degrees = index * 30 (-180 deg) */
 #define CAM_HUE_MAX    (5)    /* +150 deg                                    */
 
-/** Current OV5640 quality settings (defaults are all neutral). */
+/** Current OV5640 quality settings (defaults are neutral except flip, which
+ *  defaults to CAM_FLIP_FLIP for this board's camera mounting -- upright, #68). */
 struct camera_settings {
 	int8_t  brightness;  /* CAM_LEVEL_MIN..MAX, 0 = neutral               */
 	int8_t  contrast;    /* CAM_LEVEL_MIN..MAX                            */
@@ -166,7 +167,7 @@ struct camera_settings {
 	int8_t  hue;         /* CAM_HUE_MIN..MAX, units of 30 deg             */
 	uint8_t awb;         /* enum camera_awb                              */
 	uint8_t effect;      /* enum camera_effect                          */
-	uint8_t flip;        /* enum camera_flip                            */
+	uint8_t flip;        /* enum camera_flip (default CAM_FLIP_FLIP, #68)  */
 	uint8_t zoom;        /* digital zoom factor: 1, 2, 4 or 8           */
 	uint8_t night;       /* 0 = off, 1 = night mode on                  */
 };

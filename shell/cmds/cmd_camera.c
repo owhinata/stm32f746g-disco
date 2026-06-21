@@ -789,7 +789,8 @@ CLI_SUBCMD_SET_CREATE(camera_set_subcmds,
 	CLI_CMD_ARG(flip,   NULL, "<none|mirror|flip|both>", cmd_set_flip, 2, 0),
 	CLI_CMD_ARG(zoom,   NULL, "<1|2|4|8>", cmd_set_zoom, 2, 0),
 	CLI_CMD_ARG(night,  NULL, "<on|off>", cmd_set_night, 2, 0),
-	CLI_CMD(default,    NULL, "reset all settings to neutral", cmd_set_default),
+	CLI_CMD(default,    NULL, "reset settings (neutral; flip defaults to flip, #68)",
+	        cmd_set_default),
 	CLI_SUBCMD_SET_END);
 
 /* ---- resolution / pixel format (issue #45) ------------------------------- */
