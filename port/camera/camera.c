@@ -1366,9 +1366,23 @@ int camera_get_mode(struct camera_mode *out)
 	else
 		out->fps_clamp = CAM_FPS_OK;
 	out->pclk_hz = sel.hz;
-	if (mode.hts != 0u && mode.vts != 0u)
-		out->fps_target_x10 = (uint16_t)((uint64_t)sel.hz * 10u /
-		                                 ((uint32_t)mode.hts * mode.vts));
+	/* fps target = effective PCLK / (HTS x effective VTS).  Use the VTS actually
+	   programmed in the sensor, not the fps-table base, so the report follows the
+	   exposure-aware VTS reclamp (night mode raises VTS -> lower fps).  Otherwise
+	   the field would mix a live PCLK with a base VTS and read 15.0 while the sensor
+	   runs at ~5 fps in night mode (#71).  Read it back when configured (the sensor
+	   is the source of truth); fall back to the base table value otherwise or on a
+	   read error. */
+	{
+		uint16_t vts = mode.vts;
+
+		if (info.configured)
+			(void)read_reg_u16(OV5640_TIMING_VTS_HIGH, OV5640_TIMING_VTS_LOW,
+			                   &vts);
+		if (mode.hts != 0u && vts != 0u)
+			out->fps_target_x10 = (uint16_t)((uint64_t)sel.hz * 10u /
+			                                 ((uint32_t)mode.hts * vts));
+	}
 	op_unlock();
 	return 0;
 }
