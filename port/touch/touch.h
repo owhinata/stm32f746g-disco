@@ -54,6 +54,12 @@ extern "C" {
 /* FT5336 reports at most 5 simultaneous touch points. */
 #define TOUCH_MAX_POINTS  5
 
+/* Panel pixel extent (RK043FN48H 480x272).  A reported point outside this is the
+   FT5336 "not touched" sentinel (all-ones, 0xFFF/0xFFF) -- touch_read() drops it
+   so callers never see a phantom point. */
+#define TOUCH_PANEL_W  480
+#define TOUCH_PANEL_H  272
+
 /**
  * One touch point.  Coordinates are PANEL PIXELS: x 0..479, y 0..271, origin
  * top-left, with the TS_SWAP_XY mapping this panel needs applied (the
@@ -98,8 +104,12 @@ int touch_probe(uint8_t *id);
 /**
  * Poll the FT5336 for the current touch points into @p st.  Reads the
  * touch-data-status register (count) and the per-point XH/XL/YH/YL bytes,
- * applies the TS_SWAP_XY mapping, and fills @p st.  Returns TOUCH_ERR_STATE if
- * the bus is down, TOUCH_ERR_HAL on an I2C error.
+ * applies the TS_SWAP_XY mapping, and fills @p st with the points that fall
+ * INSIDE the panel.  Out-of-panel points (the FT5336 all-ones 0xFFF/0xFFF "not
+ * touched" sentinel, which an idle or just-released controller can report with a
+ * nonzero status count) are dropped, so @p st.count is the number of REAL points
+ * (0 when idle).  Returns TOUCH_ERR_STATE if the bus is down, TOUCH_ERR_HAL on an
+ * I2C error.
  */
 int touch_read(struct touch_state *st);
 

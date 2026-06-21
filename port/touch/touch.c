@@ -317,9 +317,11 @@ int touch_read(struct touch_state *st)
 	if (count > TOUCH_MAX_POINTS)
 		count = TOUCH_MAX_POINTS;        /* clamp a bogus status */
 
+	uint8_t valid = 0;
+
 	for (uint8_t n = 0; n < count; n++) {
 		uint8_t  b[4];                   /* XH, XL, YH, YL       */
-		uint16_t rawx, rawy;
+		uint16_t rawx, rawy, x, y;
 
 		rc = touch_rd((uint8_t)(FT5336_P1_BASE + FT5336_P_STRIDE * n),
 		              b, 4);
@@ -334,15 +336,28 @@ int touch_read(struct touch_state *st)
 		   The FT5336 reports panel-pixel coordinates directly here (x 0..479,
 		   y 0..271) -- confirmed on hardware by corner taps -- so no scaling
 		   is applied. */
-		st->p[n].x     = rawy;
-		st->p[n].y     = rawx;
-		st->p[n].event = (uint8_t)((b[0] >> FT5336_EVT_SHIFT) &
-		                           FT5336_EVT_MASK);
-		st->p[n].id    = (uint8_t)((b[2] >> FT5336_ID_SHIFT) &
-		                           FT5336_ID_MASK);
+		x = rawy;
+		y = rawx;
+
+		/* Drop the FT5336 "not touched" sentinel: an idle or just-released
+		   controller (notably while left in trigger mode after the GUIX input
+		   path, #73) reports a nonzero TD_STATUS count with all-ones
+		   (0xFFF/0xFFF) out-of-panel coordinates.  Keep only points inside the
+		   panel -- the same validity rule the GUIX driver applies
+		   (guix_touch.c) -- so callers never see the phantom point. */
+		if (x >= TOUCH_PANEL_W || y >= TOUCH_PANEL_H)
+			continue;
+
+		st->p[valid].x     = x;
+		st->p[valid].y     = y;
+		st->p[valid].event = (uint8_t)((b[0] >> FT5336_EVT_SHIFT) &
+		                               FT5336_EVT_MASK);
+		st->p[valid].id    = (uint8_t)((b[2] >> FT5336_ID_SHIFT) &
+		                               FT5336_ID_MASK);
+		valid++;
 	}
 
-	st->count = count;
+	st->count = valid;
 	return TOUCH_OK;
 }
 

@@ -15,10 +15,32 @@
  * `touch read` polls every 100 ms and prints each active point's panel-pixel
  * coordinates (x 0..479, y 0..271; TS_SWAP_XY applied), event flag and ID tag.
  *
+ * While the GUIX UI runs it owns the FT5336 (its own I2C3 poller), so `touch
+ * probe`/`read` refuse until `gui stop` -- a concurrent shell poll would clash
+ * on the bus and surface the FT5336's all-ones "not touched" sentinel (#73).
+ *
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
+#include "guix_glue.h"
 #include "touch.h"
+
+/* While the GUIX camera UI runs it owns FT5336 input -- its touch thread
+   (port/guix/guix_touch.c) polls the same I2C3 at ~60 Hz.  A concurrent shell
+   poll would be a second unsynchronized I2C3 master (touch_lock only serializes
+   single transactions, not the TD_STATUS + per-point read sequence), so refuse
+   the bus-touching touch commands while gui owns the input -- symmetric to the
+   lcd draw guard (ltdc_gui_owns) and the camera CAM_ERR_BUSY gates (#73).  (The
+   FT5336 not-touched sentinel itself is dropped in touch_read(); this guard is
+   about bus ownership.)  `touch info` does no bus I/O and stays allowed. */
+static int touch_gui_owned(struct cli_instance *sh)
+{
+	if (guix_is_up()) {
+		cli_error(sh, "touch: input owned by gui; run 'gui stop' first\r\n");
+		return 1;
+	}
+	return 0;
+}
 
 static int cmd_touch_probe(struct cli_instance *sh, int argc, char **argv)
 {
@@ -27,6 +49,9 @@ static int cmd_touch_probe(struct cli_instance *sh, int argc, char **argv)
 
 	(void)argc;
 	(void)argv;
+
+	if (touch_gui_owned(sh))
+		return 1;
 
 	/* Bring the bus up lazily if init was skipped/failed at boot. */
 	if (!touch_is_up() && touch_init() != 0) {
@@ -65,6 +90,9 @@ static int cmd_touch_read(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
+
+	if (touch_gui_owned(sh))
+		return 1;
 
 	if (!touch_is_up()) {
 		cli_error(sh, "touch: I2C3 not initialized\r\n");
