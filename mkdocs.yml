@@ -52,6 +52,7 @@ nav:
   - アーキテクチャ:
       - architecture/layering.md
       - architecture/frame-pipeline.md
+      - architecture/ownership.md
   - ハードウェア:
       - hardware/board.md
       - hardware/qspi-flash.md
