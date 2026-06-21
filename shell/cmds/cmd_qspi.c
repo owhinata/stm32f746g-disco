@@ -6,7 +6,7 @@
  * @file    cmd_qspi.c
  * @brief   `qspi` shell command (issue #29): QSPI NOR flash bring-up/debug.
  *
- *   qspi id                read the JEDEC ID (expect 20 BA 18)
+ *   qspi probe             read the JEDEC ID (expect 20 BA 18)
  *   qspi info              geometry, clock, status/flag registers
  *   qspi read <addr> [len] hexdump flash content (indirect read, no 0x90000000)
  *   qspi erase <addr>      erase the 4 KB subsector containing <addr>   (danger)
@@ -82,7 +82,7 @@ static int parse_u32(const char *s, uint32_t *out)
 	return 0;
 }
 
-static int cmd_qspi_id(struct cli_instance *sh, int argc, char **argv)
+static int cmd_qspi_probe(struct cli_instance *sh, int argc, char **argv)
 {
 	uint8_t id[3];
 	int rc;
@@ -313,7 +313,7 @@ static int cmd_qspi_test(struct cli_instance *sh, int argc, char **argv)
 #endif /* CLI_ENABLE_DANGEROUS_CMDS */
 
 CLI_SUBCMD_SET_CREATE(qspi_subcmds,
-	CLI_CMD_ARG(id,    NULL, "read JEDEC ID",                cmd_qspi_id,    1, 0),
+	CLI_CMD_ARG(probe, NULL, "read JEDEC ID",                cmd_qspi_probe, 1, 0),
 	CLI_CMD_ARG(info,  NULL, "geometry/clock/status",        cmd_qspi_info,  1, 0),
 	CLI_CMD_ARG(read,  NULL, "hexdump <addr> [len]",         cmd_qspi_read,  2, 1),
 #if CLI_ENABLE_DANGEROUS_CMDS

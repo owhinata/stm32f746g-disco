@@ -13,7 +13,7 @@
  *   lcd clear           fill black
  *   lcd anim            bouncing rectangle (tear-free double-buffer demo)
  *   lcd blit            DMA2D M2M demo (copy the colour bars left->right half)
- *   lcd on | lcd off    display-enable + backlight
+ *   lcd on | lcd off    whole display on/off (backlight + LTDC scanout, #66)
  *
  * Phase 2 of #48 (#53): the LTDC is brought up at boot (src/main.c) with a
  * DMA2D-accelerated, tear-free double buffer.  Each drawing command paints the
@@ -103,7 +103,7 @@ static int lcd_ready(struct cli_instance *sh)
 		return 0;
 	}
 	if (ltdc_scanout_off()) {
-		cli_error(sh, "lcd: scanout disabled (run 'lcd enable')\r\n");
+		cli_error(sh, "lcd: scanout off (run 'lcd on')\r\n");
 		return 0;
 	}
 	return 1;
@@ -287,13 +287,23 @@ static int cmd_lcd_blit(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* `lcd on` / `lcd off`: the whole display.  on = LTDC scanout (LTDCEN) +
+   backlight; off = backlight off + scanout stopped (the LTDC stops reading the
+   framebuffer from SDRAM).  Unlike the draw commands these do NOT go through
+   lcd_ready() -- `lcd on` must work precisely when scanout is currently off.
+   While GUIX owns the display ltdc_set_scanout() is refused (GUIX drives scanout
+   itself), so the scanout change is best-effort and the backlight is toggled
+   unconditionally (harmless under GUIX, matching the pre-#72 behaviour). */
 static int cmd_lcd_on(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
-	if (!lcd_ready(sh))
+	if (!ltdc_is_up()) {
+		cli_error(sh, "lcd: display not initialized\r\n");
 		return 1;
-	ltdc_backlight(true);
+	}
+	ltdc_set_scanout(true);   /* LTDCEN + raise backlight; refused under GUIX */
+	ltdc_backlight(true);     /* ensure DISP/BL asserted even if scanout owned */
 	return 0;
 }
 
@@ -301,33 +311,12 @@ static int cmd_lcd_off(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
-	if (!lcd_ready(sh))
-		return 1;
-	ltdc_backlight(false);
-	return 0;
-}
-
-static int cmd_lcd_disable(struct cli_instance *sh, int argc, char **argv)
-{
-	(void)argc;
-	(void)argv;
-	if (ltdc_set_scanout(false) != LTDC_OK) {
-		cli_error(sh, "lcd: cannot disable scanout (display down or owned by gui)\r\n");
+	if (!ltdc_is_up()) {
+		cli_error(sh, "lcd: display not initialized\r\n");
 		return 1;
 	}
-	cli_print(sh, "lcd: scanout disabled -- LTDC stopped reading SDRAM\r\n");
-	return 0;
-}
-
-static int cmd_lcd_enable(struct cli_instance *sh, int argc, char **argv)
-{
-	(void)argc;
-	(void)argv;
-	if (ltdc_set_scanout(true) != LTDC_OK) {
-		cli_error(sh, "lcd: cannot enable scanout (display down or owned by gui)\r\n");
-		return 1;
-	}
-	cli_print(sh, "lcd: scanout enabled\r\n");
+	ltdc_backlight(false);    /* DISP/BL off */
+	ltdc_set_scanout(false);  /* stop SDRAM reads; left running under GUIX */
 	return 0;
 }
 
@@ -343,12 +332,10 @@ CLI_SUBCMD_SET_CREATE(lcd_subcmds,
 	        cmd_lcd_anim),
 	CLI_CMD(blit, NULL, "DMA2D M2M demo (copy bars left->right half)",
 	        cmd_lcd_blit),
-	CLI_CMD(on, NULL, "display-enable + backlight on", cmd_lcd_on),
-	CLI_CMD(off, NULL, "display-enable + backlight off", cmd_lcd_off),
-	CLI_CMD(enable, NULL, "start LTDC scanout (resume SDRAM reads)",
-	        cmd_lcd_enable),
-	CLI_CMD(disable, NULL, "stop LTDC scanout (LTDC stops reading SDRAM)",
-	        cmd_lcd_disable),
+	CLI_CMD(on, NULL, "display on (backlight + scanout; resume SDRAM reads)",
+	        cmd_lcd_on),
+	CLI_CMD(off, NULL, "display off (backlight + scanout; free SDRAM bandwidth)",
+	        cmd_lcd_off),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(lcd, lcd_subcmds,

@@ -1912,7 +1912,7 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 
 	/* Program the effective PCLK for the fps knob + current scanout state (#67):
 	   30 fps (48 MHz) only takes effect here when the LTDC is not scanning out, so
-	   a plain `camera stream start` after `lcd disable` runs at 30 fps while one
+	   a plain `camera stream start` after `lcd off` runs at 30 fps while one
 	   started with the display on (or a GUIX preview) clamps to 15 fps. */
 	rc = apply_effective_pclk_locked();
 	if (rc != 0)

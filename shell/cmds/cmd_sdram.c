@@ -219,11 +219,11 @@ restore:
 	/* Single postcondition (#65): if we suspended an active scanout, the test
 	   left ltdc_fb full of test patterns -- repaint both buffers black and
 	   re-enable scanout (back to the prior ON state, no garbage shown).  If
-	   scanout was already off (lcd disable), leave it untouched. */
+	   scanout was already off (lcd off), leave it untouched. */
 	if (was_active) {
 		ltdc_clear();
 		if (ltdc_set_scanout(true) != LTDC_OK)
-			cli_warn(sh, "sdram: LTDC scanout restore failed; run 'lcd enable'\r\n");
+			cli_warn(sh, "sdram: LTDC scanout restore failed; run 'lcd on'\r\n");
 	}
 	return ret;
 }

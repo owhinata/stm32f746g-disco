@@ -122,22 +122,21 @@ lcd grad            横グラデ（黒→白、ピクセルクロック検証）
 lcd clear           黒
 lcd anim            跳ね回る矩形（tear-free ダブルバッファのデモ。Ctrl+C で停止）
 lcd blit            DMA2D M2M デモ（カラーバーの左半分を右半分へコピー）
-lcd on | lcd off    表示有効化 + バックライト（DISP/BL GPIO のみ。LTDC は走り続ける）
-lcd enable | disable  LTDC スキャンアウトの開始/停止（#66、下記）
+lcd on | lcd off    表示全体の ON/OFF（バックライト + LTDC スキャンアウト）。`off` は SDRAM 帯域も空ける（#66、下記）
 ```
 
 描画系コマンド（fill/bar/grad/clear/anim/blit）は **back に描画してから `ltdc_flip()` で present**する（`ltdc_lock_frame()`/`ltdc_unlock_frame()` で 1 フレームを atomic に）。`lcd anim` は `ltdc_flip()` が VSYNC reload まで block するので**自然にフレームレートで律速**され、追加 sleep 不要（毎フレーム Ctrl+C を polling）。
 
-### `lcd disable` / `lcd enable`（LTDC スキャンアウト停止/再開、#66）
+### `lcd off` / `lcd on`（LTDC スキャンアウト停止/再開、#66）
 
-`lcd off` は **DISP/BL GPIO を落として消灯するだけ**で **LTDC は毎フレーム SDRAM をリードし続ける**。`lcd disable` は `LTDC_GCR.LTDCEN` をクリアして**スキャンアウト自体を停止**（SDRAM リードが止まる）、`lcd enable` で再開する（layer/timing/front 面はそのまま）。GUIX 所有中（`gui` 稼働中）と faulted/未初期化時は拒否。停止中は flip/描画も拒否（VBR 待ちで fault しないため）。
+`lcd off` は **表示全体**を OFF する — バックライト**と** LTDC スキャンアウト。スキャンアウトを落とすと `LTDC_GCR.LTDCEN` がクリアされコントローラの **SDRAM フレームバッファリードが停止**する（スキャンしないパネルはゴミ表示になるのでバックライトも park）。`lcd on` で両方を再開する（layer/timing/front 面はそのまま）。つまり `lcd off` は LTDC の連続リードが消費する **SDRAM 帯域を空ける**手段でもある（例: 30fps の `camera` キャプチャ、#67）。スキャンアウト側は best-effort で、GUIX 所有中（`gui` 稼働中）と faulted/未初期化時はスキップ。停止中は flip/描画も拒否（VBR 待ちで fault しないため）。
 
 用途は **帯域/電力制御**と **#59 の FE 主因の切り分け計測**。実機計測（plain stream, QVGA, 4.8MHz, 14.9fps）:
 
 | | dma fe/s |
 |---|---|
 | LTDC ON | 1297 |
-| **LTDC OFF**（`lcd disable`） | **0** |
+| **LTDC OFF**（`lcd off`） | **0** |
 
 → **DCMI streaming の FE は 100% が LTDC 連続リードとの SDRAM 競合**で、スキャンアウトを止めると **完全にゼロ**。DCMI→SDRAM 書込み単独（リフレッシュ/行管理込み）では FE は出ない＝**床は無い**。よって残 FE を 0 近傍へ追い込むには **DCMI を優先する FMC/AXI アービトレーション**が原理的に有効（#59 で deferred）。
 

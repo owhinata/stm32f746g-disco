@@ -86,7 +86,7 @@ static bool         ltdc_up;          /* init succeeded                       */
 static bool         ltdc_tried;       /* init ran (idempotence latch)         */
 static bool         ltdc_fault;       /* reload stuck -> display latched down */
 static bool         ltdc_gui_owned;   /* GUIX owns the display (#55)          */
-static bool         ltdc_disabled;    /* LTDC scanout stopped (lcd disable, #66) */
+static bool         ltdc_disabled;    /* LTDC scanout stopped (lcd off, #66) */
 static TX_SEMAPHORE ltdc_reload_sem;  /* posted by the reload-ready IRQ       */
 static TX_MUTEX     ltdc_lock;        /* serializes drawing + flip            */
 
@@ -138,7 +138,7 @@ bool ltdc_gui_take(bool on)
 	ltdc_lock_frame();
 	/* Re-check under the lock: fault and the scanout-disabled flag (#66) are
 	   both set under ltdc_lock, so the decision cannot race a concurrent flip
-	   or lcd disable.  GUIX cannot run/flip with scanout off. */
+	   or lcd off.  GUIX cannot run/flip with scanout off. */
 	if (ltdc_fault || (on && ltdc_disabled)) {
 		ltdc_unlock_frame();
 		return false;

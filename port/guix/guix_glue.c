@@ -123,7 +123,7 @@ int guix_start(void)
 		return GUIX_ERR_STATE;
 	}
 	if (ltdc_scanout_off()) {           /* (#66) GUIX needs scanout running */
-		LOG_ERR("LTDC scanout disabled -- run 'lcd enable' before starting GUIX");
+		LOG_ERR("LTDC scanout disabled -- run 'lcd on' before starting GUIX");
 		return GUIX_ERR_STATE;
 	}
 	if (guix_active)

@@ -195,7 +195,7 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		if (cm.fps_sel == 30u && cm.fps_eff == 15u) {
 			if (cm.fps_clamp == CAM_FPS_CLAMP_LTDC)
 				cli_print(sh, "  (clamped to 15: lcd scanout active "
-				          "-- `lcd disable` for 30fps)");
+				          "-- `lcd off` for 30fps)");
 			else
 				cli_print(sh, "  (24MHz: snapshot-only mode)");
 		}
@@ -610,6 +610,28 @@ static int cmd_camera_send(struct cli_instance *sh, int argc, char **argv)
 	return xfer_send_source(sh, &src);
 }
 
+/* `camera on`: power up the module and bring the sensor to a ready state.  The
+   OV5640 cannot be powered without the I2C bring-up (there is no power-only
+   state: capture/stream lazily power-cycle whenever the module is not yet up),
+   so `on` shares the probe path -- it just powers on without reporting the chip
+   ID (that is `camera probe`'s job).  Fails like probe if the module is absent. */
+static int cmd_camera_on(struct cli_instance *sh, int argc, char **argv)
+{
+	int rc;
+
+	(void)argc;
+	(void)argv;
+
+	cli_print(sh, "camera: powering on (takes ~1s) ...\r\n");
+	rc = camera_probe(NULL);
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+		return 1;
+	}
+	cli_print(sh, "camera: on\r\n");
+	return 0;
+}
+
 static int cmd_camera_off(struct cli_instance *sh, int argc, char **argv)
 {
 	int rc;
@@ -830,7 +852,7 @@ static int cmd_camera_format(struct cli_instance *sh, int argc, char **argv)
 /* ---- frame rate (issue #67) ---------------------------------------------- */
 /* `camera fps <15|30>`: 15 = 24 MHz PCLK, 30 = 48 MHz.  30 fps only takes effect
    for a small mode while the LTDC is not scanning out (otherwise it is clamped to
-   15 fps so the 48 MHz DCMI burst does not overrun the SDRAM); use `lcd disable`. */
+   15 fps so the 48 MHz DCMI burst does not overrun the SDRAM); use `lcd off`. */
 static int cmd_camera_fps(struct cli_instance *sh, int argc, char **argv)
 {
 	int n;
@@ -889,7 +911,7 @@ static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
 			}
 			if (m.fps_sel == 30u && m.fps_clamp == CAM_FPS_CLAMP_LTDC)
 				cli_print(sh, "camera: note: 30fps clamped to 15 (lcd scanout "
-				          "active; `lcd disable` for 30fps)\r\n");
+				          "active; `lcd off` for 30fps)\r\n");
 		}
 	}
 
@@ -987,13 +1009,15 @@ CLI_SUBCMD_SET_CREATE(camera_stream_subcmds,
 
 CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD(probe, NULL, "power-cycle + read the OV5640 chip ID", cmd_camera_probe),
+	CLI_CMD(on,    NULL, "power on the camera module (bring-up, no ID report)",
+	        cmd_camera_on),
 	CLI_CMD(info,  NULL, "driver / sensor state", cmd_camera_info),
 	CLI_CMD_ARG(res, NULL, "set resolution <qqvga|qvga|480x272|vga|wvga>",
 	            cmd_camera_res, 2, 0),
 	CLI_CMD_ARG(format, NULL,
 	            "set pixel format <rgb565|yuv422|y8|jpeg> (jpeg: snapshot <=VGA)",
 	            cmd_camera_format, 2, 0),
-	CLI_CMD_ARG(fps, NULL, "set frame rate <15|30> (30 needs `lcd disable`)",
+	CLI_CMD_ARG(fps, NULL, "set frame rate <15|30> (30 needs `lcd off`)",
 	            cmd_camera_fps, 2, 0),
 	CLI_CMD_ARG(capture, NULL, "snapshot the current mode + stats ('test' = colorbar)",
 	            cmd_camera_capture, 1, 1),

@@ -92,7 +92,7 @@ enum camera_format {
 enum camera_fps_clamp {
 	CAM_FPS_OK = 0,        /* selected fps is in effect (fps_eff == fps_sel)  */
 	CAM_FPS_CLAMP_SIZE,    /* clamped to 15: res is VGA/WVGA (snapshot-only)  */
-	CAM_FPS_CLAMP_LTDC,    /* clamped to 15: LTDC scanout active (lcd enable) */
+	CAM_FPS_CLAMP_LTDC,    /* clamped to 15: LTDC scanout active (lcd on) */
 };
 
 /**
@@ -219,7 +219,7 @@ int camera_set_format(enum camera_res res, enum camera_format fmt);
  * a stream or GUIX preview owns the DCMI.  30 fps takes effect only for a small
  * streamable mode (QQVGA/QVGA/480x272) while the LTDC is not scanning out;
  * otherwise the sensor is clamped to 24 MHz so the 48 MHz DCMI burst never
- * overruns the SDRAM the LTDC also reads (use `lcd disable` for 30 fps).  Returns
+ * overruns the SDRAM the LTDC also reads (use `lcd off` for 30 fps).  Returns
  * 0 or a negative CAM_ERR_* (CAM_ERR_PARAM for an fps other than 15/30).
  */
 int camera_set_fps(unsigned fps);

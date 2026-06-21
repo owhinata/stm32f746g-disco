@@ -50,7 +50,7 @@ The VCR (volatile configuration register) reverts to its default on a power cycl
 ## The `qspi` shell command
 
 ```
-qspi id                read the JEDEC ID (expect 20 BA 18)
+qspi probe             read the JEDEC ID (expect 20 BA 18)
 qspi info              geometry / clock / status
 qspi read <addr> [len] hexdump flash content (max 256 B)
 qspi erase <addr>      erase one 4 KB subsector (must be 4 KB aligned; dangerous)
@@ -65,7 +65,7 @@ qspi test <addr>       destructive self-test (dangerous)
 ## Verification
 
 ```
-sh> qspi id
+sh> qspi probe
 JEDEC ID: 20 BA 18  (Micron N25Q128A/MT25QL128, 16 MiB)
 sh> qspi read 0 64        # factory demo data or FF
 sh> qspi test 0xFF0000    # scratch area near the end

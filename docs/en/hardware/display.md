@@ -122,22 +122,21 @@ lcd grad            horizontal gradient (black→white, pixel-clock check)
 lcd clear           fill black
 lcd anim            bouncing rectangle (tear-free double-buffer demo; Ctrl+C to stop)
 lcd blit            DMA2D M2M demo (copy the colour bars' left half over the right)
-lcd on | lcd off    display enable + backlight (DISP/BL GPIO only; LTDC keeps running)
-lcd enable | disable  start/stop LTDC scanout (#66, below)
+lcd on | lcd off    whole display on/off (backlight + LTDC scanout); `off` frees SDRAM bandwidth (#66, below)
 ```
 
 The drawing commands (fill/bar/grad/clear/anim/blit) **draw into the back buffer then present with `ltdc_flip()`** (one atomic frame under `ltdc_lock_frame()`/`ltdc_unlock_frame()`). `lcd anim` needs no explicit sleep — `ltdc_flip()` blocks until the VSYNC reload, so the loop is **naturally paced to the frame rate** (it polls Ctrl+C once per frame).
 
-### `lcd disable` / `lcd enable` (stop/start LTDC scanout, #66)
+### `lcd off` / `lcd on` (stop/start LTDC scanout, #66)
 
-`lcd off` only drops the DISP/BL GPIOs (panel blank) while the **LTDC keeps reading the framebuffer from SDRAM every frame**. `lcd disable` clears `LTDC_GCR.LTDCEN` to **stop scanout itself** (the SDRAM reads stop); `lcd enable` resumes it (layer/timing/front buffer are retained). Refused while GUIX owns the display (`gui` running) and while the LTDC is down/faulted; while disabled, flips/draws are refused too (so no VBR-timeout fault).
+`lcd off` turns the **whole display** off — backlight **and** LTDC scanout. Dropping scanout clears `LTDC_GCR.LTDCEN` so the controller **stops reading the framebuffer from SDRAM** (the backlight is parked too, since an un-scanned panel would just show garbage); `lcd on` re-enables both (layer/timing/front buffer are retained). So `lcd off` is also how you **free the SDRAM bandwidth** the LTDC's continuous read consumes — e.g. for a 30 fps `camera` capture (#67). The scanout half is best-effort: it is skipped while GUIX owns the display (`gui` running) or the LTDC is down/faulted; while scanout is off, flips/draws are refused too (so no VBR-timeout fault).
 
 Uses: **bandwidth/power control** and **isolating the FE root cause for #59**. Measured (plain stream, QVGA, 4.8 MHz, 14.9 fps):
 
 | | dma fe/s |
 |---|---|
 | LTDC ON | 1297 |
-| **LTDC OFF** (`lcd disable`) | **0** |
+| **LTDC OFF** (`lcd off`) | **0** |
 
 → The DCMI streaming FE is **100% SDRAM contention with the LTDC continuous read** — stop scanout and it drops to **exactly zero**. The DCMI→SDRAM write path alone (refresh / row management included) produces no FE, i.e. **there is no floor**. So driving the residual FE toward 0 fundamentally needs **FMC/AXI arbitration that prioritizes the DCMI** (deferred in #59).
 

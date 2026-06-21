@@ -88,7 +88,7 @@ IRQ-off, so the prio-5 IWDG petter keeps refreshing).
 !!! note "What tick-guard guarantees"
     Tick-guard removes only **SysTick-ISR** contamination (`SysTick_Handler → HAL_IncTick`). Other IRQs (USART,
     DMA, DCMI completion), the camera producer wake, and LTDC/FMC bus-master contention are NOT detectable via
-    the tick; they are merely reduced by the min and by running with **`camera stream stop` / `lcd disable`**.
+    the tick; they are merely reduced by the min and by running with **`camera stream stop` / `lcd off`**.
     It does not guarantee a fully uncontended run.
 
 ### DCE / line-reuse defeat

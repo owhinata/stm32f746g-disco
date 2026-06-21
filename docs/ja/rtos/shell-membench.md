@@ -85,7 +85,7 @@ CYCCNTENA bit0 / DEMCR.TRCENA bit24）。**ベンチ中は core が sleep しな
 !!! note "tick-guard が保証する範囲"
     tick-guard が除去できるのは **SysTick ISR の混入のみ**（`SysTick_Handler → HAL_IncTick`）。USART/DMA/DCMI
     完了 IRQ・camera producer wake・LTDC/FMC バスマスタ競合は tick 進行で検出できない。これらは min と
-    **「計測中は `camera stream stop` / `lcd disable`」** で軽減する。「完全 uncontended を保証」するものではない。
+    **「計測中は `camera stream stop` / `lcd off`」** で軽減する。「完全 uncontended を保証」するものではない。
 
 ### DCE / line 再利用対策
 
