@@ -108,10 +108,28 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
 	*pEnd = p;
 }
 
+/* Undo the 14-byte Ethernet header this driver prepended for TX (issue #79).
+ * _nx_packet_transmit_release() only rewinds NetX's own headers (it adds back
+ * nx_packet_ip_header_length for a retained TCP packet), so the L2 header is the
+ * driver's responsibility to strip.  Without this, a retransmitted TCP packet's
+ * prepend_ptr stays 14 bytes (2 mod 4) low, and _nx_ip_header_add() then writes
+ * the re-added IP header words at an unaligned address -> UNALIGNED UsageFault.
+ * Only the head packet of a chain carries the Ethernet header. */
+static void eth_tx_unprepend(NX_PACKET *p)
+{
+	p->nx_packet_prepend_ptr += ETH_HDR_SIZE;
+	p->nx_packet_length      -= ETH_HDR_SIZE;
+}
+
 void HAL_ETH_TxFreeCallback(uint32_t *buff)
 {
-	/* buff == ETH_TxPacketConfig.pData == the transmitted NX_PACKET. */
-	_nx_packet_transmit_release((NX_PACKET *)(void *)buff);
+	/* buff == ETH_TxPacketConfig.pData == the transmitted NX_PACKET.  The DMA has
+	   finished with the header bytes; strip the L2 header from the metadata before
+	   release so a retained TCP packet rewinds to its TCP header for retransmit. */
+	NX_PACKET *p = (NX_PACKET *)(void *)buff;
+
+	eth_tx_unprepend(p);
+	_nx_packet_transmit_release(p);
 	g.st.tx_ok++;
 }
 
@@ -243,6 +261,7 @@ static void eth_tx(NX_IP_DRIVER *req)
 		uint8_t *d = tx_coalesce;
 		if (pkt->nx_packet_length > sizeof tx_coalesce) {
 			g.st.tx_drop++;
+			eth_tx_unprepend(pkt);          /* #79: restore before release */
 			_nx_packet_transmit_release(pkt);
 			return;
 		}
@@ -267,6 +286,7 @@ static void eth_tx(NX_IP_DRIVER *req)
 
 	if (st != HAL_OK) {
 		g.st.tx_drop++;
+		eth_tx_unprepend(pkt);              /* #79: restore before release */
 		_nx_packet_transmit_release(pkt);   /* TxFree won't run on a failed send */
 	}
 	/* success: the packet is released later by HAL_ETH_TxFreeCallback. */
