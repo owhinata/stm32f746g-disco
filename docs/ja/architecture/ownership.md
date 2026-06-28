@@ -85,6 +85,13 @@ Copyright (c) 2026 ThreadX Shell Project
   active)` と表示）を返す。GUIX preview 自体が stream なので `cam_stream_active` を
   立てる。read-only 経路（`info`/`save`/`send`/`stream stats`）はカメラロックのみ取り
   常に許可。
+- **NET-MJPEG**（#49 P5）— `net mjpeg start` はもう一人の `cam_ext_sink` 所有者
+  （JPEG モードの DCMI 所有）として CAM-STREAM 列と同等に振る舞う。`camera_mjpeg_start`
+  は `stream_start_locked` 経由で同じ所有権ゲートを通るので、GUIX preview / `camera
+  stream` が DCMI を握っていれば `CAM_ERR_BUSY`。逆に MJPEG 稼働中は `gui start` /
+  `camera stream start` / `camera set` 等が BUSY になる。単一所有モデルを 1 ビットも
+  変えずに排他が成立する（`port/netxduo/nx_mjpeg.c` の eth_sink は同期 copy sink ゆえ
+  in-flight 0、producer の async teardown もそのまま安全）。
 - **Touch** — タッチの所有権フラグは無い（`guix_is_up()` が代理）。shell は 2 段で守る:
   (1) `touch_read()`（`port/touch/touch.c`）が FT5336 の全 1「タッチ無し」センチネル
   — idle や直後リリースのコントローラが *非ゼロ* の status count とともに報告する

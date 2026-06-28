@@ -126,6 +126,41 @@ VCP shell と同時稼働。認証なし（LAN 内前提）。
   フォールバック）。shell の `cli_print` 経由の出力は TCP に正しく出るので、コマンドの通常出力は
   telnet に届く。
 
+## MJPEG-over-HTTP カメラ配信（P5）
+
+OV5640 のハードウェア JPEG フレームを **`multipart/x-mixed-replace`** で PC ブラウザへ
+ストリーム配信する（`port/netxduo/nx_mjpeg.c`）。Epic #49 の **P5**、カメラ frame pipeline
+（#46/#47）の **eth_sink**（30fps JPEG パスの本命ネット消費先）。
+
+```
+net mjpeg start [res]   # camera を JPEG で所有 + :80 listen（res 既定 qvga、qqvga|qvga|480x272|vga）
+net mjpeg stop          # 配信停止・camera 解放
+net mjpeg stats         # client 接続 / 配信 frames・bytes / drop / error
+```
+
+ブラウザで `http://<board-ip>/` を開くとライブ映像が見える。N=1 単一クライアント。
+
+- **明示コマンド方式**: `net mjpeg start` が camera を JPEG モードで所有し続け（client の有無に
+  関わらず）、:80 で listen。GUIX preview / `camera stream` が DCMI を所有中は `CAM_ERR_BUSY` で
+  拒否（`gui stop` 等が必要）。所有権は既存の単一所有モデル（`cam_ext_sink`）で、camera stream /
+  GUI と自動的に排他（#73）。
+- **eth_sink = 同期 copy sink**: frame pipeline の consume（producer スレッド文脈）は重い HTTP 送信を
+  せず、JPEG フレームを private バッファ（`.sdram.eth`、JPEG budget=256KB）へ memcpy して**即 put**
+  （in-flight 常に 0＝GUIX sink と同じ同期型）。これで camera の async teardown（DCMI overrun）が
+  そのまま安全に回る。HTTP サーバスレッドが private バッファから送信。`buf_busy` フラグで 1-deep
+  ハンドオフし、送信中の新フレームは drop（遅い client に自然 back-pressure）。
+- **HTTP サーバスレッド（prio14）**: listen→accept→GET 読み飛ばし→multipart ヘッダ→フレーム毎に
+  `--boundary` + `Content-Type: image/jpeg` + `Content-Length` + JPEG + `\r\n` を送信。切断で relisten、
+  `stop` で park（nx_echo と同型、accept/送信は bounded wait）。socket create+listen はスレッド内
+  （thread-only NetX API）。
+- **★MSS チャンク送信**: `nx_tcp_socket_send` は payload>MSS で内部分割し pool を二重消費するため、
+  JPEG を **MSS（=min(1400, peer MSS)）単位**に分割して `nx_packet_allocate`+`data_append`+`send`。
+  `transmit_configure` で TX queue を 8 に制限し共用 eth_pool を保護。フレーム途中で詰まると
+  multipart が壊れるので、ドロップはフレーム先頭で判定する。
+- **帯域**: 単一 16-bit FMC SDRAM を DCMI write + LTDC scanout + DMA2D + **ETH DMA** + memcpy が
+  競合する。JPEG は圧縮済みで ETH read 帯域は小さいが、`net mjpeg stats` と `camera stream stats`
+  （dma fe/s, ovr）で実測して確認する。
+
 ## 参考
 
 - RM0385 §38（Ethernet）/ §2.1.10（ETH DMA バス）

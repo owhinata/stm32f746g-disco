@@ -21,6 +21,7 @@
 #include "eth_link.h"
 #include "nx_glue.h"
 #include "nx_echo.h"
+#include "nx_mjpeg.h"
 
 #include <stdint.h>
 
@@ -186,6 +187,7 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 
 	if (nx_net_is_up()) {
 		struct nx_net_info ni;
+		struct nx_mjpeg_stats ms;
 		unsigned ep, ec, eb;
 
 		if (nx_net_info_get(&ni) == NXG_OK)
@@ -193,6 +195,10 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 		if (nx_echo_status(&ep, &ec, &eb))
 			cli_print(sh, "echo:  listening on :%u (%u conns, %u bytes)\r\n",
 			          ep, ec, eb);
+		if (nx_mjpeg_stats_get(&ms))
+			cli_print(sh, "mjpeg: http://board:80 (%s, %lu frames)\r\n",
+			          ms.client ? "streaming" : "idle",
+			          (unsigned long)ms.sent_frames);
 	}
 	return 0;
 }
@@ -372,6 +378,111 @@ CLI_SUBCMD_SET_CREATE(net_echo_subcmds,
 	CLI_CMD(stop, NULL, "stop the TCP echo server", cmd_net_echo_stop),
 	CLI_SUBCMD_SET_END);
 
+/* ---- MJPEG-over-HTTP camera streaming (#49 P5) --------------------------- */
+
+static const struct {
+	const char     *name;
+	enum camera_res res;
+} mjpeg_res_names[] = {
+	{ "qqvga", CAM_RES_QQVGA }, { "qvga", CAM_RES_QVGA },
+	{ "480x272", CAM_RES_480x272 }, { "vga", CAM_RES_VGA },
+};
+
+static int cmd_net_mjpeg_start(struct cli_instance *sh, int argc, char **argv)
+{
+	enum camera_res res = CAM_RES_QVGA;     /* default */
+	int rc;
+
+	if (!net_ip_ready(sh))
+		return 1;
+	if (argc >= 2) {
+		size_t i;
+
+		for (i = 0; i < sizeof mjpeg_res_names / sizeof mjpeg_res_names[0]; i++) {
+			if (strcmp(argv[1], mjpeg_res_names[i].name) == 0) {
+				res = mjpeg_res_names[i].res;
+				break;
+			}
+		}
+		if (i == sizeof mjpeg_res_names / sizeof mjpeg_res_names[0]) {
+			cli_error(sh, "net: bad resolution '%s' "
+			          "(qqvga|qvga|480x272|vga)\r\n", argv[1]);
+			return 1;
+		}
+	}
+	rc = nx_mjpeg_start(res);
+	if (rc == -2) {
+		cli_error(sh, "net: mjpeg already running\r\n");
+		return 1;
+	}
+	if (rc == CAM_ERR_BUSY) {
+		cli_error(sh, "net: camera busy (owned by gui preview or stream); "
+		          "stop it first\r\n");
+		return 1;
+	}
+	if (rc != 0) {
+		cli_error(sh, "net: mjpeg start failed (%d)\r\n", rc);
+		return 1;
+	}
+	cli_print(sh, "net: mjpeg streaming at http://<board-ip>:80/ (%s)\r\n",
+	          argc >= 2 ? argv[1] : "qvga");
+	return 0;
+}
+
+static int cmd_net_mjpeg_stop(struct cli_instance *sh, int argc, char **argv)
+{
+	int rc;
+
+	(void)argc;
+	(void)argv;
+	if (!net_ready(sh))
+		return 1;
+	rc = nx_mjpeg_stop();
+	if (rc == -1) {
+		cli_error(sh, "net: mjpeg not running\r\n");
+		return 1;
+	}
+	if (rc != 0) {
+		cli_error(sh, "net: mjpeg stop timed out\r\n");
+		return 1;
+	}
+	cli_print(sh, "net: mjpeg stopped\r\n");
+	return 0;
+}
+
+static int cmd_net_mjpeg_stats(struct cli_instance *sh, int argc, char **argv)
+{
+	struct nx_mjpeg_stats st;
+
+	(void)argc;
+	(void)argv;
+	if (!net_ready(sh))
+		return 1;
+	if (!nx_mjpeg_stats_get(&st)) {
+		cli_print(sh, "mjpeg: not running\r\n");
+		return 0;
+	}
+	cli_print(sh, "state:     %s\r\n", st.client ? "streaming" : "idle (no client)");
+	cli_print(sh, "conns:     %lu\r\n", (unsigned long)st.conns);
+	cli_print(sh, "sent:      %lu frames, %lu bytes\r\n",
+	          (unsigned long)st.sent_frames, (unsigned long)st.sent_bytes);
+	cli_print(sh, "dropped:   busy %lu, oversized %lu\r\n",
+	          (unsigned long)st.drop_busy, (unsigned long)st.drop_oversized);
+	cli_print(sh, "errors:    send %lu, pool %lu\r\n",
+	          (unsigned long)st.send_err, (unsigned long)st.pool_fail);
+	return 0;
+}
+
+CLI_SUBCMD_SET_CREATE(net_mjpeg_subcmds,
+	CLI_CMD_ARG(start, NULL,
+	            "start MJPEG-over-HTTP on :80 [res] (qqvga|qvga|480x272|vga, "
+	            "default qvga)", cmd_net_mjpeg_start, 1, 1),
+	CLI_CMD(stop, NULL, "stop MJPEG streaming and release the camera",
+	        cmd_net_mjpeg_stop),
+	CLI_CMD(stats, NULL, "MJPEG client / frame / drop counters",
+	        cmd_net_mjpeg_stats),
+	CLI_SUBCMD_SET_END);
+
 CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_CMD(info, NULL, "MAC / PHY id / link + IP / mask / gateway", cmd_net_info),
 	CLI_CMD(link, NULL, "restart auto-negotiation and report link state",
@@ -380,6 +491,8 @@ CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_CMD_ARG(ip, NULL, "set static <a.b.c.d/mask> [gw]", cmd_net_ip, 2, 1),
 	CLI_CMD(dhcp, NULL, "(re)acquire an address via DHCP", cmd_net_dhcp),
 	CLI_CMD(echo, net_echo_subcmds, "TCP echo server (start/stop)", NULL),
+	CLI_CMD(mjpeg, net_mjpeg_subcmds,
+	        "MJPEG-over-HTTP camera stream (start/stop/stats)", NULL),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(net, net_subcmds,

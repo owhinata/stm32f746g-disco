@@ -314,6 +314,17 @@ struct frame_desc;       /* svc/frame.h          */
 int camera_preview_start(struct frame_sink *s, enum camera_res res);
 
 /**
+ * Start streaming in JPEG at resolution @p res and attach @p s as the external
+ * push sink, for the MJPEG-over-HTTP server (#49 P5).  Like camera_preview_start
+ * but JPEG (snapshot-loop, res <= CAM_RES_VGA) instead of RGB565: the sink then
+ * receives compressed frames from frame_pipeline_publish(FRAME_FMT_JPEG).  Takes
+ * the same single DCMI ownership -- refused (CAM_ERR_BUSY) if a GUIX preview or a
+ * plain `camera stream` already owns the camera.  Stop with camera_preview_stop()
+ * (sink-agnostic).  Returns 0 or a negative CAM_ERR_*.
+ */
+int camera_mjpeg_start(struct frame_sink *s, enum camera_res res);
+
+/**
  * Release preview ownership taken by camera_preview_start(@p s): detach @p s and
  * stop the stream -- but ONLY while @p s is still the owner.  If an async
  * teardown already released ownership, this is a no-op (it must not stop a

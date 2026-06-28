@@ -150,6 +150,47 @@ concurrent with the VCP shell. No authentication (LAN-only).
   the `_write` fallback; the shell's `cli_print` output goes to TCP correctly, so
   normal command output reaches telnet.
 
+## MJPEG-over-HTTP camera streaming (P5)
+
+Streams the OV5640 hardware-JPEG frames to a PC browser as
+**`multipart/x-mixed-replace`** (`port/netxduo/nx_mjpeg.c`). Epic #49 **P5**: the
+camera frame pipeline's (#46/#47) **eth_sink** -- the real network consumer of
+the 30 fps JPEG path.
+
+```
+net mjpeg start [res]   # own the camera in JPEG + listen on :80 (res default qvga; qqvga|qvga|480x272|vga)
+net mjpeg stop          # stop streaming, release the camera
+net mjpeg stats         # client / sent frames+bytes / drops / errors
+```
+
+Open `http://<board-ip>/` in a browser for the live stream. One client at a time (N=1).
+
+- **Explicit command**: `net mjpeg start` keeps the camera owned in JPEG (whether
+  or not a client is connected) and listens on :80. Refused with `CAM_ERR_BUSY`
+  while a GUIX preview / `camera stream` owns the DCMI (stop it first). Ownership
+  is the existing single-owner model (`cam_ext_sink`), auto-exclusive with the
+  camera stream / GUI (#73).
+- **eth_sink = synchronous copy sink**: the pipeline consume() (producer-thread
+  context) does no heavy HTTP send -- it memcpy's the JPEG into a private buffer
+  (`.sdram.eth`, JPEG budget = 256 KB) and puts the pin immediately (in-flight is
+  always 0, like the GUIX sink), so the camera's async teardown (DCMI overrun)
+  stays correct. The HTTP server thread sends from the private buffer. A `buf_busy`
+  flag gives a one-deep handoff; frames arriving mid-send are dropped (natural
+  back-pressure to a slow client).
+- **HTTP server thread (prio 14)**: listen -> accept -> skip GET -> multipart
+  header -> per frame `--boundary` + `Content-Type: image/jpeg` + `Content-Length`
+  + JPEG + `\r\n`. Relisten on disconnect; park on `stop` (the nx_echo idiom,
+  bounded accept/send). Socket create + listen run in the thread (thread-only NetX).
+- **MSS chunking**: `nx_tcp_socket_send` fragments a >MSS payload internally
+  (double-spending the pool), so the JPEG is sent in MSS (= min(1400, peer MSS))
+  chunks via `nx_packet_allocate` + `data_append` + `send`. `transmit_configure`
+  caps the TX queue at 8 to protect the shared eth_pool. A frame is dropped at its
+  start (not mid-frame) to keep the multipart stream intact.
+- **Bandwidth**: the single 16-bit FMC SDRAM is shared by DCMI write + LTDC
+  scanout + DMA2D + **ETH DMA** + the memcpy. JPEG is compressed so the ETH read
+  bandwidth is small, but verify with `net mjpeg stats` + `camera stream stats`
+  (dma fe/s, ovr).
+
 ## References
 
 - RM0385 §38 (Ethernet) / §2.1.10 (ETH DMA bus)

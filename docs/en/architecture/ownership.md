@@ -90,6 +90,15 @@ state/frame only.
   `cam_stream_active` or `cam_ext_sink` is set. A GUIX preview is itself a
   stream, so it sets `cam_stream_active`. Read-only paths (`info`, `save`,
   `send`, `stream stats`) only take the camera lock and are always allowed.
+- **NET-MJPEG** (#49 P5) — `net mjpeg start` is another `cam_ext_sink` owner
+  (owning the DCMI in JPEG), behaving like the CAM-STREAM column.
+  `camera_mjpeg_start` goes through the same ownership gate (via
+  `stream_start_locked`), so it returns `CAM_ERR_BUSY` if a GUIX preview /
+  `camera stream` owns the DCMI, and while MJPEG runs `gui start` / `camera
+  stream start` / `camera set` are BUSY. Exclusion falls out of the single-owner
+  model with no extra state (the `port/netxduo/nx_mjpeg.c` eth_sink is a
+  synchronous copy sink -- in-flight 0 -- so the producer's async teardown stays
+  safe).
 - **Touch** — there is no touch ownership flag (`guix_is_up()` is the proxy).
   Two things protect the shell: (1) `touch_read()` (`port/touch/touch.c`) drops
   the FT5336 all-ones "not touched" sentinel — an out-of-panel `0xFFF/0xFFF`

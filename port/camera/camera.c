@@ -1951,9 +1951,13 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	if (mode.is_jpeg) {
 		/* JPEG snapshot-loop (#63): one ring slot is the live DMA target and the
 		   DCMI FRAME ISR delimits each variable-length frame (no DBM, no TC).  ext
-		   is always NULL here -- preview forces RGB565 and rejects JPEG. */
+		   is the MJPEG eth_sink (#49 P5) when started via camera_mjpeg_start(), or
+		   NULL for a plain `camera stream` -- either way roll back any attached ext
+		   on a failure path (like the raster branch below). */
 		cam_jpeg_slot = frame_pipeline_acquire(&cam_pipe);
 		if (cam_jpeg_slot == NULL) {
+			if (ext != NULL)
+				frame_pipeline_detach(&cam_pipe, ext);
 			frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 			return CAM_ERR_STATE;
 		}
@@ -1968,12 +1972,14 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 			hdma_dcmi.Init.Mode = DMA_NORMAL;
 			(void)HAL_DMA_Init(&hdma_dcmi);
 			__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
+			if (ext != NULL)
+				frame_pipeline_detach(&cam_pipe, ext);
 			frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 			drain_stream_sem();
 			LOG_ERR("JPEG stream arm failed");
 			return CAM_ERR_HAL;
 		}
-		cam_ext_sink = NULL;
+		cam_ext_sink = ext;               /* #49 P5: record the MJPEG sink owner */
 		(void)tx_semaphore_put(&cam_start_sem);
 		LOG_INF("stream start jpeg (frames=%lu secs=%lu)",
 		        (unsigned long)frames, (unsigned long)secs);
@@ -2070,6 +2076,32 @@ int camera_preview_start(struct frame_sink *s, enum camera_res res)
 	   camera_set_format (which would re-take cam_lock).  The set_format gate passes
 	   because no stream/preview owns the DCMI yet. */
 	rc = camera_set_format_locked((uint8_t)res, CAM_FMT_RGB565);
+	if (rc == 0)
+		rc = stream_start_locked(0, 0, 0, s);
+	op_unlock();
+	return rc;
+}
+
+int camera_mjpeg_start(struct frame_sink *s, enum camera_res res)
+{
+	int rc;
+
+	if (s == NULL)
+		return CAM_ERR_PARAM;
+	/* JPEG is the snapshot-loop format and gated to res <= VGA (#63/#69): bigger
+	   modes are capture-only.  Unlike camera_preview_start (RGB565 for the LCD),
+	   MJPEG (#49 P5) owns the DCMI in JPEG so the eth_sink receives compressed
+	   frames straight from frame_pipeline_publish(FRAME_FMT_JPEG). */
+	if (res > CAM_RES_VGA)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	/* Set JPEG at the requested resolution, then arm the stream with @p s as the
+	   external sink owner.  Both helpers gate on DCMI ownership: if a GUIX preview
+	   or a plain `camera stream` already owns the camera they return CAM_ERR_BUSY,
+	   so MJPEG never steals the DCMI (#73 ownership model). */
+	rc = camera_set_format_locked((uint8_t)res, CAM_FMT_JPEG);
 	if (rc == 0)
 		rc = stream_start_locked(0, 0, 0, s);
 	op_unlock();
