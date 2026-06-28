@@ -63,6 +63,10 @@ int  nx_net_ping(uint32_t ip, unsigned timeout_ms, unsigned *rtt_ms);
  *  server (P3) / future sockets cast it back.  NULL before nx_net_init(). */
 void *nx_net_ip(void);
 
+/** The shared non-cacheable packet pool (NX_PACKET_POOL*), for backends that
+ *  allocate TX packets (the network shell, P4).  NULL before nx_net_init(). */
+void *nx_net_pool(void);
+
 #ifdef __cplusplus
 }
 #endif

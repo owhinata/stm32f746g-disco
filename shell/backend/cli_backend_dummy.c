@@ -77,7 +77,7 @@ static int dummy_write(struct cli_transport *tr, const uint8_t *data, size_t len
 }
 
 const struct cli_transport_api cli_dummy_api = {
-	dummy_init, dummy_enable, dummy_write, dummy_read, NULL, NULL,
+	dummy_init, dummy_enable, dummy_write, dummy_read, NULL, NULL, NULL,
 };
 
 /* ---- test/driver helpers ----------------------------------------------- */

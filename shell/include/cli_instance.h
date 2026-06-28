@@ -40,6 +40,11 @@ extern "C" {
 #define CLI_EVT_RX    0x1u   /**< RX data available (set by the backend / ISR) */
 #define CLI_EVT_TX    0x2u   /**< reserved for #5 flow control; unused in #4 */
 #define CLI_EVT_KILL  0x4u   /**< request the thread to stop (full stop is future) */
+#define CLI_EVT_CONN  0x8u   /**< a transport (re)connected: begin a fresh session
+                              *   (issue #49 P4 -- the TCP backend posts this on
+                              *   accept so the instance thread resets the editor
+                              *   state and redraws the prompt; never set for a
+                              *   persistent transport like the UART). */
 
 /* Cooperative Ctrl+C cancel (issue #16) deliberately adds NO new event-flag bit:
  * the wake source for an in-flight command is the existing CLI_EVT_RX (the ISR
@@ -88,6 +93,13 @@ struct cli_transport_api {
 	int  (*read)(struct cli_transport *tr, uint8_t *data, size_t cap);        /**< non-blocking; ret 0..cap */
 	void (*uninit)(struct cli_transport *tr);                        /**< optional (NULL ok) */
 	void (*update)(struct cli_transport *tr);                        /**< optional periodic poll (NULL ok), req §4.1 */
+	/* Optional (NULL ok): the instance thread calls this on CLI_EVT_CONN, AFTER
+	 * resetting the editor state and BEFORE redrawing the prompt, to let a
+	 * connection-oriented backend enable its output for the new session (the TCP
+	 * backend sets `connected` here so the fresh prompt is the first thing the new
+	 * client sees, and a previous command's output that drained after a reconnect
+	 * is dropped -- see issue #49 P4).  Never invoked for a persistent transport. */
+	void (*session_begin)(struct cli_transport *tr);
 };
 
 /** A backend instance: API table + owning shell + backend-private context. */
@@ -212,6 +224,7 @@ int  cli_start(struct cli_instance *sh);
  * event flag -- never take a lock or touch the line state (requirements §10). */
 void cli_transport_notify_rx(struct cli_instance *sh);
 void cli_transport_notify_tx(struct cli_instance *sh);   /* reserved for #5 */
+void cli_transport_notify_conn(struct cli_instance *sh); /* issue #49 P4: (re)connect -> fresh session */
 
 /* Thread->instance registry (#18).  Lets a backend's printf retarget (_write)
  * resolve which shell instance owns the running thread, so printf follows the

@@ -146,13 +146,28 @@ static void cli_thread_entry(ULONG arg)
 	cli_edit_session_start(sh);   /* probe terminal width + draw the first prompt */
 
 	for (;;) {
-		if (tx_event_flags_get(&sh->events, CLI_EVT_RX | CLI_EVT_KILL,
+		if (tx_event_flags_get(&sh->events,
+		                       CLI_EVT_RX | CLI_EVT_KILL | CLI_EVT_CONN,
 		                       TX_OR_CLEAR, &flags, TX_WAIT_FOREVER)
 		    != TX_SUCCESS)
 			continue;
 
 		if (flags & CLI_EVT_KILL)
 			break;                  /* full stop/uninit lifecycle is future (§14) */
+
+		/* A transport (re)connected (issue #49 P4: TCP backend posts CLI_EVT_CONN
+		 * on accept).  Start a fresh session ON THIS THREAD so every editor-state
+		 * mutation stays single-threaded against the byte loop below.  Order is
+		 * deliberate: reset state -> backend session_begin (the TCP backend sets
+		 * `connected`, enabling output) -> draw the prompt.  Thus the fresh prompt
+		 * is the first thing the new client sees, and a previous command's output
+		 * that drained after a reconnect was dropped while connected was false. */
+		if (flags & CLI_EVT_CONN) {
+			cli_session_reset_state(sh);
+			if (tr->api->session_begin)
+				tr->api->session_begin(tr);
+			cli_edit_session_start(sh);
+		}
 
 		/* Read ONE byte at a time and feed it immediately.  A command line ends
 		 * with '\r', which dispatches the handler synchronously from inside
@@ -276,6 +291,11 @@ void cli_transport_notify_rx(struct cli_instance *sh)
 {
 	/* ISR-safe: only sets an event flag (no lock, no suspend). */
 	tx_event_flags_set(&sh->events, CLI_EVT_RX, TX_OR);
+}
+
+void cli_transport_notify_conn(struct cli_instance *sh)
+{
+	tx_event_flags_set(&sh->events, CLI_EVT_CONN, TX_OR);
 }
 
 void cli_transport_notify_tx(struct cli_instance *sh)

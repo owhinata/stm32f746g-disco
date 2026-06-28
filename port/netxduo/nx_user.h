@@ -47,4 +47,9 @@
  * driver bottom-half (RX drain / TX reclaim) via NX_LINK_DEFERRED_PROCESSING. */
 #define NX_DRIVER_DEFERRED_PROCESSING
 
+/* Enable nx_tcp_socket_queue_depth_notify_set (issue #49 P4): the network shell
+ * backend waits on it (+ window_update) to resume output after TCP back-pressure
+ * instead of timing out.  Without this the API returns NX_NOT_SUPPORTED. */
+#define NX_ENABLE_TCP_QUEUE_DEPTH_UPDATE_NOTIFY
+
 #endif /* NX_USER_H */

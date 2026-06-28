@@ -150,7 +150,7 @@ static void uart_uninit(struct cli_transport *tr)
 }
 
 const struct cli_transport_api cli_uart_api = {
-	uart_init, uart_enable, uart_write, uart_read, uart_uninit, NULL,
+	uart_init, uart_enable, uart_write, uart_read, uart_uninit, NULL, NULL,
 };
 
 /* ---- HAL callbacks + ISR (resolved to the console via g_uart_console) --- */

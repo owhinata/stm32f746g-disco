@@ -128,6 +128,15 @@ void cli_input_byte(struct cli_instance *sh, uint8_t b);
  */
 void cli_edit_session_start(struct cli_instance *sh);
 
+/* Reset the per-session editor state (line / cursor / history / escape parse /
+ * render / output-staging / cancel) WITHOUT producing any output (issue #49 P4).
+ * The instance thread calls this on a transport (re)connect before
+ * cli_edit_session_start() so the new session starts clean -- no previous line,
+ * history or render state leaks across a reconnect.  ThreadX-free.  Excludes the
+ * config (bs_swap/prompt), the cumulative stats and the lifecycle/transport
+ * fields. */
+void cli_session_reset_state(struct cli_instance *sh);
+
 /** Set the backspace mode at run time (issue #9): 0 = DEL erases backward,
  *  1 = DEL (0x7F) deletes forward.  See CLI_BACKSPACE_MODE. */
 void cli_set_backspace_mode(struct cli_instance *sh, int mode);

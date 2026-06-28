@@ -114,6 +114,11 @@ void *nx_net_ip(void)
 	return nx_up ? (void *)&eth_ip : NULL;
 }
 
+void *nx_net_pool(void)
+{
+	return nx_up ? (void *)&eth_pool : NULL;
+}
+
 int nx_net_info_get(struct nx_net_info *out)
 {
 	ULONG ip = 0, mask = 0, gw = 0;

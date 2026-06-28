@@ -120,6 +120,36 @@ leaves the old listener running. This socket lifecycle is the **template for P4
 `net info` shows `echo: listening on :7 (N conns, M bytes)` while running. Connect
 with `nc <board-ip> 7` and each input line is echoed back.
 
+## Network shell (telnet, P4)
+
+The existing clean-room CLI shell is also driveable over **TCP (telnet)**
+(`port/netxduo/nx_shell.c`). The CLI has a transport abstraction (VCP = USART1
+backend), so a network shell is **a TCP backend plus a second `cli_instance`
+bound to it** -- almost no core change. `telnet <board-ip>` or `nc <board-ip> 23`
+gives the same shell (`dmesg`/`fs`/`camera`/`net` ...) over the network,
+concurrent with the VCP shell. No authentication (LAN-only).
+
+- **Single session (N=1)**: the CLI §14 KILL/uninit lifecycle is not implemented,
+  so a static `cli_instance` is reused across connections rather than
+  created/destroyed per client. One connection at a time.
+- **Clean session on connect**: each connection resets the line/history/render
+  state and redraws the prompt, via a minimal CLI-core addition
+  (`cli_session_reset_state()` + a `CLI_EVT_CONN` event + an optional transport
+  method `session_begin`). The server thread only posts `CLI_EVT_CONN` on accept;
+  the actual reset and output-enable happen **on the CLI thread** (keeping all
+  editor-state mutation single-threaded -- no race). Output enable (`connected`)
+  is set by the CLI thread in `session_begin` and cleared on disconnect, so a
+  previous command's late output never leaks to a new client after a reconnect.
+- **telnet IAC strip**: the telnet negotiation (`0xFF ...`) at connect is dropped
+  in the RX path, so both telnet and nc are garbage-free.
+- **TX flow control**: output uses `nx_tcp_socket_send(NX_NO_WAIT)`; a full
+  window/queue resumes via the `window_update`/`queue_depth` notifies firing
+  `cli_transport_notify_tx` (needs `NX_ENABLE_TCP_QUEUE_DEPTH_UPDATE_NOTIFY`). The
+  TX queue is capped at 8 to protect the shared pool.
+- **Note (printf retarget)**: raw C-library `printf` goes to the VCP (USART1) via
+  the `_write` fallback; the shell's `cli_print` output goes to TCP correctly, so
+  normal command output reaches telnet.
+
 ## References
 
 - RM0385 §38 (Ethernet) / §2.1.10 (ETH DMA bus)

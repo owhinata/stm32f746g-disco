@@ -23,6 +23,41 @@
 #include "cli_instance.h"
 #include "cli_internal.h"
 
+/* Reset the per-session editor state on a transport (re)connect (issue #49 P4).
+ * Mirrors the per-session subset of cli_init() (cli_core.c) but touches NO
+ * transport/ThreadX/config field and produces NO output -- the caller
+ * (cli_thread_entry, on CLI_EVT_CONN) follows it with the backend's session_begin
+ * hook and then cli_edit_session_start() to draw the fresh prompt.  Kept here in
+ * the ThreadX-free editor/session layer so the host test harness sees it too. */
+void cli_session_reset_state(struct cli_instance *sh)
+{
+	sh->len            = 0;
+	sh->cur            = 0;
+	sh->line[0]        = '\0';
+	sh->overwrite      = 0;
+	sh->rx             = CLI_RX_NORMAL;
+	sh->prev_cr        = 0;
+	sh->esc_np         = 0;
+	sh->esc_bad        = 0;
+	sh->esc_p[0]       = 0;
+	sh->esc_p[1]       = 0;
+	sh->hist_used      = 0;        /* no history leak across clients              */
+	sh->hist_nav_on    = 0;
+	sh->hist_nav       = 0;
+	sh->term_width     = CLI_TERM_WIDTH;   /* re-probed by cli_edit_session_start */
+	sh->old_rows       = 0;
+	sh->draw_row       = 0;
+	sh->probing_cpr    = 0;
+	sh->tab_list_armed = 0;
+	sh->render_dirty   = 0;
+	sh->out_len        = 0;
+	sh->tx_failed      = 0;
+	sh->dispatching    = 0;
+	sh->cancel_req     = 0;
+	/* Intentionally NOT touched: tr/sh/state/prompt/ThreadX objects/fg (lifecycle
+	 * & binding), bs_swap (a setting), last_result/rx_dropped/tx_dropped (stats). */
+}
+
 void cli_prompt(struct cli_instance *sh)
 {
 	cli_write(sh, sh->prompt, strlen(sh->prompt));

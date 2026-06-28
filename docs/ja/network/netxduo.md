@@ -101,6 +101,31 @@ NetX の TCP ソケット経路を検証する最小の echo サービス（`por
 `net info` に稼働中の `echo: listening on :7 (N conns, M bytes)` を表示。PC から `nc <board-ip> 7` で接続し
 入力行が echo される。
 
+## ネットワーク shell（telnet, P4）
+
+既存の clean-room CLI shell を **TCP（telnet）経由**でも操作できる（`port/netxduo/nx_shell.c`）。
+CLI は transport 抽象（VCP=USART1 backend）を持つので、**TCP backend を 1 つ足して 2 つ目の
+`cli_instance` を bind するだけ**でコア無改造に近い形で載る。`telnet <board-ip>` か `nc <board-ip> 23`
+で接続すると、VCP と同じ shell（`dmesg`/`fs`/`camera`/`net` 等）がネットワーク越しに使える。
+VCP shell と同時稼働。認証なし（LAN 内前提）。
+
+- **単一セッション（N=1）**: CLI の §14 KILL/uninit ライフサイクル未実装のため、接続のたびに
+  破棄/生成せず**静的 `cli_instance` を再利用**する。同時接続は 1。
+- **接続時のクリーンセッション**: 接続のたびに行/履歴/描画状態をリセットし prompt を再表示する。
+  CLI コアに最小追加（`cli_session_reset_state()` + `CLI_EVT_CONN` イベント + optional transport
+  メソッド `session_begin`）。サーバスレッドは accept で `CLI_EVT_CONN` を投げるだけで、**実際の
+  リセット/出力有効化は CLI スレッド上**で行う（編集状態の変更を 1 スレッドに保ち競合を排除）。
+  出力有効化（`connected`）は CLI スレッドが `session_begin` で立て、切断で切るので、再接続時に
+  前コマンドの遅延出力が新クライアントへ漏れない。
+- **telnet IAC ストリップ**: 接続時の telnet ネゴシエーション（`0xFF ...`）を RX 経路で破棄し、
+  telnet/nc 両方で文字化けしない。
+- **TX フロー制御**: 出力は `nx_tcp_socket_send(NX_NO_WAIT)`。window/queue full は
+  `window_update`/`queue_depth` notify で `cli_transport_notify_tx` を起こして再開
+  （`NX_ENABLE_TCP_QUEUE_DEPTH_UPDATE_NOTIFY` 必須）。TX queue を 8 に制限し共用 pool を保護。
+- **注意（printf retarget）**: C ライブラリの生 `printf` は VCP(USART1) に出る（`_write` の
+  フォールバック）。shell の `cli_print` 経由の出力は TCP に正しく出るので、コマンドの通常出力は
+  telnet に届く。
+
 ## 参考
 
 - RM0385 §38（Ethernet）/ §2.1.10（ETH DMA バス）

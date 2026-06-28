@@ -44,6 +44,7 @@
 #include "touch.h"
 #include "eth_link.h"
 #include "nx_glue.h"
+#include "nx_shell.h"
 #include "guix_camera_ui.h"
 #include "iwdg.h"
 
@@ -59,10 +60,15 @@ void tx_glue_profile_enable(void);   /* issue #19: arm exec-profile ISR hooks */
 CLI_BACKEND_UART_DEFINE(vcp_tr, &huart1);
 CLI_INSTANCE_DEFINE(vcp_sh, &vcp_tr, "sh> ");
 
-/* Every instance started at boot.  The array + compile-time gate is kept (even at
- * one instance) as the §4.2 requirement: the live instance count must not exceed
- * the build's CLI_MAX_INSTANCES.  Add more transports here to run them at once. */
-static struct cli_instance *const shells[] = { &vcp_sh };
+/* Network shell over TCP (issue #49 P4): one telnet session bound to the NetX
+ * TCP server transport (port/netxduo/nx_shell.c).  The instance thread runs at
+ * boot (idle until a client connects); nx_shell_init() arms the socket later. */
+CLI_INSTANCE_DEFINE(net_sh, &nx_shell_transport, "net> ");
+
+/* Every instance started at boot.  The array + compile-time gate is kept as the
+ * §4.2 requirement: the live instance count must not exceed the build's
+ * CLI_MAX_INSTANCES.  Add more transports here to run them at once. */
+static struct cli_instance *const shells[] = { &vcp_sh, &net_sh };
 #define SHELL_COUNT (sizeof(shells) / sizeof(shells[0]))
 _Static_assert(SHELL_COUNT <= CLI_MAX_INSTANCES,
                "more shell instances than CLI_MAX_INSTANCES");
@@ -224,6 +230,11 @@ void tx_application_define(void *first_unused_memory)
 			 * creates ThreadX objects here -- DHCP negotiates later on the IP
 			 * thread.  On failure the link still works; `net` IP/ping report it. */
 			printf("net: NetX Duo init failed (IP disabled)\r\n");
+		} else if (nx_shell_init() != 0) {
+			/* TCP network shell (issue #49 P4): listen :23 + server thread.  The
+			 * net_sh instance thread already started above; on failure the telnet
+			 * shell is disabled, everything else keeps running. */
+			printf("net: shell server init failed (telnet disabled)\r\n");
 		}
 	} else {
 		printf("eth: skipped (SDRAM down)\r\n");
