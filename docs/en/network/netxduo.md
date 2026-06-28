@@ -97,6 +97,29 @@ start/stop, Transmit, ReadData).
 The boot default is **DHCP**: `nx_dhcp_start` runs on link-up and `net info`
 shows the lease.
 
+## TCP echo server (P3)
+
+A minimal echo service (`port/netxduo/nx_echo.c`) that validates the NetX TCP
+socket path. A dedicated thread (prio 14, created once and parked when stopped)
+serves one connection at a time: `nx_tcp_socket_create` ->
+`nx_tcp_server_socket_listen` -> loop { `nx_tcp_server_socket_accept` -> echo each
+received packet straight back with `nx_tcp_socket_send` -> `nx_tcp_socket_disconnect`
+-> `unaccept` -> `relisten` }. The received packet is re-sent directly (NetX keeps
+the IP/TCP header room). accept/receive use a short timeout so `net echo stop`
+(`echo_run = 0`) lets the thread tear the socket down and park. **start/stop are
+synchronous**: `echo_active` (a lifecycle-owned flag) is claimed in start before
+the thread runs and stop waits for teardown, so a back-to-back stop/start never
+leaves the old listener running. This socket lifecycle is the **template for P4
+(the network shell, cli_backend_tcp)**.
+
+| Command | Description |
+|---|---|
+| `net echo start [port]` | start the echo server (default port 7) |
+| `net echo stop` | stop the echo server |
+
+`net info` shows `echo: listening on :7 (N conns, M bytes)` while running. Connect
+with `nc <board-ip> 7` and each input line is echoed back.
+
 ## References
 
 - RM0385 §38 (Ethernet) / §2.1.10 (ETH DMA bus)

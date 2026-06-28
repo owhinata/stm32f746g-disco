@@ -59,6 +59,10 @@ int  nx_net_dhcp_renew(void);
  */
 int  nx_net_ping(uint32_t ip, unsigned timeout_ms, unsigned *rtt_ms);
 
+/** The NetX IP instance (NX_IP*), opaque to non-NetX callers -- the TCP echo
+ *  server (P3) / future sockets cast it back.  NULL before nx_net_init(). */
+void *nx_net_ip(void);
+
 #ifdef __cplusplus
 }
 #endif

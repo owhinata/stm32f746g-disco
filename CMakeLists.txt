@@ -287,6 +287,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/port/eth/eth_phy.c"
     "${CMAKE_SOURCE_DIR}/port/netxduo/nx_eth_driver.c"
     "${CMAKE_SOURCE_DIR}/port/netxduo/nx_glue.c"
+    "${CMAKE_SOURCE_DIR}/port/netxduo/nx_echo.c"
     "${NX_DIR}/addons/dhcp/nxd_dhcp_client.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_display.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_touch.c"
