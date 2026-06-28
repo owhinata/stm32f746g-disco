@@ -42,6 +42,7 @@
 #include "camera.h"
 #include "ltdc_display.h"
 #include "touch.h"
+#include "eth_link.h"
 #include "guix_camera_ui.h"
 #include "iwdg.h"
 
@@ -205,6 +206,21 @@ void tx_application_define(void *first_unused_memory)
 	 * `touch` command reports it; nothing else stops. */
 	if (touch_init() != 0)
 		printf("touch: init failed (touch command disabled)\r\n");
+
+	/* Ethernet bring-up (issue #49 P1): ETH MAC + LAN8742A RMII PHY, link
+	 * detection only (no NetX/traffic).  GATED on sdram_is_up(): the ETH DMA
+	 * descriptors live in .sdram.eth (0xC0400000) and HAL_ETH_Init writes them
+	 * immediately, so with the FMC down this would fault instead of failing soft
+	 * (like ltdc_init above).  Non-blocking -- eth_init() does GPIO/MAC/PHY setup
+	 * and spawns the eth-link monitor thread but never waits for the link, so it
+	 * is safe before the scheduler / IWDG arm.  On failure the `net` command
+	 * reports it; nothing else stops. */
+	if (sdram_is_up()) {
+		if (eth_init() != 0)
+			printf("eth: init failed (net command disabled)\r\n");
+	} else {
+		printf("eth: skipped (SDRAM down)\r\n");
+	}
 
 	/* GUIX camera UI (issues #60/#61).  Register the widget-tree builder first --
 	 * no I/O, so safe here -- then bring the UI up ON at boot, symmetric with the

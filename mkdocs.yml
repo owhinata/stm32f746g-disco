@@ -44,6 +44,7 @@ plugins:
           nav_translations:
             アーキテクチャ: Architecture
             ハードウェア: Hardware
+            ネットワーク: Network
             ビルド: Build
             RTOS: RTOS
 
@@ -61,6 +62,8 @@ nav:
       - hardware/camera.md
       - hardware/display.md
       - hardware/touch.md
+  - ネットワーク:
+      - network/ethernet.md
   - ビルド:
       - build/cmake.md
   - RTOS:

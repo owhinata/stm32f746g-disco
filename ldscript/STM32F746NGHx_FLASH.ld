@@ -216,7 +216,12 @@ SECTIONS
    *     (cam_arena), so the DCMI ring WRITE target sits in a different internal
    *     bank from the LTDC read surface -- both banks can hold a row open,
    *     cutting precharge/activate thrashing (a FE-reduction lever; measured).
-   * Banks 2,3 (0xC0400000..0xC07FFFFF, 4 MB) are left free (e.g. #49 NetX). */
+   *   .sdram.eth   (bank2, 0xC0400000..): ETH DMA descriptors (and, from #49 P2,
+   *     the RX buffer pool).  The new HAL_ETH does NO D-cache maintenance, so its
+   *     descriptors/buffers must be MPU non-cacheable -- the whole 8 MB SDRAM
+   *     already is (src/bsp.c), and the FMC is unambiguously reachable by the ETH
+   *     MAC DMA (AHB master), so this is the lowest-risk placement.
+   * Banks 2,3 (0xC0400000..0xC07FFFFF, 4 MB) host ETH (front) + future #49 NetX. */
   .sdram (NOLOAD) :
   {
     . = ALIGN(32);
@@ -234,6 +239,12 @@ SECTIONS
     KEEP(*(.sdram.cam))           /* cam_arena: 2 MB DCMI ring arena in bank1 */
     . = ALIGN(32);
     _esdram_cam = .;
+
+    . = ORIGIN(SDRAM) + 0x400000; /* advance to FMC internal bank2 (0xC0400000) */
+    _ssdram_eth = .;
+    KEEP(*(.sdram.eth))           /* ETH DMA descriptors (+ future RX buffers, #49) */
+    . = ALIGN(32);
+    _esdram_eth = .;
     _esdram = .;
   } >SDRAM
 
@@ -246,6 +257,12 @@ SECTIONS
          ".sdram.cam must start at FMC internal bank1 (0xC0200000)")
   ASSERT(_esdram_cam - _ssdram_cam == 0x200000,
          ".sdram.cam (cam_arena) must be exactly 2 MB (one FMC internal bank)")
+  /* ETH descriptors/buffers must start at bank2 and stay within the free 4 MB
+     (banks 2,3) -- issue #49. */
+  ASSERT(_ssdram_eth == ORIGIN(SDRAM) + 0x400000,
+         ".sdram.eth must start at FMC internal bank2 (0xC0400000)")
+  ASSERT(_esdram_eth - _ssdram_eth <= 0x400000,
+         ".sdram.eth must fit in the free 4 MB (banks 2,3)")
   /* Overall guard: still inside the 8 MB SDRAM bank (issue #45/#65). */
   ASSERT(_esdram - _ssdram <= 0x800000, ".sdram exceeds the 8 MB SDRAM bank")
 
