@@ -91,6 +91,36 @@ int eth_link_get(struct eth_link_info *out);
  */
 int eth_link_renegotiate(void);
 
+/* ---- P2 (#75) hooks: the NetX ETH driver layers on top of this MAC/PHY -----
+ * These keep eth_link.c free of any NetX/HAL-handle leakage to its other callers
+ * (cmd_net.c only uses the link API above): the NetX driver (port/netxduo) gets
+ * the ETH handle as an opaque pointer, the MAC bytes, the shared HAL lock, and a
+ * link-change callback -- dependency inversion (eth_link.c never includes NetX),
+ * mirroring guix_register_app_builder(). */
+
+/**
+ * Link-change/poll callback registered by the NetX driver.  Invoked from the
+ * `eth-link` monitor thread on EVERY successful PHY poll (~5 Hz): the driver uses
+ * it to (a) reconfigure the MAC speed/duplex and start/stop the DMA on a real
+ * transition, and (b) kick NetX deferred processing as a packet-pool-starvation
+ * watchdog.  @p up / @p speed_mbps (0/10/100) / @p full_duplex are the PHY state.
+ */
+typedef void (*eth_link_cb_t)(void *arg, bool up, int speed_mbps, bool full_duplex);
+void eth_link_set_callback(eth_link_cb_t cb, void *arg);
+
+/** The ETH_HandleTypeDef* (opaque here to avoid pulling the HAL into non-HAL
+ *  callers); the NetX driver casts it back.  NULL before eth_init() succeeds. */
+void *eth_get_handle(void);
+
+/** Copy the 6-byte MAC address programmed into the ETH MAC. */
+void eth_get_mac(uint8_t out[6]);
+
+/** Acquire/release the shared HAL_ETH serialization lock (eth_lock).  The NetX
+ *  driver wraps every HAL_ETH state-changing call (Start/Stop/Transmit/ReadData)
+ *  in these so MDIO polling, link start/stop and the data path never overlap. */
+void eth_lock_acquire(void);
+void eth_lock_release(void);
+
 #ifdef __cplusplus
 }
 #endif

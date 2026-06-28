@@ -18,7 +18,8 @@ cmake_minimum_required(VERSION 3.20)
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32f7xx_hal_driver/Src/stm32f7xx_hal.c"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/filex/common/src/fx_media_open.c"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/ov5640/ov5640.c"
-   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/guix/common/src/gx_system_initialize.c")
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/guix/common/src/gx_system_initialize.c"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/netxduo/common/src/nx_ip_create.c")
     message(STATUS "Initializing git submodules ...")
     execute_process(
         COMMAND git submodule update --init --recursive
@@ -183,6 +184,16 @@ set(GX_DIR "${CMAKE_SOURCE_DIR}/lib/guix")
 file(GLOB GX_CORE "${GX_DIR}/common/src/*.c")
 list(FILTER GX_CORE EXCLUDE REGEX "gx_binres")          # no binary resource loader
 
+# --- NetX Duo (IPv4 TCP/IP, issue #49 P2) ----------------------------------
+# eclipse-threadx/netxduo (MIT), same GLOB pattern as ThreadX/FileX/GUIX.  The
+# IPv6 sources self-guard on FEATURE_NX_IPV6 (neutralised by NX_DISABLE_IPV6 in
+# port/netxduo/nx_user.h) -> empty objects that --gc-sections drops.  Only the
+# RAM/simulator demo driver is excluded; this firmware ships its own clean-room
+# port/netxduo ETH driver glue over the STM32 ETH MAC.
+set(NX_DIR "${CMAKE_SOURCE_DIR}/lib/netxduo")
+file(GLOB NX_CORE "${NX_DIR}/common/src/*.c")
+list(FILTER NX_CORE EXCLUDE REGEX "nx_ram_network_driver")
+
 # --- App: threadx (the interactive ThreadX CLI shell) ----------------------
 # The single firmware: the ThreadX CLI shell over the USART1 VCP.  Uses the
 # ThreadX core/port set up above and omits src/stm32f7xx_it.c because ThreadX
@@ -274,6 +285,9 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/port/sdram/sdram.c"
     "${CMAKE_SOURCE_DIR}/port/eth/eth_link.c"
     "${CMAKE_SOURCE_DIR}/port/eth/eth_phy.c"
+    "${CMAKE_SOURCE_DIR}/port/netxduo/nx_eth_driver.c"
+    "${CMAKE_SOURCE_DIR}/port/netxduo/nx_glue.c"
+    "${NX_DIR}/addons/dhcp/nxd_dhcp_client.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_display.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_touch.c"
     "${CMAKE_SOURCE_DIR}/port/guix/guix_glue.c"
@@ -291,7 +305,8 @@ add_executable(threadx
     ${TX_ASM}
     ${FX_CORE}
     ${LX_CORE}
-    ${GX_CORE})
+    ${GX_CORE}
+    ${NX_CORE})
 target_link_libraries(threadx PRIVATE common shell_obj coremark_obj svc_obj)
 target_include_directories(threadx PRIVATE
     "${TX_DIR}/common/inc" "${TX_PORT}/inc"
@@ -308,6 +323,9 @@ target_include_directories(threadx PRIVATE
     "${FX_DIR}/common/inc" "${FX_DIR}/ports/cortex_m7/gnu/inc"
     "${LX_DIR}/common/inc"
     "${GX_DIR}/common/inc" "${GX_DIR}/ports/cortex_m7/gnu/inc"
+    "${NX_DIR}/common/inc" "${NX_DIR}/ports/cortex_m7/gnu/inc"
+    "${NX_DIR}/addons/dhcp"
+    "${CMAKE_SOURCE_DIR}/port/netxduo"    # nx_user.h + NetX ETH driver glue (#49)
     "${CMAKE_SOURCE_DIR}/port/filex"
     "${CMAKE_SOURCE_DIR}/port/levelx"
     "${CMAKE_SOURCE_DIR}/port/guix"
@@ -320,6 +338,9 @@ target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE
     FX_INCLUDE_USER_DEFINE_FILE           # port/filex/fx_user.h  (issue #30)
     LX_INCLUDE_USER_DEFINE_FILE           # port/levelx/lx_user.h (issue #30)
     GX_INCLUDE_USER_DEFINE_FILE           # port/guix/gx_user.h   (issue #55)
+    NX_INCLUDE_USER_DEFINE_FILE           # port/netxduo/nx_user.h (issue #49 P2)
+    NX_DHCP_CLIENT_USER_CREATE_PACKET_POOL  # DHCP reuses the shared pool (#49 P2)
+    NX_DHCP_THREAD_PRIORITY=13            # below the IP thread (12) (issue #49 P2)
     CLI_ENABLE_DANGEROUS_CMDS=$<BOOL:${CLI_ENABLE_DANGEROUS_CMDS}>
     CLI_DEVMEM_DUMP_MAX_LEN=${CLI_DEVMEM_DUMP_MAX_LEN}
     CLI_INSTANCE_STACK_SIZE=4096          # headroom: coremark runs in this thread

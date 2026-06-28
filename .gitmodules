@@ -26,3 +26,6 @@
 [submodule "lib/guix"]
 	path = lib/guix
 	url = https://github.com/eclipse-threadx/guix
+[submodule "lib/netxduo"]
+	path = lib/netxduo
+	url = https://github.com/eclipse-threadx/netxduo

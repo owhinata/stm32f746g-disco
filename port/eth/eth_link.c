@@ -56,6 +56,9 @@ static struct eth_link_info shared;   /* identity (init) + live link (thread)   
 static TX_THREAD eth_link_thread;
 static UCHAR     eth_link_stack[ETH_LINK_STACK_SIZE];
 
+static eth_link_cb_t eth_cb;          /* P2: NetX driver link-change/poll hook   */
+static void         *eth_cb_arg;
+
 /* ---- MDIO vtable wired to the MAC's SMI (injected into eth_phy) ----------- */
 
 static int eth_mdio_read(void *ctx, uint32_t addr, uint32_t reg, uint16_t *val)
@@ -160,6 +163,16 @@ static void eth_link_entry(ULONG arg)
 			else
 				LOG_INF("link down");
 			last_up = l.up;
+		}
+
+		/* P2: notify the NetX driver on EVERY successful poll -- it reconfigures
+		   the MAC + starts/stops the DMA on a real transition and kicks NetX
+		   deferred processing as a pool-starvation watchdog.  Called outside
+		   eth_lock; the callback re-takes it for its HAL_ETH work. */
+		if (rc == ETH_PHY_OK && eth_cb != NULL) {
+			int mbps = (l.speed == ETH_PHY_SPEED_100M) ? 100 :
+			           (l.speed == ETH_PHY_SPEED_10M)  ? 10  : 0;
+			eth_cb(eth_cb_arg, l.up, mbps, l.duplex == ETH_PHY_DUPLEX_FULL);
 		}
 	}
 }
@@ -267,4 +280,33 @@ int eth_link_renegotiate(void)
 	rc = eth_phy_restart_autoneg(&phy);
 	tx_mutex_put(&eth_lock);
 	return (rc == ETH_PHY_OK) ? ETH_OK : ETH_ERR_PHY;
+}
+
+/* ---- P2 (#75) hooks for the NetX ETH driver ------------------------------- */
+
+void eth_link_set_callback(eth_link_cb_t cb, void *arg)
+{
+	eth_cb_arg = arg;
+	eth_cb = cb;          /* arg first, then cb -- the poll thread reads cb last */
+}
+
+void *eth_get_handle(void)
+{
+	return eth_up ? &heth : NULL;
+}
+
+void eth_get_mac(uint8_t out[6])
+{
+	for (int i = 0; i < 6; i++)
+		out[i] = g_mac[i];
+}
+
+void eth_lock_acquire(void)
+{
+	tx_mutex_get(&eth_lock, TX_WAIT_FOREVER);
+}
+
+void eth_lock_release(void)
+{
+	tx_mutex_put(&eth_lock);
 }

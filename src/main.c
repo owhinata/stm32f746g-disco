@@ -43,6 +43,7 @@
 #include "ltdc_display.h"
 #include "touch.h"
 #include "eth_link.h"
+#include "nx_glue.h"
 #include "guix_camera_ui.h"
 #include "iwdg.h"
 
@@ -216,8 +217,14 @@ void tx_application_define(void *first_unused_memory)
 	 * is safe before the scheduler / IWDG arm.  On failure the `net` command
 	 * reports it; nothing else stops. */
 	if (sdram_is_up()) {
-		if (eth_init() != 0)
+		if (eth_init() != 0) {
 			printf("eth: init failed (net command disabled)\r\n");
+		} else if (nx_net_init() != 0) {
+			/* NetX Duo IPv4 (issue #49 P2): pool/IP/ARP/ICMP/UDP/DHCP.  Only
+			 * creates ThreadX objects here -- DHCP negotiates later on the IP
+			 * thread.  On failure the link still works; `net` IP/ping report it. */
+			printf("net: NetX Duo init failed (IP disabled)\r\n");
+		}
 	} else {
 		printf("eth: skipped (SDRAM down)\r\n");
 	}
