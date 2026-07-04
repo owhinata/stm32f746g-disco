@@ -206,7 +206,6 @@ static uint32_t cam_sensor_pclk_hz;
 static const uint16_t res_wh[CAM_RES__COUNT][2] = {
 	{ 160u, 120u },   /* QQVGA   */
 	{ 320u, 240u },   /* QVGA    */
-	{ 480u, 272u },   /* 480x272 */
 	{ 640u, 480u },   /* VGA     */
 	{ 800u, 480u },   /* WVGA    */
 };
@@ -292,8 +291,10 @@ static uint8_t cam_frame[CAM_FRAME_MAX_BYTES]
    thrashing (FE).  Replaces the old fixed cam_ring[4][256 KB]: at stream start
    the slot stride is sized to the current mode (align32(frame_bytes)) and the
    arena is partitioned into as many slots as fit, capped at
-   FRAME_PIPELINE_MAX_SLOTS -- so small modes get a deeper ring.  2 MB = the
-   largest streamable slot (262144 = 480x272 RGB565 rounded up) x 8. */
+   FRAME_PIPELINE_MAX_SLOTS -- so small modes get a deeper ring.  2 MB gives the
+   full FRAME_PIPELINE_MAX_SLOTS ring even for the largest streamable slot
+   (QVGA RGB565 = 153600, rounded up) and keeps cam_arena filling bank1 for the
+   #65 FE bank-isolation win. */
 #define CAM_ARENA_BYTES    (2u * 1024u * 1024u)
 
 static uint8_t cam_arena[CAM_ARENA_BYTES]
@@ -854,16 +855,15 @@ static const struct {
 } mode_fps[CAM_RES__COUNT] = {
 	[CAM_RES_QQVGA]   = { 1600u, 1000u },
 	[CAM_RES_QVGA]    = { 1600u, 1000u },
-	[CAM_RES_480x272] = { 1600u, 1000u },
 	[CAM_RES_VGA]     = { 1936u, 1088u },
 	[CAM_RES_WVGA]    = { 1936u, 1088u },
 };
 
-/* Only the small modes (QQVGA/QVGA/480x272) are streamable and worth 48 MHz; the
-   larger VGA/WVGA modes are snapshot-only and stay at 24 MHz regardless of fps. */
+/* Only the small modes (QQVGA/QVGA) are streamable and worth 48 MHz; the larger
+   VGA/WVGA modes are snapshot-only and stay at 24 MHz regardless of fps. */
 static int res_is_small(uint8_t res)
 {
-	return res <= CAM_RES_480x272;
+	return res <= CAM_RES_QVGA;
 }
 
 struct cam_pclk_sel { uint8_t ov; uint32_t hz; };
@@ -920,7 +920,6 @@ static uint32_t res_to_ov(uint8_t r)
 {
 	switch (r) {
 	case CAM_RES_QQVGA:   return OV5640_R160x120;
-	case CAM_RES_480x272: return OV5640_R480x272;
 	case CAM_RES_VGA:     return OV5640_R640x480;
 	case CAM_RES_WVGA:    return OV5640_R800x480;
 	default:              return OV5640_R320x240;   /* QVGA */
@@ -2055,12 +2054,12 @@ int camera_preview_start(struct frame_sink *s, enum camera_res res)
 
 	if (s == NULL)
 		return CAM_ERR_PARAM;
-	/* Preview only accepts the streamable small modes (qqvga/qvga/480x272): the
-	   bigger raster modes are capture-only (frame_words > 65535) and would set the
-	   mode then fail at stream arm, leaving the mode changed (#69).  Format is
-	   fixed RGB565 (the #56 GUIX sink's only geometry); fps stays the LTDC-clamped
+	/* Preview only accepts the streamable small modes (qqvga/qvga): the bigger
+	   raster modes are capture-only (frame_words > 65535) and would set the mode
+	   then fail at stream arm, leaving the mode changed (#69).  Format is fixed
+	   RGB565 (the #56 GUIX sink's only geometry); fps stays the LTDC-clamped
 	   15 fps while the panel scans out. */
-	if (res > CAM_RES_480x272)
+	if (res > CAM_RES_QVGA)
 		return CAM_ERR_PARAM;
 	rc = op_lock();
 	if (rc != 0)

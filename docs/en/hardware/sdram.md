@@ -60,7 +60,7 @@ The SDRAM has **4 internal banks** (2 MB each, selected by CPU address **offset 
 | Mode | Old layout (same bank) | #65 (bank0 LTDC / bank1 ring) | Reduction |
 |---|---|---|---|
 | QVGA RGB565 | 1193.3 fe/s | **859.3 fe/s** | **−28%** |
-| 480x272 RGB565 | 2022.0 fe/s | **1489.5 fe/s** | **−26%** |
+| 480x272 RGB565 *(mode removed in #84)* | 2022.0 fe/s | **1489.5 fe/s** | **−26%** |
 
 Both keep `ovr dcmi`/`ovr ring` = 0 and fps 14.8. The bank separation cut **FE by ~26–28%** -- the "uncertain" side-effect confirmed on hardware. The dynamic arena gives both modes `ring: 8 slots` (deeper than the old fixed 4).
 

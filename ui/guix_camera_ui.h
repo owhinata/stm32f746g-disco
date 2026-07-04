@@ -9,12 +9,11 @@
  *          controller) into one application-layer module.
  *
  * This is the presentation layer (ui/), above port/guix.  The board boots with
- * the UI ON (#60) showing the live camera preview (RGB565, default 480x272 full
- * screen #69, drawn
- * native 1:1 centred on the 480x272 panel).  The UI has two full-screen pages
- * (#68): the clean live preview, and a settings page reached by tapping the image
- * that holds the OV5640 image-quality controls, a preview-resolution selector
- * (qqvga/qvga/480x272, #69) and Back (see guix_camera_ui.c).  Lifecycle:
+ * the UI ON (#60) showing the live camera preview (RGB565, default QVGA #84,
+ * drawn native 1:1 centred on the 480x272 panel).  The UI has two full-screen
+ * pages (#68): the clean live preview, and a settings page reached by tapping the
+ * image that holds the OV5640 image-quality controls, a preview-resolution
+ * selector (qqvga/qvga, #69/#84) and Back (see guix_camera_ui.c).  Lifecycle:
  *
  *   camera_ui_init()   register the GUIX widget-tree builder with guix_glue
  *                      (boot-safe: no GUIX/camera I/O).  Call once from

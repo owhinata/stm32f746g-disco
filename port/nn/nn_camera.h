@@ -47,7 +47,7 @@ struct nn_camera_stats {
 
 /**
  * Start live camera inference at resolution @p res (RGB565; must be a small
- * streamable mode QQVGA/QVGA/480x272, per camera_preview_start()).  Takes single
+ * streamable mode QQVGA/QVGA, per camera_preview_start()).  Takes single
  * camera ownership -- refused if a GUIX preview / plain stream / mjpeg already
  * owns the DCMI.  Non-blocking.  Returns 0 or <0.
  */

@@ -60,9 +60,11 @@ extern "C" {
 
 /* ---- capture mode: resolution / pixel format (issue #45) ----------------- */
 /*
- * Port-neutral resolution and pixel-format enums (mirror the lib/ov5640
- * OV5640 resolution / pixel-format constants, the way the quality enums
- * mirror the SDE controls).  The shell never sees the lib values.  Ceilings:
+ * Port-neutral resolution and pixel-format enums, translated to the lib/ov5640
+ * OV5640 resolution / pixel-format constants by res_to_ov() / the format helpers
+ * (NOT raw-value compatible -- e.g. dropping 480x272 in #84 shifted the VGA/WVGA
+ * ordinals away from OV5640_R*, so never cast between the two).  The shell never
+ * sees the lib values.  Ceilings:
  *   - snapshot supports every resolution (DCMI/DMA intra-frame banding);
  *   - streaming supports a mode only while its frame fits one DMA NDTR
  *     (frame_words <= 65535); larger modes are capture-only;
@@ -71,7 +73,6 @@ extern "C" {
 enum camera_res {
 	CAM_RES_QQVGA = 0,  /* 160x120  */
 	CAM_RES_QVGA,       /* 320x240  (power-on default) */
-	CAM_RES_480x272,    /* 480x272  */
 	CAM_RES_VGA,        /* 640x480  */
 	CAM_RES_WVGA,       /* 800x480  */
 	CAM_RES__COUNT
@@ -217,7 +218,7 @@ int camera_set_format(enum camera_res res, enum camera_format fmt);
  * (48 MHz PCLK).  Stored as a preference and re-applied to the live sensor at
  * once (same path as camera_set_format), so it is refused with CAM_ERR_BUSY while
  * a stream or GUIX preview owns the DCMI.  30 fps takes effect only for a small
- * streamable mode (QQVGA/QVGA/480x272) while the LTDC is not scanning out;
+ * streamable mode (QQVGA/QVGA) while the LTDC is not scanning out;
  * otherwise the sensor is clamped to 24 MHz so the 48 MHz DCMI burst never
  * overruns the SDRAM the LTDC also reads (use `lcd off` for 30 fps).  Returns
  * 0 or a negative CAM_ERR_* (CAM_ERR_PARAM for an fps other than 15/30).
@@ -301,7 +302,7 @@ struct frame_desc;       /* svc/frame.h          */
  * Start streaming for a GUIX live preview at resolution @p res (RGB565, the
  * GUIX sink's only format) and attach @p s as an external push sink (in addition
  * to the internal stats sink).  @p res must be a streamable small mode
- * (CAM_RES_QQVGA / QVGA / 480x272); larger modes return CAM_ERR_PARAM (#69).
+ * (CAM_RES_QQVGA / QVGA); larger modes return CAM_ERR_PARAM (#69).
  * Equivalent to camera_stream_start(colorbar=0, unbounded) but also takes
  * **preview ownership**: while it holds, the public `camera stream start/stop`
  * are refused (CAM_ERR_BUSY).  Changing resolution mid-preview is not possible

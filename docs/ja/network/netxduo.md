@@ -133,7 +133,7 @@ OV5640 のハードウェア JPEG フレームを **`multipart/x-mixed-replace`*
 （#46/#47）の **eth_sink**（30fps JPEG パスの本命ネット消費先）。
 
 ```
-net mjpeg start [res]   # camera を JPEG で所有 + :80 listen（res 既定 qvga、qqvga|qvga|480x272|vga）
+net mjpeg start [res]   # camera を JPEG で所有 + :80 listen（res 既定 qvga、qqvga|qvga|vga）
 net mjpeg stop          # 配信停止・camera 解放
 net mjpeg stats         # client 接続 / 配信 frames・bytes / drop / error
 ```

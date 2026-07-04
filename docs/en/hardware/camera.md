@@ -80,7 +80,7 @@ Sensor setup is lazy, at capture time: probe if needed → `OV5640_Init` (once p
 camera probe             power cycle + read the OV5640 chip ID (~1 s)
 camera on                power on the module (bring-up, ~1 s; no chip-ID report)
 camera info              driver / sensor state + current mode / quality settings
-camera res <resolution>  switch resolution qqvga|qvga|480x272|vga|wvga (#45)
+camera res <resolution>  switch resolution qqvga|qvga|vga|wvga (#45)
 camera format <fmt>      switch pixel format rgb565|yuv422|y8|jpeg (#45)
 camera fps <15|30>       frame rate 15 (PCLK 24M) / 30 (PCLK 48M); 30 needs lcd off (#67)
 camera capture [test]    snapshot one frame in the current mode (test = colorbar)
@@ -132,7 +132,7 @@ Channels are expanded to 8 bits by bit replication (full-scale 5/6-bit values ma
 
 ## Image-quality settings (camera set, #44)
 
-`camera set` adjusts the OV5640's built-in ISP (the B-CAMS-OMV has no module-side LED/AF, so only the sensor ISP is controllable). Settings live in a **RAM cache** in `port/camera`: applied over I2C immediately when the sensor is live, or cached and applied in one pass by the next capture's lazy configure (`OV5640_Init` rewrites the SDE register block, so the cache must be re-applied after every init). This is a **shared control layer**: both the `camera set` shell commands and the GUIX camera UI settings screen (#68, reached by tapping the live image) call the same `camera_set_*`. That settings screen also selects the **live preview resolution** (qqvga / qvga / 480x272, RGB565, #69) — a stop → re-format → restart since a live re-format is BUSY (see [GUIX](../rtos/guix.md)). **flip defaults to `flip`** (`CAM_FLIP_FLIP`, #68) for this board's camera-module mounting, so the boot preview / capture come out upright (the other settings default to neutral); use `camera set flip none` to disable it.
+`camera set` adjusts the OV5640's built-in ISP (the B-CAMS-OMV has no module-side LED/AF, so only the sensor ISP is controllable). Settings live in a **RAM cache** in `port/camera`: applied over I2C immediately when the sensor is live, or cached and applied in one pass by the next capture's lazy configure (`OV5640_Init` rewrites the SDE register block, so the cache must be re-applied after every init). This is a **shared control layer**: both the `camera set` shell commands and the GUIX camera UI settings screen (#68, reached by tapping the live image) call the same `camera_set_*`. That settings screen also selects the **live preview resolution** (qqvga / qvga, RGB565, #69/#84) — a stop → re-format → restart since a live re-format is BUSY (see [GUIX](../rtos/guix.md)). **flip defaults to `flip`** (`CAM_FLIP_FLIP`, #68) for this board's camera-module mounting, so the boot preview / capture come out upright (the other settings default to neutral); use `camera set flip none` to disable it.
 
 | Setting | Value | Meaning |
 |---------|-------|---------|
@@ -195,23 +195,23 @@ type 'help camera set' for the list of settings
 
 | Axis | Values |
 |------|--------|
-| Resolution | `qqvga`(160x120) / `qvga`(320x240) / `480x272` / `vga`(640x480) / `wvga`(800x480) |
+| Resolution | `qqvga`(160x120) / `qvga`(320x240) / `vga`(640x480) / `wvga`(800x480) |
 | Format | `rgb565`(2 B/px) / `yuv422`(2 B/px, YUYV) / `y8`(1 B/px greyscale) / `jpeg`(variable) |
 
 ### Snapshot vs stream asymmetry (a hardware constraint)
 
 - **Snapshot supports every mode**: a VGA/WVGA frame exceeds the DMA NDTR limit (65535 words), but `HAL_DCMI_Start_DMA` transparently **bands it intra-frame** (DBM into one contiguous buffer: VGA = 4×38400w, WVGA = 4×48000w), firing FRAME once at the end.
-- **Raster streaming only supports modes with frame_words ≤ 65535** (QQVGA/QVGA/480x272 in RGB565/YUV422). The producer's manual DBM points each M-register at a whole slot via NDTR, so larger raster modes (VGA/WVGA) have `mode.streamable=0` — flagged `capture only` in `camera info` and refused by `camera stream start` (`mode.streamable=0` means "outside the raster DBM path").
+- **Raster streaming only supports modes with frame_words ≤ 65535** (QQVGA/QVGA in RGB565/YUV422). The producer's manual DBM points each M-register at a whole slot via NDTR, so larger raster modes (VGA/WVGA) have `mode.streamable=0` — flagged `capture only` in `camera info` and refused by `camera stream start` (`mode.streamable=0` means "outside the raster DBM path").
 - **JPEG (≤ VGA) streams via a separate path** (#63, see "JPEG streaming" below). Being variable-length it uses a **snapshot-loop** (one DCMI SNAPSHOT per frame + the FRAME interrupt) rather than DBM/TC. JPEG snapshot still works as before.
 
 ### Frame rate (per-mode HTS/VTS + 15/30 fps knob, #45/#67)
 
 The `lib/ov5640` common table sets HTS=1936/VTS=1088 for **every** resolution at a fixed 24 MHz PCLK, so the default is **~11fps**. The timing table (`mode_fps[]`) applied by `camera res` gives the streamable small modes a tightened HTS/VTS (1600/1000 → **~15fps**, 14.9fps measured) and keeps the snapshot-only VGA/WVGA on the full common timing (1936/1088, ~11fps). `fps = PCLK/(HTS×VTS)`.
 
-**`camera fps <15|30>` switches the PCLK between 24 and 48 MHz (#67).** The small modes (QQVGA/QVGA/480x272) keep HTS/VTS=1600/1000, so `48e6/(1600×1000)=30.0fps`. The default is **15fps (safe)**. `camera fps` re-applies to the sensor at once like `camera res/format`, and is refused while a stream/preview owns the DCMI (its PLL must not be retuned under a live DMA target).
+**`camera fps <15|30>` switches the PCLK between 24 and 48 MHz (#67).** The small modes (QQVGA/QVGA) keep HTS/VTS=1600/1000, so `48e6/(1600×1000)=30.0fps`. The default is **15fps (safe)**. `camera fps` re-applies to the sensor at once like `camera res/format`, and is refused while a stream/preview owns the DCMI (its PLL must not be retuned under a live DMA target).
 
 !!! danger "30fps (48 MHz) requires LTDC scanout to be stopped"
-    48 MHz doubles the peak DCMI burst rate and, while the LTDC continuously reads the framebuffer from the 16-bit SDRAM, **even the smallest QQVGA overruns within a few hundred ms** (`camera stream stats` shows `stopped (overrun)`). Measured: with **`lcd off` (LTDC scanout OFF, #66)** all of qqvga/qvga/480x272 RGB565 run at ~30fps with 0 overrun and 0 FE (even 480x272 = 7.8 MB/s is perfectly clean).
+    48 MHz doubles the peak DCMI burst rate and, while the LTDC continuously reads the framebuffer from the 16-bit SDRAM, **even the smallest QQVGA overruns within a few hundred ms** (`camera stream stats` shows `stopped (overrun)`). Measured: with **`lcd off` (LTDC scanout OFF, #66)** all of qqvga/qvga RGB565 run at ~30fps with 0 overrun and 0 FE.
 
     So the effective PCLK is decided by a **single predicate**: 48 MHz **only when "fps 30 selected ∧ small mode ∧ `ltdc_scanout_active()`==false"** all hold; otherwise it **auto-clamps to 24 MHz** (a clamp, not a reject). This predicate is applied at every path that programs the sensor PCLK (`camera_set_format` / before a stream arm / before a snapshot arm), so selecting fps 30 while `lcd on` is active or a GUIX preview is running safely falls back to 15fps. `camera info`'s `fps select` line shows the selection and the clamp reason (`lcd scanout active` / `snapshot-only mode`), and `camera stream start` prints a clamp note.
 
@@ -311,7 +311,7 @@ camera save fs /shot.jpg          # save the latest frame as JPEG (SOI/EOI consi
 
 ### GUIX live preview (#56/#61)
 
-The GUIX camera UI (#61) attaches a GUIX push sink to this streaming pipeline at **boot / `gui start`** and shows the frames **at native scale** on the LTDC (GUIX) screen (since #61 this is the default UI, so live video shows right after power-on). Preview is **RGB565 at a selectable resolution** (qqvga / qvga / 480x272, GUI default **480x272 full screen** #69; `camera_preview_start(s, res)` calls `camera_set_format_locked(res, RGB565)` under the same lock) — the GUIX settings screen switches it with a stop → re-format → restart (#69). While the preview owns the stream, `camera stream start/stop` and `camera res/format/fps` are refused with CAM_ERR_BUSY (the quality `camera set` controls still apply live; escape hatch: `gui stop`). See [GUIX › Camera settings screen](../rtos/guix.md#camera-settings-screen-68) for details.
+The GUIX camera UI (#61) attaches a GUIX push sink to this streaming pipeline at **boot / `gui start`** and shows the frames **at native scale** on the LTDC (GUIX) screen (since #61 this is the default UI, so live video shows right after power-on). Preview is **RGB565 at a selectable resolution** (qqvga / qvga, GUI default **QVGA** #84; `camera_preview_start(s, res)` calls `camera_set_format_locked(res, RGB565)` under the same lock) — the GUIX settings screen switches it with a stop → re-format → restart (#69). 480x272 (16:9) was removed (#84): the sensor scales its 4:3 FOV non-uniformly, stretching the image horizontally, and the extra SDRAM bandwidth overran the DCMI under the #83 overlay. While the preview owns the stream, `camera stream start/stop` and `camera res/format/fps` are refused with CAM_ERR_BUSY (the quality `camera set` controls still apply live; escape hatch: `gui stop`). See [GUIX › Camera settings screen](../rtos/guix.md#camera-settings-screen-68) for details.
 
 ## References
 

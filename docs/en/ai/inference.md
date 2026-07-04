@@ -124,7 +124,7 @@ SSD face detector).
 | `ai info` | backend / model name / I/O tensor shape, dtype, quant / arena size |
 | `ai bench [n]` | run inference n times on a fixed input; min/avg/max latency (µs, DWT) + throughput |
 | `ai run` | single-shot inference on one camera frame; latency + face boxes |
-| `ai stream start [qqvga\|qvga\|480x272]` | start live continuous inference (default QVGA) |
+| `ai stream start [qqvga\|qvga]` | start live continuous inference (default QVGA) |
 | `ai stream stop` | stop |
 | `ai stream stats` | inference rate / latency / drops / face boxes (+ maxscore diag) |
 | `ai norm <0\|1>` | float input normalization toggle (1=[-1,1] / 0=[0,1] default) |

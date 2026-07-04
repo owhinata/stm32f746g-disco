@@ -204,9 +204,8 @@ static int cmd_ai_bench(struct cli_instance *sh, int argc, char **argv)
 static enum camera_res ai_parse_res(const char *s, int *ok)
 {
 	*ok = 1;
-	if (!strcmp(s, "qqvga"))                       return CAM_RES_QQVGA;
-	if (!strcmp(s, "qvga"))                        return CAM_RES_QVGA;
-	if (!strcmp(s, "480x272") || !strcmp(s, "480")) return CAM_RES_480x272;
+	if (!strcmp(s, "qqvga")) return CAM_RES_QQVGA;
+	if (!strcmp(s, "qvga"))  return CAM_RES_QVGA;
 	*ok = 0;
 	return CAM_RES_QVGA;
 }
@@ -282,7 +281,7 @@ static int cmd_ai_stream_start(struct cli_instance *sh, int argc, char **argv)
 		int ok;
 		res = ai_parse_res(argv[1], &ok);
 		if (!ok) {
-			cli_error(sh, "usage: ai stream start [qqvga|qvga|480x272]\r\n");
+			cli_error(sh, "usage: ai stream start [qqvga|qvga]\r\n");
 			return 1;
 		}
 	}
@@ -344,7 +343,7 @@ static int cmd_ai_norm(struct cli_instance *sh, int argc, char **argv)
 }
 
 CLI_SUBCMD_SET_CREATE(ai_stream_subcmds,
-	CLI_CMD_ARG(start, NULL, "start live inference [qqvga|qvga|480x272]",
+	CLI_CMD_ARG(start, NULL, "start live inference [qqvga|qvga]",
 	            cmd_ai_stream_start, 1, 1),
 	CLI_CMD(stop,  NULL, "stop live inference", cmd_ai_stream_stop),
 	CLI_CMD(stats, NULL, "inference rate / latency / drops", cmd_ai_stream_stats),

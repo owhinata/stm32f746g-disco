@@ -170,10 +170,12 @@ static GX_CONST struct {
 };
 static int cyc_cur[N_CYC];        /* current index into names[]                    */
 
-/* ---- preview resolution (#69): the GUI cycles these three streamable RGB565
-   modes (format/fps stay fixed).  geometry is centred on the 480x272 panel; the
-   view buffer below is sized for the largest (480x272) so a switch never
-   reallocates -- only the live geometry passed to guix_display changes. */
+/* ---- preview resolution (#69): the GUI cycles these two streamable RGB565 modes
+   (format/fps stay fixed).  Both are 4:3 like the sensor's ISP FOV, so neither
+   stretches; 480x272 (16:9) was removed in #84 (horizontal stretch + SDRAM
+   overrun).  geometry is centred on the 480x272 panel; the view buffer below is
+   sized for the largest (QVGA) so a switch never reallocates -- only the live
+   geometry passed to guix_display changes. */
 static GX_CONST struct {
 	enum camera_res res;
 	uint16_t w, h;
@@ -181,16 +183,14 @@ static GX_CONST struct {
 } res_tbl[] = {
 	{ CAM_RES_QQVGA,   160, 120, "160x120" },
 	{ CAM_RES_QVGA,    320, 240, "320x240" },
-	{ CAM_RES_480x272, 480, 272, "480x272" },
 };
 #define N_RES        ((int)(sizeof res_tbl / sizeof res_tbl[0]))
 #define RES_VIEW_X(i)  ((uint16_t)((LTDC_LCD_WIDTH  - res_tbl[i].w) / 2))
 #define RES_VIEW_Y(i)  ((uint16_t)((LTDC_LCD_HEIGHT - res_tbl[i].h) / 2))
-/* GUI preview boots full-screen (480x272, index 2) so the panel shows edge-to-edge
-   live video by default (#69); the selection then persists across gui stop/start.
-   The shell capture/stream path keeps its own QVGA default (`mode`), independent
-   of this GUI preview resolution. */
-static int cur_res_idx = 2;       /* index into res_tbl; default 480x272 (#69)     */
+/* GUI preview boots at QVGA (320x240, index 1), centred on the panel (#84); the
+   selection then persists across gui stop/start.  The shell capture/stream path
+   keeps its own QVGA default (`mode`), independent of this GUI preview resolution. */
+static int cur_res_idx = 1;       /* index into res_tbl; default QVGA (#84)         */
 
 /* ---- Camera view buffer + frame_pipeline push sink (#56/#61) -------------- */
 static uint16_t cam_view_buf[CAM_VIEW_W_MAX * CAM_VIEW_H_MAX]
@@ -220,9 +220,11 @@ static volatile int overlay_wanted;       /* user intent (gui overlay on/off)   
 static volatile int overlay_on;           /* feed active                              */
 static volatile int preview_reformatting;
 
-/* Auto-recovery backoff: a DCMI overrun (the overlay's continuous inference contends
-   with the DCMI DMA for SDRAM bandwidth at 480x272) tears the preview down; we
-   auto-restart it.  Track rapid successive recoveries so a persistent overrun loop
+/* Auto-recovery backoff: a DCMI overrun (the overlay's continuous inference can
+   contend with the DCMI DMA for SDRAM bandwidth) tears the preview down; we
+   auto-restart it.  QVGA has bandwidth headroom so an overrun is now rare (#84
+   removed the 480x272 preview that reliably provoked it), but the recovery stays
+   as a safety net.  Track rapid successive recoveries so a persistent overrun loop
    (overlay -> overrun -> restart -> overlay ...) is broken: after RAPID_DROP drop the
    overlay, after RAPID_GIVEUP stop auto-restarting. */
 static ULONG recover_last_tick;
@@ -531,7 +533,7 @@ static void preview_teardown(void)
 }
 
 /* Rebuild the GUIX view pixmap + camera-icon geometry for res_tbl[idx] (#69).
-   Runs on the GUIX thread.  The view buffer is max-sized (480x272), so only the
+   Runs on the GUIX thread.  The view buffer is max-sized (QVGA), so only the
    pixmap width/height/data_size and the icon rectangle change -- the data pointer
    is unchanged.  Safe while the preview screen is hidden (settings up): Back's
    full-screen dirty repaints the icon at its new size and the exposed border. */

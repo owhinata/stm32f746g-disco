@@ -158,7 +158,7 @@ camera frame pipeline's (#46/#47) **eth_sink** -- the real network consumer of
 the 30 fps JPEG path.
 
 ```
-net mjpeg start [res]   # own the camera in JPEG + listen on :80 (res default qvga; qqvga|qvga|480x272|vga)
+net mjpeg start [res]   # own the camera in JPEG + listen on :80 (res default qvga; qqvga|qvga|vga)
 net mjpeg stop          # stop streaming, release the camera
 net mjpeg stats         # client / sent frames+bytes / drops / errors
 ```

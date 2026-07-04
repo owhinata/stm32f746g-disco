@@ -40,11 +40,12 @@ extern "C" {
 #define CAM_VIEW_X  80    /* (480 - 320) / 2 */
 #define CAM_VIEW_Y  16    /* (272 - 240) / 2 */
 
-/* Largest preview the UI can select (#69): full panel 480x272.  The view buffer
-   is sized to this so a resolution switch never reallocates; the live geometry is
-   passed to guix_display_cam_preview_begin() per session. */
-#define CAM_VIEW_W_MAX  480
-#define CAM_VIEW_H_MAX  272
+/* Largest preview the UI can select (#69/#84): QVGA (320x240) -- 480x272 was
+   removed (horizontal stretch from the sensor's 4:3 FOV + SDRAM overrun, #84).
+   The view buffer is sized to this so a resolution switch never reallocates; the
+   live geometry is passed to guix_display_cam_preview_begin() per session. */
+#define CAM_VIEW_W_MAX  320
+#define CAM_VIEW_H_MAX  240
 
 /** GUIX display-driver setup callback passed to gx_display_create(): lays down
  *  the software 565rgb driver, then installs the DMA2D-accelerated overrides and

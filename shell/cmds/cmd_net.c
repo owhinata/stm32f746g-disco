@@ -385,7 +385,7 @@ static const struct {
 	enum camera_res res;
 } mjpeg_res_names[] = {
 	{ "qqvga", CAM_RES_QQVGA }, { "qvga", CAM_RES_QVGA },
-	{ "480x272", CAM_RES_480x272 }, { "vga", CAM_RES_VGA },
+	{ "vga", CAM_RES_VGA },
 };
 
 static int cmd_net_mjpeg_start(struct cli_instance *sh, int argc, char **argv)
@@ -406,7 +406,7 @@ static int cmd_net_mjpeg_start(struct cli_instance *sh, int argc, char **argv)
 		}
 		if (i == sizeof mjpeg_res_names / sizeof mjpeg_res_names[0]) {
 			cli_error(sh, "net: bad resolution '%s' "
-			          "(qqvga|qvga|480x272|vga)\r\n", argv[1]);
+			          "(qqvga|qvga|vga)\r\n", argv[1]);
 			return 1;
 		}
 	}
@@ -475,7 +475,7 @@ static int cmd_net_mjpeg_stats(struct cli_instance *sh, int argc, char **argv)
 
 CLI_SUBCMD_SET_CREATE(net_mjpeg_subcmds,
 	CLI_CMD_ARG(start, NULL,
-	            "start MJPEG-over-HTTP on :80 [res] (qqvga|qvga|480x272|vga, "
+	            "start MJPEG-over-HTTP on :80 [res] (qqvga|qvga|vga, "
 	            "default qvga)", cmd_net_mjpeg_start, 1, 1),
 	CLI_CMD(stop, NULL, "stop MJPEG streaming and release the camera",
 	        cmd_net_mjpeg_stop),

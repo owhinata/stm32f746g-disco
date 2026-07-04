@@ -117,7 +117,7 @@ $STEDGEAI_ROOT/Utilities/linux/stedgeai generate \
 | `ai info` | backend / モデル名 / 入出力テンソル shape・dtype・量子化 / arena サイズ |
 | `ai bench [n]` | 固定入力で n 回推論し、min/avg/max レイテンシ（µs, DWT）とスループット |
 | `ai run` | カメラ 1 フレームで単発推論し、レイテンシ + 顔 bbox を表示 |
-| `ai stream start [qqvga\|qvga\|480x272]` | ライブ連続推論を開始（既定 QVGA） |
+| `ai stream start [qqvga\|qvga]` | ライブ連続推論を開始（既定 QVGA） |
 | `ai stream stop` | 停止 |
 | `ai stream stats` | 推論レート / レイテンシ / drop / 顔 bbox（+ maxscore 診断） |
 | `ai norm <0\|1>` | float 入力正規化切替（1=[-1,1] / 0=[0,1] 既定） |

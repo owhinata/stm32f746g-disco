@@ -71,8 +71,7 @@ static const struct cam_named flip_names[] = {
    RGB888 is unsupported; JPEG is snapshot-only and gated to <= VGA. */
 static const struct cam_named res_names[] = {
 	{ "qqvga", CAM_RES_QQVGA }, { "qvga", CAM_RES_QVGA },
-	{ "480x272", CAM_RES_480x272 }, { "vga", CAM_RES_VGA },
-	{ "wvga", CAM_RES_WVGA }, { NULL, 0 }
+	{ "vga", CAM_RES_VGA }, { "wvga", CAM_RES_WVGA }, { NULL, 0 }
 };
 static const struct cam_named format_names[] = {
 	{ "rgb565", CAM_FMT_RGB565 }, { "yuv422", CAM_FMT_YUV422 },
@@ -1012,7 +1011,7 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD(on,    NULL, "power on the camera module (bring-up, no ID report)",
 	        cmd_camera_on),
 	CLI_CMD(info,  NULL, "driver / sensor state", cmd_camera_info),
-	CLI_CMD_ARG(res, NULL, "set resolution <qqvga|qvga|480x272|vga|wvga>",
+	CLI_CMD_ARG(res, NULL, "set resolution <qqvga|qvga|vga|wvga>",
 	            cmd_camera_res, 2, 0),
 	CLI_CMD_ARG(format, NULL,
 	            "set pixel format <rgb565|yuv422|y8|jpeg> (jpeg: snapshot <=VGA)",

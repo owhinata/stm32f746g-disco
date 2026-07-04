@@ -80,7 +80,7 @@ TIMINGR は **PCLK1 = 54 MHz** 用に再計算した値を使う（RM0385 §30.4
 camera probe             電源サイクル + OV5640 chip ID 読出し（~1 s）
 camera on                モジュール電源 ON（bring-up、~1 s。chip ID は表示しない）
 camera info              ドライバ / センサ状態 + 現在のモード / 画質設定を表示
-camera res <解像度>      解像度切替 qqvga|qvga|480x272|vga|wvga（#45）
+camera res <解像度>      解像度切替 qqvga|qvga|vga|wvga（#45）
 camera format <fmt>      ピクセルフォーマット切替 rgb565|yuv422|y8|jpeg（#45）
 camera fps <15|30>       フレームレート切替 15(PCLK24M) / 30(PCLK48M)。30 は lcd off 必須（#67）
 camera capture [test]    現在モードを 1 フレーム snapshot（test = colorbar パターン）
@@ -132,7 +132,7 @@ wrote bar.png (320x240)
 
 ## 画質設定（camera set, #44）
 
-`camera set` で OV5640 内蔵 ISP の画質を調整する（B-CAMS-OMV はモジュール側に LED/AF を持たず、制御できるのはセンサ ISP 設定のみ）。設定は `port/camera` の **RAM キャッシュ**に保持し、センサが live なら即時 I2C 適用、未設定なら次回 capture の遅延 configure で一括適用する（`OV5640_Init` が SDE レジスタ群を書き潰すため、毎回 init 後に再適用が必要）。これらは**共有制御層**で、shell の `camera set` と GUIX カメラ UI の設定画面（#68、ライブ映像タップで遷移）の双方が同じ `camera_set_*` を叩く。同設定画面は**ライブプレビューの解像度**（qqvga / qvga / 480x272、RGB565、#69）も切り替える（live 再フォーマットは BUSY なので stop → 再フォーマット → restart。[GUIX](../rtos/guix.md) 参照）。**flip の既定は `flip`**（`CAM_FLIP_FLIP`、#68）= このボードのカメラモジュール実装向きで起動時プレビュー/capture が正立する（他の設定は中立）。`camera set flip none` で無効化可。
+`camera set` で OV5640 内蔵 ISP の画質を調整する（B-CAMS-OMV はモジュール側に LED/AF を持たず、制御できるのはセンサ ISP 設定のみ）。設定は `port/camera` の **RAM キャッシュ**に保持し、センサが live なら即時 I2C 適用、未設定なら次回 capture の遅延 configure で一括適用する（`OV5640_Init` が SDE レジスタ群を書き潰すため、毎回 init 後に再適用が必要）。これらは**共有制御層**で、shell の `camera set` と GUIX カメラ UI の設定画面（#68、ライブ映像タップで遷移）の双方が同じ `camera_set_*` を叩く。同設定画面は**ライブプレビューの解像度**（qqvga / qvga、RGB565、#69/#84）も切り替える（live 再フォーマットは BUSY なので stop → 再フォーマット → restart。[GUIX](../rtos/guix.md) 参照）。**flip の既定は `flip`**（`CAM_FLIP_FLIP`、#68）= このボードのカメラモジュール実装向きで起動時プレビュー/capture が正立する（他の設定は中立）。`camera set flip none` で無効化可。
 
 | 設定 | 値 | 内容 |
 |------|----|------|
@@ -195,23 +195,23 @@ type 'help camera set' for the list of settings
 
 | 軸 | 値 |
 |----|----|
-| 解像度 | `qqvga`(160x120) / `qvga`(320x240) / `480x272` / `vga`(640x480) / `wvga`(800x480) |
+| 解像度 | `qqvga`(160x120) / `qvga`(320x240) / `vga`(640x480) / `wvga`(800x480) |
 | フォーマット | `rgb565`(2B/px) / `yuv422`(2B/px, YUYV) / `y8`(1B/px, グレースケール) / `jpeg`(可変長) |
 
 ### snapshot と stream の非対称（HW 制約由来）
 
 - **snapshot は全モード可**: VGA/WVGA は 1 フレームが DMA NDTR 上限（65535 words）を超えるが、`HAL_DCMI_Start_DMA` が単一連続バッファへ **intra-frame DBM banding**（VGA=4×38400w, WVGA=4×48000w）して取り込む。FRAME はバンド最終で 1 回発火。
-- **raster stream は frame_words ≤ 65535 のモードのみ**（QQVGA/QVGA/480x272 の RGB565・YUV422 等）。producer の手動 DBM は各 M-reg が full-slot を NDTR で指すため、これを超えるモード（VGA/WVGA raster）は `mode.streamable=0`＝`camera info` で `capture only` と表示し `camera stream start` を拒否する（`mode.streamable=0` は **raster DBM 経路の対象外**という意味）。
+- **raster stream は frame_words ≤ 65535 のモードのみ**（QQVGA/QVGA の RGB565・YUV422 等）。producer の手動 DBM は各 M-reg が full-slot を NDTR で指すため、これを超えるモード（VGA/WVGA raster）は `mode.streamable=0`＝`camera info` で `capture only` と表示し `camera stream start` を拒否する（`mode.streamable=0` は **raster DBM 経路の対象外**という意味）。
 - **JPEG（≤ VGA）は別経路で stream 可能**（#63、下記「JPEG streaming」）。可変長ゆえ DBM/TC ではなく **snapshot-loop**（DCMI SNAPSHOT を 1 フレームずつ + FRAME 割込み）で取り込む。JPEG snapshot も従来通り可。
 
 ### フレームレート（per-mode HTS/VTS + fps 切替 15/30、#45/#67）
 
 OV5640 の `lib/ov5640` 共通テーブルは HTS=1936/VTS=1088 を**全解像度共通**・PCLK 24MHz 固定で設定するため既定は **~11fps**。`camera res` で適用される **timing 表**（`mode_fps[]`）は、stream 対象の小モードに HTS/VTS 縮小（1600/1000 → **~15fps**、実機 14.9fps）を、snapshot 専用の VGA/WVGA に従来のタイミング（1936/1088, ~11fps）を与える。`fps = PCLK/(HTS×VTS)`。
 
-**`camera fps <15|30>` で PCLK を 24/48MHz 切替（#67）**。小モード（QQVGA/QVGA/480x272）は HTS/VTS=1600/1000 据え置きなので `48e6/(1600×1000)=30.0fps`。既定は **15fps（安全側）**。`camera fps` は `camera res/format` と同様に即時センサ再適用し、stream/プレビュー所有中は拒否（live DMA target のセンサ PLL を触らない）。
+**`camera fps <15|30>` で PCLK を 24/48MHz 切替（#67）**。小モード（QQVGA/QVGA）は HTS/VTS=1600/1000 据え置きなので `48e6/(1600×1000)=30.0fps`。既定は **15fps（安全側）**。`camera fps` は `camera res/format` と同様に即時センサ再適用し、stream/プレビュー所有中は拒否（live DMA target のセンサ PLL を触らない）。
 
 !!! danger "30fps（48MHz）は LTDC scanout 停止が前提"
-    48MHz は peak DCMI バーストレートを倍化し、LTDC がフレームバッファを連続リードする 16-bit SDRAM 競合下では **最小の QQVGA ですら数百 ms で DCMI OVR**（`camera stream stats` が `stopped (overrun)`）。実測では **`lcd off`（LTDC scanout OFF, #66）なら** qqvga/qvga/480x272 RGB565 すべて ~30fps・OVR 0・FE 0（480x272=7.8MB/s でも完全クリーン）。
+    48MHz は peak DCMI バーストレートを倍化し、LTDC がフレームバッファを連続リードする 16-bit SDRAM 競合下では **最小の QQVGA ですら数百 ms で DCMI OVR**（`camera stream stats` が `stopped (overrun)`）。実測では **`lcd off`（LTDC scanout OFF, #66）なら** qqvga/qvga RGB565 すべて ~30fps・OVR 0・FE 0。
 
     そこで実効 PCLK は**単一述語**で決まる: **「fps 30 選択 ∧ 小モード ∧ `ltdc_scanout_active()`==false」が全部成立する時だけ 48MHz**、それ以外は **24MHz に自動クランプ**（reject ではなく clamp）。これを「センサ PCLK を書く全経路」（`camera_set_format` / stream arm 前 / snapshot arm 前）で適用するため、`lcd on` 中・GUIX プレビュー中は fps 30 を選んでも安全に 15fps へ落ちる。`camera info` の `fps select` 行が選択値と clamp 理由（`lcd scanout active` / `snapshot-only mode`）を表示し、`camera stream start` 時も clamp note を出す。
 
@@ -317,7 +317,7 @@ camera save fs /shot.jpg          # 最新フレームを JPEG 保存（SOI/EOI 
 
 ### GUIX ライブプレビュー（#56/#61）
 
-GUIX カメラ UI（#61）は **boot / `gui start`** でこの streaming パイプラインに GUIX の push sink を attach し、フレームを **等倍のまま** LTDC 画面（GUIX）に表示する（#61 以降これが既定 UI で、起動直後にライブ映像が出る）。プレビューは **RGB565・選択可能な解像度**（qqvga / qvga / 480x272、GUI 既定は **480x272 全画面** #69。`camera_preview_start(s, res)` が同一 lock 下で `camera_set_format_locked(res, RGB565)` を呼ぶ）で、GUIX 設定画面が stop → 再フォーマット → restart で切り替える（#69）。プレビュー所有中は `camera stream start/stop` と `camera res/format/fps` が CAM_ERR_BUSY で拒否される（画質 `camera set` は live で適用される。逃げ道は `gui stop`）。詳細は [GUIX のカメラ設定画面](../rtos/guix.md#カメラ設定画面-68) を参照。
+GUIX カメラ UI（#61）は **boot / `gui start`** でこの streaming パイプラインに GUIX の push sink を attach し、フレームを **等倍のまま** LTDC 画面（GUIX）に表示する（#61 以降これが既定 UI で、起動直後にライブ映像が出る）。プレビューは **RGB565・選択可能な解像度**（qqvga / qvga、GUI 既定は **QVGA** #84。`camera_preview_start(s, res)` が同一 lock 下で `camera_set_format_locked(res, RGB565)` を呼ぶ）で、GUIX 設定画面が stop → 再フォーマット → restart で切り替える（#69）。480x272（16:9）は #84 で削除した：センサが 4:3 視野を非一様スケールして横伸びし、追加の SDRAM 帯域が #83 overlay 下で DCMI を overrun させたため。プレビュー所有中は `camera stream start/stop` と `camera res/format/fps` が CAM_ERR_BUSY で拒否される（画質 `camera set` は live で適用される。逃げ道は `gui stop`）。詳細は [GUIX のカメラ設定画面](../rtos/guix.md#カメラ設定画面-68) を参照。
 
 ## 参照
 

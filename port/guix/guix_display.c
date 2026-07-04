@@ -295,8 +295,8 @@ static uint16_t *cam_view_data;        /* cam_view_buf base (registered by begin
 static bool      cam_buf_stale[2];     /* per LTDC buffer; invariant above        */
 /* Camera icon geometry on the panel (set by begin(), #69 variable resolution).
    Defaults to the QVGA centred placement; rect/blit helpers read these instead of
-   the compile-time CAM_VIEW_* constants so the preview can run at qqvga/qvga/
-   480x272.  CAM_RECT bounds are cam_x..cam_x+cam_w-1 / cam_y..cam_y+cam_h-1. */
+   the compile-time CAM_VIEW_* constants so the preview can run at qqvga/qvga
+   (#84).  CAM_RECT bounds are cam_x..cam_x+cam_w-1 / cam_y..cam_y+cam_h-1. */
 static uint16_t  cam_x = CAM_VIEW_X, cam_y = CAM_VIEW_Y;
 static uint16_t  cam_w = CAM_VIEW_W, cam_h = CAM_VIEW_H;
 
