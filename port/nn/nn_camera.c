@@ -60,14 +60,6 @@
 #define NNCAM_WORKER_STACK    8192u
 #define NNCAM_POLL_TICKS      100u        /* sem wait -> stop latency               */
 
-/* Throttle the external-feed (GUIX overlay) inference: sleep between runs so the
- * worker's near-continuous bank3 (activation) SDRAM traffic does not starve the DCMI
- * DMA of SDRAM bandwidth at 480x272 (which overruns the DCMI FIFO -- issue #83).  The
- * camera-owning `ai stream` path (lighter: QVGA default, no GUIX copy-forward) keeps
- * its full rate.  ~250 ms after a ~685 ms inference -> ~1/s detections and ~70% worker
- * duty (was ~93%).  A live overlay does not need real-time detection. */
-#define NNCAM_FEED_THROTTLE   250u        /* ticks (ms) slept after a feed inference */
-
 /* Staging buffers live in the NN arena (bank3, .sdram.ai).  Raw bytes: hold either
  * int8 or float32 preprocessed input depending on the model's input dtype. */
 static uint8_t nncam_stage[NNCAM_STAGE_N][NNCAM_STAGE_BYTES]
@@ -351,10 +343,7 @@ static void nncam_entry(ULONG arg)
 		while (nncam_run && !nncam_producer_dead) {
 			if (tx_semaphore_get(&nncam_sem, NNCAM_POLL_TICKS) != TX_SUCCESS)
 				continue;                   /* timeout -> re-check run/dead         */
-			/* Throttle only the GUIX overlay feed (mode FEED): give the DCMI DMA a
-			 * bandwidth gap after each inference so it does not overrun (#83). */
-			if (nncam_step() && nncam_mode == NNCAM_MODE_FEED)
-				tx_thread_sleep(NNCAM_FEED_THROTTLE);
+			(void)nncam_step();
 		}
 		if (nncam_producer_dead) {
 			LOG_WRN("camera producer stopped -- auto-stopping inference");
