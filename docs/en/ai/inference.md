@@ -5,10 +5,10 @@ A backend-agnostic `nn` abstraction layer plus an `ai` shell command for running
 first use case is **camera face detection** (OV5640/DCMI → inference).
 
 !!! note "Phase status"
-    The P1 **null-backend foundation** and the **X-CUBE-AI (`stedgeai`) backend**
-    are implemented (the latter validated on hardware with an MNIST int8 sample:
-    runtime execution + cacheable arena).  The BlazeFace decode (#8), SD model
-    loading (P2), the TFLM backend (P3), and the GUIX overlay (P4) are follow-ups.
+    **P1 complete** — null-backend foundation + X-CUBE-AI (`stedgeai`) backend +
+    BlazeFace-128 face detection running on hardware (`ai run`/`ai stream` print
+    face boxes, ~1.5 fps).  SD model loading (P2), the TFLM backend (P3), and the
+    GUIX box overlay (P4) are follow-ups.
 
 ## Design
 
@@ -49,6 +49,7 @@ HAL/CMSIS/ThreadX  <-  svc  <-  port/nn  <-  ui  <-  shell/src
 | `port/nn/nn_null.c` | Null backend (BlazeFace-shaped stub) |
 | `port/nn/nn_stedgeai.c` | X-CUBE-AI (STAI) backend (`generated/` + ST runtime .a) |
 | `port/nn/nn_camera.{c,h}` | Live camera → inference sink + worker |
+| `port/nn/models/blazeface.{c,h}` | BlazeFace face-detection decode (anchors + NMS, model-specific) |
 
 ## Memory layout
 
@@ -94,16 +95,38 @@ DCMI producer (prio 10)          nn worker (prio 18, best-effort)
   yield), so placing it below the CLI (16) is what guarantees `ai stream stop`
   reaches us.
 
+## Face detection (BlazeFace-front 128, #8)
+
+The first model is ST Model Zoo's **BlazeFace Front 128x128** (a MediaPipe/PINTO
+SSD face detector).
+
+- **Model**: `int8` quantized (int8 weights, 105 KB) but **float32 I/O** (a
+  QUANTIZE node at the input, DEQUANTIZE nodes at the outputs are baked in).  Input
+  `1x128x128x3 f32`; 4 output tensors (2 scales x {box, score}): `1x512x16` +
+  `1x512x1` (16x16 grid x2) and `1x384x16` + `1x384x1` (8x8 grid x6) = **896
+  anchors**.  box 16 = 4 bbox + 6 keypoints x2.
+- **Preprocessing** (`nn_camera.c`): RGB565 → nearest-neighbour resize → float32
+  **[0,1]** (`rgb/255`).  The model card says [-1,1], but only [0,1] detects faces
+  on hardware (maxscore 288 vs 11) — ST retrained with [0,1].  `ai norm <0|1>`
+  toggles it at runtime (0=[0,1] default / 1=[-1,1]).
+- **Post-processing** (`port/nn/models/blazeface.c`): tensors located by shape
+  (C=16→box, C=1→score; anchors=512→16x16, 384→8x8), cell-centre anchors, a logit
+  score threshold (no expf), box = `raw/128 + anchor centre`, hard NMS (IoU 0.5).
+  A safe no-op for non-BlazeFace models.
+- **Performance**: 31.8M MACC → **~685 ms / ~1.5 fps** (~4.6 cyc/MACC).  Not
+  real-time video but usable for a demo; `-O time` is worse (balanced is best).
+
 ## `ai` shell commands
 
 | Command | Description |
 |---|---|
 | `ai info` | backend / model name / I/O tensor shape, dtype, quant / arena size |
 | `ai bench [n]` | run inference n times on a fixed input; min/avg/max latency (µs, DWT) + throughput |
-| `ai run` | single-shot inference on one camera frame; latency + detections |
+| `ai run` | single-shot inference on one camera frame; latency + face boxes |
 | `ai stream start [qqvga\|qvga\|480x272]` | start live continuous inference (default QVGA) |
 | `ai stream stop` | stop |
-| `ai stream stats` | inference rate / latency / drops / detections |
+| `ai stream stats` | inference rate / latency / drops / face boxes (+ maxscore diag) |
+| `ai norm <0\|1>` | float input normalization toggle (1=[-1,1] / 0=[0,1] default) |
 
 **Latency** is measured with the Cortex-M7 DWT CYCCNT (RM0385 §40.10/§40.13/
 §40.14.2).  On the M7 the DWT CoreSight software lock must be cleared by writing
@@ -135,7 +158,7 @@ cmake -B build ... -DCONFIG_NN_BACKEND=stedgeai -DSTEDGEAI_ROOT=/opt/ST/STEdgeAI
 
 | Phase | Scope |
 |---|---|
-| **P1** | `nn` abstraction + X-CUBE-AI backend + `ai` command + BlazeFace-128 first-light |
+| **P1 ✅** | `nn` abstraction + X-CUBE-AI backend + `ai` command + **BlazeFace-128 face detection first-light** |
 | P2 | Load the model/weights from the SD card (FileX → `.sdram.ai`) |
 | P3 | TFLM backend behind the same API; comparative bench |
 | P4 | GUIX overlay (live preview + face bbox) |

@@ -36,16 +36,51 @@
 #include <stdint.h>
 
 /* This backend assumes exactly one input and one activation arena, and handles
- * up to 3 outputs (covers MNIST 1-out and BlazeFace 2-out).  Guard so a future
- * model with a different shape fails loudly at compile time (codex suggestion). */
+ * up to 4 outputs (covers MNIST 1-out and BlazeFace-front 4-out: 2 score + 2 box
+ * tensors, 2 anchor scales).  Guard so a future model with a different shape
+ * fails loudly at compile time (codex suggestion). */
 #if STAI_NETWORK_IN_NUM != 1
 #error "nn_stedgeai: exactly one input assumed -- extend the backend"
 #endif
 #if STAI_NETWORK_ACTIVATIONS_NUM != 1
 #error "nn_stedgeai: exactly one activation buffer assumed -- extend the backend"
 #endif
-#if STAI_NETWORK_OUT_NUM > 3
-#error "nn_stedgeai: extend the output-tensor ladder (>3 outputs)"
+#if STAI_NETWORK_OUT_NUM > 4
+#error "nn_stedgeai: extend the output-tensor ladder (>4 outputs)"
+#endif
+
+/* Quantized (int8/uint8) tensors have SCALE/ZERO_POINT macros; float32 I/O
+ * tensors (e.g. BlazeFace) do not.  Default the missing ones to 0 (nn_tensor
+ * treats scale==0 as "not quantized") so the macro-based build works for both. */
+#ifndef STAI_NETWORK_IN_1_SCALE
+#define STAI_NETWORK_IN_1_SCALE 0.0f
+#endif
+#ifndef STAI_NETWORK_IN_1_ZERO_POINT
+#define STAI_NETWORK_IN_1_ZERO_POINT 0
+#endif
+#ifndef STAI_NETWORK_OUT_1_SCALE
+#define STAI_NETWORK_OUT_1_SCALE 0.0f
+#endif
+#ifndef STAI_NETWORK_OUT_1_ZERO_POINT
+#define STAI_NETWORK_OUT_1_ZERO_POINT 0
+#endif
+#ifndef STAI_NETWORK_OUT_2_SCALE
+#define STAI_NETWORK_OUT_2_SCALE 0.0f
+#endif
+#ifndef STAI_NETWORK_OUT_2_ZERO_POINT
+#define STAI_NETWORK_OUT_2_ZERO_POINT 0
+#endif
+#ifndef STAI_NETWORK_OUT_3_SCALE
+#define STAI_NETWORK_OUT_3_SCALE 0.0f
+#endif
+#ifndef STAI_NETWORK_OUT_3_ZERO_POINT
+#define STAI_NETWORK_OUT_3_ZERO_POINT 0
+#endif
+#ifndef STAI_NETWORK_OUT_4_SCALE
+#define STAI_NETWORK_OUT_4_SCALE 0.0f
+#endif
+#ifndef STAI_NETWORK_OUT_4_ZERO_POINT
+#define STAI_NETWORK_OUT_4_ZERO_POINT 0
 #endif
 
 /* Opaque network context (8-aligned per STAI_NETWORK_CONTEXT_ALIGNMENT). */
@@ -151,6 +186,12 @@ static int stai_bk_open(void **impl_out)
 	  stai_fill(&g_stm.out[2], outs[2], STAI_NETWORK_OUT_3_SIZE_BYTES,
 	            STAI_NETWORK_OUT_3_FORMAT, STAI_NETWORK_OUT_3_SCALE,
 	            STAI_NETWORK_OUT_3_ZERO_POINT, STAI_SHAPE_NDIM(sh), sh); }
+#endif
+#if STAI_NETWORK_OUT_NUM >= 4
+	{ static const int32_t sh[] = STAI_NETWORK_OUT_4_SHAPE;
+	  stai_fill(&g_stm.out[3], outs[3], STAI_NETWORK_OUT_4_SIZE_BYTES,
+	            STAI_NETWORK_OUT_4_FORMAT, STAI_NETWORK_OUT_4_SCALE,
+	            STAI_NETWORK_OUT_4_ZERO_POINT, STAI_SHAPE_NDIM(sh), sh); }
 #endif
 
 	*impl_out = &g_stm;

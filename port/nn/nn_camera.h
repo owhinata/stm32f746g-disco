@@ -24,7 +24,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "camera.h"   /* enum camera_res */
+#include "camera.h"            /* enum camera_res */
+#include "models/blazeface.h"  /* struct bf_det */
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,6 +59,13 @@ bool nn_camera_running(void);
 
 /** Snapshot current stats (any time). */
 void nn_camera_stats_get(struct nn_camera_stats *out);
+
+/** Copy the latest detections into @p out[0..max); returns the count copied. */
+int nn_camera_dets_get(struct bf_det *out, int max);
+
+/** Runtime float32 input normalization: 1 = [-1,1], 0 = [0,1] (tuning, no reflash). */
+void nn_camera_set_norm(int signed_range);
+int  nn_camera_get_norm(void);
 
 #ifdef __cplusplus
 }

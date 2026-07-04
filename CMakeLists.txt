@@ -261,7 +261,8 @@ set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null stedgeai)
 
 set(NN_SOURCES
     "${CMAKE_SOURCE_DIR}/port/nn/nn.c"
-    "${CMAKE_SOURCE_DIR}/port/nn/nn_camera.c")   # live camera -> inference glue
+    "${CMAKE_SOURCE_DIR}/port/nn/nn_camera.c"          # live camera -> inference glue
+    "${CMAKE_SOURCE_DIR}/port/nn/models/blazeface.c")  # BlazeFace decode (model post-proc)
 if(CONFIG_NN_BACKEND STREQUAL "null")
     list(APPEND NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/nn_null.c")
 elseif(CONFIG_NN_BACKEND STREQUAL "stedgeai")

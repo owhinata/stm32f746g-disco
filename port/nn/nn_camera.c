@@ -29,6 +29,7 @@
 
 #include "nn.h"
 #include "nn_camera.h"
+#include "models/blazeface.h" /* BlazeFace decode (model-specific post-process) */
 #include "camera.h"          /* camera_preview_start / camera_preview_stop / camera_frame_put */
 #include "frame_pipeline.h"  /* struct frame_sink / frame_desc / FRAME_POLICY_* */
 
@@ -38,19 +39,30 @@
 #include "log.h"
 
 /* Max model input: BlazeFace-128 is 128x128x3.  Two staging buffers in the NN
- * arena (.sdram.ai, bank3).  Larger models would bump this bound. */
+ * arena (.sdram.ai, bank3).  Sized for the worst case -- a FLOAT32 128x128x3
+ * input (BlazeFace) = 196608 B/buffer; int8 models use a quarter.  Larger models
+ * would bump these bounds. */
 #define NNCAM_IN_MAX_W    128u
 #define NNCAM_IN_MAX_H    128u
 #define NNCAM_IN_MAX_C    3u
-#define NNCAM_STAGE_BYTES (NNCAM_IN_MAX_W * NNCAM_IN_MAX_H * NNCAM_IN_MAX_C)
+#define NNCAM_STAGE_BYTES (NNCAM_IN_MAX_W * NNCAM_IN_MAX_H * NNCAM_IN_MAX_C * 4u)
 #define NNCAM_STAGE_N     2
+
+/* Float32 input normalization.  BlazeFace's model card says [-1,1], but its ST
+ * config says rescale 1/255 -> [0,1] -- and [0,1] is what actually detects faces
+ * on hardware (maxscore 288 vs 11), so ST retrained with [0,1].  Default [0,1];
+ * `ai norm 1` flips to [-1,1] at runtime for other models. */
+#ifndef NNCAM_NORM_SIGNED
+#define NNCAM_NORM_SIGNED 0
+#endif
 
 #define NNCAM_WORKER_PRIORITY 18          /* full best-effort (below BG-17)        */
 #define NNCAM_WORKER_STACK    8192u
 #define NNCAM_POLL_TICKS      100u        /* sem wait -> stop latency               */
 
-/* Staging buffers live in the NN arena (bank3, .sdram.ai). */
-static int8_t nncam_stage[NNCAM_STAGE_N][NNCAM_STAGE_BYTES]
+/* Staging buffers live in the NN arena (bank3, .sdram.ai).  Raw bytes: hold either
+ * int8 or float32 preprocessed input depending on the model's input dtype. */
+static uint8_t nncam_stage[NNCAM_STAGE_N][NNCAM_STAGE_BYTES]
 	__attribute__((aligned(32), section(".sdram.ai")));
 
 enum { ST_FREE = 0, ST_FILLING, ST_READY, ST_RUNNING };
@@ -88,6 +100,15 @@ static void nncam_release_session(void)
 /* Model input geometry, latched at start from the input tensor. */
 static uint16_t nncam_in_w, nncam_in_h, nncam_in_c;
 static uint32_t nncam_in_bytes;
+static uint8_t  nncam_in_dtype;   /* enum nn_dtype of the model input */
+
+/* Latest detections (BlazeFace), guarded by nncam_lock; read via nn_camera_dets_get(). */
+static struct bf_det nncam_dets[BF_MAX_DET];
+static int           nncam_ndet;
+
+/* Float32 input normalization, runtime-tunable (ai norm) to settle the [-1,1] vs
+ * [0,1] ambiguity on hardware without reflashing. */
+static int nncam_norm_signed = NNCAM_NORM_SIGNED;
 
 static struct {
 	uint32_t frames;
@@ -99,17 +120,19 @@ static struct {
 	uint32_t start_tick;
 } nnstat;
 
-/* ---- RGB565 -> int8 nearest-neighbour resize/convert ---------------------- */
+/* ---- RGB565 -> model input: nearest-neighbour resize + convert ------------ */
 
-/* Convert one camera frame @p f (RGB565) into @p dst (int8 HxWxC).  Reads only
- * the sampled source pixels.  int8 = uint8 - 128 (symmetric); the exact model
- * normalization/quant is aligned to the deployed BlazeFace in task 6/8. */
-static void nncam_preprocess(const struct frame_desc *f, int8_t *dst)
+/* Convert one camera frame @p f (RGB565) into @p dst (HxWxC), formatted for the
+ * model input dtype.  Reads only the sampled source pixels.
+ *   - FLOAT32: RGB in [-1,1] (NNCAM_NORM_SIGNED) or [0,1] -- BlazeFace.
+ *   - INT8   : uint8 - 128 (symmetric ~[-1,1], scale 1/128) -- MNIST/null stub. */
+static void nncam_preprocess(const struct frame_desc *f, void *dst)
 {
 	const uint8_t *base = (const uint8_t *)f->data;
 	uint32_t stride = f->stride ? f->stride : (uint32_t)f->width * 2u;
-	uint16_t ow = nncam_in_w, oh = nncam_in_h;
+	uint16_t ow = nncam_in_w, oh = nncam_in_h, oc = nncam_in_c;
 	uint16_t sw = f->width, sh = f->height;
+	int is_f32 = (nncam_in_dtype == NN_DTYPE_FLOAT32);
 
 	for (uint16_t oy = 0; oy < oh; oy++) {
 		uint16_t sy = (uint16_t)((uint32_t)oy * sh / oh);
@@ -117,13 +140,24 @@ static void nncam_preprocess(const struct frame_desc *f, int8_t *dst)
 		for (uint16_t ox = 0; ox < ow; ox++) {
 			uint16_t sx = (uint16_t)((uint32_t)ox * sw / ow);
 			uint16_t px = (uint16_t)(row[sx * 2] | ((uint16_t)row[sx * 2 + 1] << 8));
-			uint8_t r = (uint8_t)(((px >> 11) & 0x1Fu) * 255u / 31u);
-			uint8_t g = (uint8_t)(((px >> 5) & 0x3Fu) * 255u / 63u);
-			uint8_t b = (uint8_t)((px & 0x1Fu) * 255u / 31u);
-			int8_t *o = dst + ((uint32_t)oy * ow + ox) * nncam_in_c;
-			o[0] = (int8_t)((int)r - 128);
-			if (nncam_in_c > 1) o[1] = (int8_t)((int)g - 128);
-			if (nncam_in_c > 2) o[2] = (int8_t)((int)b - 128);
+			uint8_t rgb[3];
+			uint32_t o = ((uint32_t)oy * ow + ox) * oc;
+
+			rgb[0] = (uint8_t)(((px >> 11) & 0x1Fu) * 255u / 31u);
+			rgb[1] = (uint8_t)(((px >> 5) & 0x3Fu) * 255u / 63u);
+			rgb[2] = (uint8_t)((px & 0x1Fu) * 255u / 31u);
+
+			if (is_f32) {
+				float *o32 = (float *)dst + o;
+				for (uint16_t c = 0; c < oc && c < 3; c++)
+					o32[c] = nncam_norm_signed
+					       ? (float)rgb[c] / 127.5f - 1.0f   /* [-1,1] */
+					       : (float)rgb[c] / 255.0f;         /* [0,1]  */
+			} else {
+				int8_t *o8 = (int8_t *)dst + o;
+				for (uint16_t c = 0; c < oc && c < 3; c++)
+					o8[c] = (int8_t)((int)rgb[c] - 128);
+			}
 		}
 	}
 }
@@ -139,6 +173,7 @@ static int nncam_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t h)
 
 	/* Fresh session on attach (single reset point, like eth_open). */
 	nncam_producer_dead = 0;
+	nncam_ndet = 0;                     /* drop stale detections from a prior session */
 	for (int i = 0; i < NNCAM_STAGE_N; i++)
 		nncam_state[i] = ST_FREE;
 	memset(&nnstat, 0, sizeof nnstat);
@@ -229,8 +264,25 @@ static int nncam_step(void)
 	}
 	nnstat.infers++;
 	nnstat.last_us = nn_last_cycles(nncam_model) / mhz;
-	/* task 8: decode BlazeFace outputs -> nnstat.detections + bbox list. */
-	nnstat.detections = 0;
+
+	/* Model-specific decode (BlazeFace).  A safe no-op (returns <0) for other
+	 * models, so this stays model-agnostic at the sink level.  Publish the boxes
+	 * under the lock for nn_camera_dets_get(). */
+	{
+		struct bf_det tmp[BF_MAX_DET];
+		int nd = blazeface_decode(nncam_model, tmp, BF_MAX_DET);
+
+		tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
+		if (nd < 0) {
+			nncam_ndet = 0;
+		} else {
+			nncam_ndet = nd;
+			for (int d = 0; d < nd; d++)
+				nncam_dets[d] = tmp[d];
+		}
+		tx_mutex_put(&nncam_lock);
+		nnstat.detections = (nd > 0) ? (uint32_t)nd : 0u;
+	}
 	return 1;
 }
 
@@ -282,6 +334,7 @@ int nn_camera_start(enum camera_res res)
 	nncam_in_w = in->dims[2];
 	nncam_in_c = (in->ndim >= 4) ? in->dims[3] : 1;
 	nncam_in_bytes = in->bytes;
+	nncam_in_dtype = in->dtype;
 	if (nncam_in_w > NNCAM_IN_MAX_W || nncam_in_h > NNCAM_IN_MAX_H ||
 	    nncam_in_c > NNCAM_IN_MAX_C || nncam_in_bytes > NNCAM_STAGE_BYTES)
 		return -4;                          /* model input exceeds the staging bound */
@@ -379,3 +432,20 @@ void nn_camera_stats_get(struct nn_camera_stats *out)
 	elapsed = now - nnstat.start_tick;
 	out->fps_x100 = elapsed ? (uint32_t)((uint64_t)nnstat.infers * 100000u / elapsed) : 0u;
 }
+
+int nn_camera_dets_get(struct bf_det *out, int max)
+{
+	int n;
+
+	if (!nncam_created || !out || max <= 0)
+		return 0;                           /* nncam_lock not created before 1st start */
+	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
+	n = nncam_ndet < max ? nncam_ndet : max;
+	for (int i = 0; i < n; i++)
+		out[i] = nncam_dets[i];
+	tx_mutex_put(&nncam_lock);
+	return n;
+}
+
+void nn_camera_set_norm(int signed_range) { nncam_norm_signed = signed_range ? 1 : 0; }
+int  nn_camera_get_norm(void)              { return nncam_norm_signed; }

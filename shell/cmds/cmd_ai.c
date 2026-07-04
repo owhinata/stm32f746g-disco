@@ -223,6 +223,19 @@ static void ai_print_stats(struct cli_instance *sh, const struct nn_camera_stats
 	          (unsigned long)s->detections);
 }
 
+/* Print the latest detections as percent-of-frame boxes (avoids %f). */
+static void ai_print_dets(struct cli_instance *sh)
+{
+	struct bf_det d[BF_MAX_DET];
+	int n = nn_camera_dets_get(d, BF_MAX_DET);
+
+	for (int i = 0; i < n; i++)
+		cli_print(sh, "  face[%d]  x %ld%% y %ld%% w %ld%% h %ld%%  score %ld%%\r\n",
+		          i, (long)(d[i].x * 100.0f), (long)(d[i].y * 100.0f),
+		          (long)(d[i].w * 100.0f), (long)(d[i].h * 100.0f),
+		          (long)(d[i].score * 100.0f));
+}
+
 static int cmd_ai_run(struct cli_instance *sh, int argc, char **argv)
 {
 	struct nn_camera_stats s;
@@ -256,6 +269,7 @@ static int cmd_ai_run(struct cli_instance *sh, int argc, char **argv)
 	}
 	cli_print(sh, "inference: %lu us, %lu detections\r\n",
 	          (unsigned long)s.last_us, (unsigned long)s.detections);
+	ai_print_dets(sh);
 	return 0;
 }
 
@@ -306,6 +320,22 @@ static int cmd_ai_stream_stats(struct cli_instance *sh, int argc, char **argv)
 	(void)argc; (void)argv;
 	nn_camera_stats_get(&s);
 	ai_print_stats(sh, &s);
+	ai_print_dets(sh);
+	cli_print(sh, "maxscore %ld  norm %s  (diagnostic)\r\n",
+	          (long)(blazeface_last_max_score() * 100.0f),
+	          nn_camera_get_norm() ? "[-1,1]" : "[0,1]");
+	return 0;
+}
+
+static int cmd_ai_norm(struct cli_instance *sh, int argc, char **argv)
+{
+	if (argc > 1) {
+		if (!strcmp(argv[1], "0"))      nn_camera_set_norm(0);
+		else if (!strcmp(argv[1], "1")) nn_camera_set_norm(1);
+		else { cli_error(sh, "usage: ai norm <0|1>  (1=[-1,1], 0=[0,1])\r\n"); return 1; }
+	}
+	cli_print(sh, "norm = %s\r\n",
+	          nn_camera_get_norm() ? "[-1,1] (signed)" : "[0,1] (unsigned)");
 	return 0;
 }
 
@@ -322,6 +352,8 @@ CLI_SUBCMD_SET_CREATE(ai_subcmds,
 	            cmd_ai_bench, 1, 1),
 	CLI_CMD(run, NULL, "single-shot inference on one camera frame", cmd_ai_run),
 	CLI_CMD(stream, ai_stream_subcmds, "live camera inference", NULL),
+	CLI_CMD_ARG(norm, NULL, "float input norm <0|1> (1=[-1,1], 0=[0,1])",
+	            cmd_ai_norm, 1, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(ai, ai_subcmds,
