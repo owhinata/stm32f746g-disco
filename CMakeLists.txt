@@ -256,8 +256,12 @@ set(CLI_DEVMEM_DUMP_MAX_LEN "256" CACHE STRING "Max bytes per devmem dump")
 # `stedgeai` (X-CUBE-AI) links generated sources + libNetworkRuntime.a from a
 # local ST Edge AI Core install; those ST-SLA artifacts are NOT committed (public
 # repo, see .gitignore + port/nn/generated/) and land in issue #81 task 6.
-set(CONFIG_NN_BACKEND "null" CACHE STRING "NN inference backend: null | stedgeai")
-set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null stedgeai)
+# `tflm` (tflite-micro) is a C++ runtime whose interpreter + backend live in a
+# separate `tflm` static lib (cmake/tflite-micro.cmake); it enables C++ only for
+# that build so the default (null/stedgeai) firmware stays byte-identical and
+# needs no C++ toolchain (Epic #80 P3, issue #86).
+set(CONFIG_NN_BACKEND "null" CACHE STRING "NN inference backend: null | stedgeai | tflm")
+set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null stedgeai tflm)
 
 set(NN_SOURCES
     "${CMAKE_SOURCE_DIR}/port/nn/nn.c"
@@ -284,8 +288,15 @@ elseif(CONFIG_NN_BACKEND STREQUAL "stedgeai")
         "${CMAKE_SOURCE_DIR}/port/nn/nn_stedgeai.c"
         "${CMAKE_SOURCE_DIR}/port/nn/generated/network.c"
         "${CMAKE_SOURCE_DIR}/port/nn/generated/network_data.c")
+elseif(CONFIG_NN_BACKEND STREQUAL "tflm")
+    # TFLM (tflite-micro) C++ backend (Epic #80 P3, issue #86).  The C++ backend
+    # (nn_tflm.cc providing nn_backend_vt_selected) + the interpreter + the vendored
+    # tflite-micro tree are built into a `tflm` static lib below (cmake/tflite-micro.cmake)
+    # and linked into threadx.  Nothing is added to NN_SOURCES here on purpose: threadx's
+    # own TUs stay C, so the final link keeps the C driver (gcc) and does NOT pull the full
+    # libstdc++.  nn.c's undefined ref to nn_backend_vt_selected pulls nn_tflm.o from the lib.
 else()
-    message(FATAL_ERROR "CONFIG_NN_BACKEND must be 'null' or 'stedgeai'")
+    message(FATAL_ERROR "CONFIG_NN_BACKEND must be 'null', 'stedgeai' or 'tflm'")
 endif()
 
 add_executable(threadx
@@ -401,6 +412,22 @@ if(CONFIG_NN_BACKEND STREQUAL "stedgeai")
         "${STEDGEAI_INC}")
     target_link_libraries(threadx PRIVATE "${STEDGEAI_RT}")
     target_compile_definitions(threadx PRIVATE CONFIG_NN_BACKEND_STEDGEAI=1)
+endif()
+
+# TFLM (tflite-micro) C++ backend (Epic #80 P3, issue #86).  Builds the `tflm`
+# static lib (C++ interpreter + vendored tree + nn_tflm/tflm_spike/cxx_runtime),
+# links it + the nano C++ runtime archives, and enables the `ai selftest` hook.
+# The final threadx link stays on the C driver (no C++ TU in threadx itself).
+if(CONFIG_NN_BACKEND STREQUAL "tflm")
+    include("${CMAKE_SOURCE_DIR}/cmake/tflite-micro.cmake")
+    target_link_libraries(threadx PRIVATE tflm)
+    target_compile_definitions(threadx PRIVATE CONFIG_NN_BACKEND_TFLM=1)
+    # Keep the final link on the C driver (gcc): threadx's own TUs are all C, and
+    # linking the CXX `tflm` lib would otherwise make CMake pick the g++ driver,
+    # which auto-adds the FULL libstdc++ (exceptions).  We link the nano C++ archives
+    # explicitly (in cmake/tflite-micro.cmake) instead.  LINKER_LANGUAGE C makes the
+    # driver choice match that design.
+    set_target_properties(threadx PROPERTIES LINKER_LANGUAGE C)
 endif()
 
 firmware_finalize(threadx)

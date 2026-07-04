@@ -39,6 +39,10 @@ endif()
 # --- Compilers / tools ------------------------------------------------------
 set(CMAKE_C_COMPILER   "${GCC_BIN}/arm-none-eabi-gcc")
 set(CMAKE_ASM_COMPILER "${GCC_BIN}/arm-none-eabi-gcc")
+# C++ compiler is set here (harmless for the default C-only builds -- the project
+# is `C ASM`, so CXX is never enabled/probed) but is required for the TFLM backend
+# build (CONFIG_NN_BACKEND=tflm), which calls enable_language(CXX) (Epic #80 #86).
+set(CMAKE_CXX_COMPILER "${GCC_BIN}/arm-none-eabi-g++")
 set(CMAKE_OBJCOPY      "${GCC_BIN}/arm-none-eabi-objcopy" CACHE FILEPATH "")
 set(CMAKE_SIZE         "${GCC_BIN}/arm-none-eabi-size"    CACHE FILEPATH "")
 
