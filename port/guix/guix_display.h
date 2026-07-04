@@ -89,6 +89,15 @@ void guix_display_cam_set_visible(bool on);
  *  under ltdc_lock.  Returns 0 on a completed copy, -1 otherwise. */
 int guix_display_cam_view_store(const uint16_t *src);
 
+/** Draw a 2-px RGB565 rectangle outline into the camera view buffer, scaled from a
+ *  normalized [0,1] box @p nx,@p ny,@p nw,@p nh (issue #83 face-detect overlay).  The
+ *  box rides the view buffer, so it is composited into the live image the same way as
+ *  the frame itself (#59 B2) and is overwritten by the next store.  No-op if no
+ *  preview session is armed (cam_view_data NULL).  Runs under ltdc_lock and marks both
+ *  LTDC buffers stale.  Call after guix_display_cam_view_store(), on the producer. */
+void guix_display_cam_overlay_box(float nx, float ny, float nw, float nh,
+                                  uint16_t rgb565);
+
 #ifdef __cplusplus
 }
 #endif

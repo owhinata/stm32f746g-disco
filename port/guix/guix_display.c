@@ -425,6 +425,57 @@ int guix_display_cam_view_store(const uint16_t *src)
 	return rc;
 }
 
+/* Fill the inclusive rectangle [x0,x1]x[y0,y1] (clamped to the view buffer wxh) with
+ * @p c in cam_view_data.  Caller holds ltdc_lock and has checked cam_view_data.  The
+ * view buffer is packed at cam_w stride starting at pixel (0,0). */
+static void cam_view_fill(int x0, int y0, int x1, int y1, int w, int h, uint16_t c)
+{
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > w - 1) x1 = w - 1;
+	if (y1 > h - 1) y1 = h - 1;
+	for (int yy = y0; yy <= y1; yy++) {
+		uint16_t *row = cam_view_data + (uint32_t)yy * (uint32_t)w;
+		for (int xx = x0; xx <= x1; xx++)
+			row[xx] = c;
+	}
+}
+
+/* Draw a 2-px RGB565 rectangle outline into the camera view buffer, scaled from a
+ * normalized [0,1] box (issue #83).  See the header.  The box rides the view buffer,
+ * so it is composited into the live image via the same B2 paths as the frame and is
+ * overwritten by the next store.  cam_view_buf is non-cacheable SDRAM, so these CPU
+ * writes are coherent with the DMA2D reads that later blit it. */
+void guix_display_cam_overlay_box(float nx, float ny, float nw, float nh,
+                                  uint16_t rgb565)
+{
+	const int T = 2;                        /* outline thickness (px)                */
+
+	ltdc_lock_frame();
+	if (cam_view_data != NULL && cam_w > 0u && cam_h > 0u) {
+		int w = (int)cam_w, h = (int)cam_h;
+		int l = (int)(nx * (float)w);
+		int t = (int)(ny * (float)h);
+		int r = (int)((nx + nw) * (float)w);
+		int b = (int)((ny + nh) * (float)h);
+
+		if (l < 0) l = 0;
+		if (t < 0) t = 0;
+		if (r > w - 1) r = w - 1;
+		if (b > h - 1) b = h - 1;
+		if (r >= l && b >= t) {
+			/* Four edge bands (corners overwritten twice, same colour). */
+			cam_view_fill(l, t, r, t + T - 1, w, h, rgb565);   /* top    */
+			cam_view_fill(l, b - T + 1, r, b, w, h, rgb565);   /* bottom */
+			cam_view_fill(l, t, l + T - 1, b, w, h, rgb565);   /* left   */
+			cam_view_fill(r - T + 1, t, r, b, w, h, rgb565);   /* right  */
+			cam_buf_stale[0] = true;
+			cam_buf_stale[1] = true;
+		}
+	}
+	ltdc_unlock_frame();
+}
+
 /*
  * Tear-free buffer toggle (GUIX calls this once per refreshed frame).  GUIX has
  * just composited the accumulated dirty region into the back buffer (= the

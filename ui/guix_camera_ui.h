@@ -36,6 +36,8 @@
 #ifndef GUIX_CAMERA_UI_H
 #define GUIX_CAMERA_UI_H
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -53,6 +55,17 @@ int camera_ui_start(void);
 /** Stop the live preview, blank the screen and hand the display back to `lcd`
  *  (`gui stop`).  Thread context only.  Idempotent.  Returns 0. */
 int camera_ui_stop(void);
+
+/** Enable/disable the on-preview face-detect bbox overlay (issue #83, Epic #80 P4).
+ *  Enabling feeds the live preview frames into the NN inference worker and draws the
+ *  returned face boxes onto the image; it needs a running preview and claims the
+ *  single NN session (mutually exclusive with `ai bench` / `ai stream`).  Serialized
+ *  against the async camera teardown.  Returns 0 on success, -1 if no preview is
+ *  running, or a negative feed-start error.  Idempotent. */
+int camera_ui_overlay_set(bool on);
+
+/** True while the face-detect overlay is enabled. */
+bool camera_ui_overlay_get(void);
 
 #ifdef __cplusplus
 }

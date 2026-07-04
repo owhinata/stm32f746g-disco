@@ -159,6 +159,16 @@ probe（カメラ有 ~150-250ms、無 ~1s）の間は GUIX dispatch が止まる
 
 > **画質変更と fps（#70）:** 画質変更（brightness/contrast/effect/flip/zoom/…）は preview の fps を落とさない — センサのタイミングを変えるのは night モードと解像度切替のみで、night を off にすると昼光時の AEC 上限が復帰して fps が mode 既定へ戻る。（以前は暗所で画質適用のたびに fps が落ちていた。）
 
+## 顔検出オーバレイ（#83, Epic #80 P4）
+
+`gui overlay on` で**ライブプレビュー上に顔検出の bbox 枠（緑）を描画**する（`gui overlay off` で解除、既定 OFF、引数無しの `gui overlay` で状態と推論統計を表示）。プレビュー映像を BlazeFace-128（`ai` コマンドと同じ推論土台、[AI 推論](../ai/inference.md)）に feed し、返ってきた顔 box をプレビューに重ねる。overlay の推論は **~1/s に throttle**（`nn_camera` FEED モード）、プレビューは ~15fps を維持: 連続実行だと worker は ~93% CPU で、活性化（bank3）の SDRAM トラフィックが DCMI DMA の帯域を奪い overrun するため、推論後に間隔を空けて DCMI に帯域の隙間を与える。camera 所有の `ai stream`（軽い）はフル ~1.5fps を維持。
+
+- **camera 単一所有のまま推論する（Approach A）**: `ai stream` は camera を自分で所有するため GUIX preview と排他だが、overlay は **GUIX が camera を所有したまま** frame consume から推論へ frame を feed する（`nn_camera` の external-feed モード `nn_camera_feed_start/feed/feed_abort`）。worker / staging（`.sdram.ai`）/ BlazeFace decode / dets は `ai stream` と共有し、単一 NN セッションガードで相互排他: overlay 稼働中は `ai bench` / `ai stream start` が拒否、`ai stream stop` は「`gui overlay off` を使え」と案内する（`nn_camera` の CAMERA / FEED モード分離）。
+- **box は GUIX スレッドで「フレームの一部」として描く**: #59 B2 copy-forward は camera 矩形を毎 flip `cam_view_buf` から再スタンプするため、preview 上に別 widget を重ねると上書きされる。よって box は `guix_display_cam_overlay_box()` で **`cam_view_buf` に直接（`ltdc_lock` 下で）焼き込む**が、**producer(prio10) ではなく GUIX スレッドの `GX_EVENT_CAMERA_FRAME` ハンドラで描く**（producer で box ごとに `ltdc_lock` を取ると DCMI DMA の再アームを遅らせ overrun するため）。store / pixelmap draw / corrective refresh と同じ経路で両 LTDC バッファに伝播。box 座標は正規化 [0,1]（前処理が full frame を 128×128 に x/y 独立 squash）で clamp、次 store が古い box を上書き（overlay off / 検出消失で自然に消える）。`cam_view_buf` は bank0 non-cacheable SDRAM ゆえ cache maintenance 不要。
+- **frame-perfect ではない**: overlay は最後に完了した推論結果を描くので、box は表示中フレームより数フレーム前の顔位置を指す（ライブ overlay として許容）。
+- **ライフサイクル + overrun 自動復帰**: overlay の on/off と feed の start/abort は `overlay_lock` で直列化（意図 `overlay_wanted` と稼働 `overlay_on` を分離、複数シェル・非同期 teardown が乖離しない）。解像度切替（#69）は BlazeFace 入力が常に 128×128 ゆえ feed を維持したまま跨ぐ（`preview_reformatting` で deliberate teardown を識別）。**DCMI overrun でプレビューが倒れたら GUIX スレッド（`GX_EVENT_CAMERA_RESTART`）で自動再起動**し、NN セッションが空き次第 overlay も復帰。連続 overrun には backoff（規定回数で overlay 自動 OFF → 最終的に自動再起動停止、`gui start` で復帰）。
+- **480×272 は帯域が重い**（削除を #84 で追跡）: 全画面 480×272 では store（DMA2D bank1→bank0, 261KB/frame）+ DCMI(bank1) + 推論(bank3) が throttle 下でも DCMI を overrun し得る。**F746 の bus matrix は round-robin で per-master の SDRAM QoS を持たない**（RM0385 §2）ため優先度では解決不可。QVGA(320×240) は bank1 帯域 約 -41% で滑らか、かつアスペクト正（480×272 は 4:3 センサ視野を 16:9 へ非一様スケール＝横伸び）。
+
 ## 使い方
 
 ```text
@@ -172,6 +182,7 @@ sh> gui stop          # UI + preview を停止し LCD を lcd コマンドへ返
 sh> lcd info          # gui stop 後は lcd/touch/camera テストが使える
 sh> camera capture    # 〃
 sh> gui start         # カメラ UI を再開（preview 復帰）
+sh> gui overlay on    # ライブプレビュー上に顔 bbox を描画（#83）。off で解除、引数無しで状態表示
 ```
 
 ## 実装メモ

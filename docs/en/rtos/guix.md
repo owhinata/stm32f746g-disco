@@ -159,6 +159,16 @@ Putting the settings on their own page (rather than an overlay on top of the liv
 
 > **Image quality vs fps (#70):** changing image quality (brightness/contrast/effect/flip/zoom/…) keeps the preview fps — only night mode and resolution changes reprogram the sensor timing, and turning night mode off restores the daylight AEC ceiling so the fps returns to the per-mode target. (Earlier this dropped fps on every quality apply in a dark scene.)
 
+## Face-detect overlay (#83, Epic #80 P4)
+
+`gui overlay on` **draws green face-detection bounding boxes onto the live preview** (`gui overlay off` clears them, default OFF; bare `gui overlay` prints the state + inference stats). The preview frames are fed into BlazeFace-128 (the same inference stack as the `ai` command, see [AI inference](../ai/inference.md)) and the returned face boxes are composited onto the image. The overlay inference is throttled to ~1 detection/s (`nn_camera` FEED-mode throttle) while the preview stays at ~15 fps: run back-to-back it is ~93 % CPU and the worker's activation (bank3) SDRAM traffic starves the DCMI DMA of bandwidth and overruns it, so a gap after each run gives the DCMI room. The camera-owning `ai stream` (lighter) keeps its full ~1.5 fps.
+
+- **Infers while keeping single camera ownership (Approach A)**: `ai stream` owns the camera itself, so it is exclusive with the GUIX preview; the overlay instead **keeps GUIX as the camera owner** and feeds frames from the frame-consume path into inference (`nn_camera`'s external-feed mode `nn_camera_feed_start/feed/feed_abort`). The worker / staging (`.sdram.ai`) / BlazeFace decode / dets are shared with `ai stream` and gated by the single NN session guard: while the overlay runs, `ai bench` / `ai stream start` are refused and `ai stream stop` reports "use `gui overlay off`" (`nn_camera`'s CAMERA / FEED mode split).
+- **The box is drawn as part of the frame, on the GUIX thread**: the #59 B2 copy-forward re-stamps the camera rect from `cam_view_buf` on every flip, so a widget composited on top would be overwritten. The box is therefore burned **directly into `cam_view_buf` (under `ltdc_lock`) by `guix_display_cam_overlay_box()`**, from the GUIX thread's `GX_EVENT_CAMERA_FRAME` handler — NOT the camera producer: taking `ltdc_lock` per box on the producer (prio 10) delayed the DCMI DMA re-arm and caused overruns. It then propagates to both LTDC buffers via the same store / pixelmap-draw / corrective-refresh paths as the frame. Coordinates are normalized [0,1] (preprocessing squashes the full frame to 128×128 independently in x/y) and clamped; the next store overwrites the old box (so it clears on overlay-off or when a detection is lost). `cam_view_buf` is bank0 non-cacheable SDRAM, so the CPU writes are coherent with the DMA2D reads — no cache maintenance.
+- **Not frame-perfect**: the overlay draws the last completed inference, so a box lags the displayed frame by a few frames (acceptable for a live overlay).
+- **Lifecycle + overrun auto-recovery**: overlay on/off and the feed start/abort are serialized on `overlay_lock` (intent `overlay_wanted` vs active `overlay_on`) so concurrent shells and the async camera teardown cannot diverge them. A resolution change (#69) keeps the feed across the stop/restart (BlazeFace input is always 128×128; `preview_reformatting` distinguishes the deliberate teardown). **On a DCMI overrun the preview is auto-restarted** (GUIX-thread `GX_EVENT_CAMERA_RESTART`) and the overlay restored once the NN session frees; an escalating backoff drops the overlay after repeated rapid overruns and finally stops auto-restarting (`gui start` to recover).
+- **480×272 is bandwidth-heavy** (tracked for removal in #84): at the full-panel 480×272 preview the store (DMA2D bank1→bank0, 261 KB/frame) + DCMI (bank1) + inference (bank3) can still overrun the DCMI even throttled — the F746 bus matrix is round-robin with no per-master SDRAM QoS (RM0385 §2), so priority cannot help. QVGA (320×240) has ~41 % less bank1 traffic and is smoother; it is also correctly proportioned (480×272 non-uniformly scales the 4:3 sensor field to 16:9, stretching the image horizontally).
+
 ## Usage
 
 ```text
@@ -172,6 +182,7 @@ sh> gui stop          # stop the UI + preview and hand the LCD back to `lcd`
 sh> lcd info          # after gui stop the lcd/touch/camera test commands work
 sh> camera capture    # ditto
 sh> gui start         # resume the camera UI (preview comes back)
+sh> gui overlay on    # draw face bboxes on the live preview (#83); off clears, bare shows state
 ```
 
 ## Implementation notes

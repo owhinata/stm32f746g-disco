@@ -27,6 +27,8 @@
 #include "camera.h"            /* enum camera_res */
 #include "models/blazeface.h"  /* struct bf_det */
 
+struct frame_desc;             /* svc/frame_pipeline.h (external-feed push) */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -51,8 +53,42 @@ struct nn_camera_stats {
  */
 int  nn_camera_start(enum camera_res res);
 
-/** Stop live inference and release the camera (bounded wait for teardown). */
+/** Stop live inference and release the camera (bounded wait for teardown).
+ *  Only stops a camera-OWNING stream (`ai stream`/`ai run`); returns -3 if a GUIX
+ *  overlay external feed owns the session (tear that down via `gui overlay off`). */
 int  nn_camera_stop(void);
+
+/* ---- external-feed mode (GUIX face-detect overlay, issue #83) -------------
+ * The camera-owning path above takes the DCMI itself; the external-feed path lets
+ * an owner that ALREADY holds the camera (the GUIX live preview) push its frames
+ * into the same inference worker/decode/dets pipeline.  The two modes are mutually
+ * exclusive (single camera owner) and share the single nn session guard. */
+
+/**
+ * Start inference in external-feed mode: open the model, latch its input geometry,
+ * claim the nn session and start the worker -- but do NOT take the camera.  The
+ * caller (which owns the camera) then pushes frames with nn_camera_feed().  Bounded
+ * (no worker-park wait), so it is safe to call under a short caller lock.  Returns 0
+ * or <0 (-2 busy/tearing down, -3 model, -4 geometry, -5 objects, -6 nn session busy).
+ */
+int  nn_camera_feed_start(void);
+
+/**
+ * Push one RGB565 camera frame @p f into the external-feed pipeline (no-op unless a
+ * feed is running).  Synchronous copy: preprocesses into a free staging buffer and
+ * wakes the worker; drops if none free.  Must be called with @p f's data valid
+ * (pinned by the caller, who releases the pin afterwards).
+ */
+void nn_camera_feed(const struct frame_desc *f);
+
+/**
+ * Non-blocking teardown of an external-feed session (idempotent; no-op unless a feed
+ * is running).  Requests the worker to stop and release the nn session; safe to call
+ * from any thread (incl. the camera producer during async teardown) since it never
+ * waits on the worker.  The session is released asynchronously by the worker (or by
+ * this caller if the worker never entered its run loop).
+ */
+void nn_camera_feed_abort(void);
 
 /** True while a stream is running. */
 bool nn_camera_running(void);

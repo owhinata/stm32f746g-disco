@@ -305,6 +305,10 @@ static int cmd_ai_stream_stop(struct cli_instance *sh, int argc, char **argv)
 		cli_warn(sh, "not running\r\n");
 		return 0;
 	}
+	if (rc == -3) {
+		cli_error(sh, "owned by the GUI face-detect overlay; use 'gui overlay off'\r\n");
+		return 1;
+	}
 	if (rc != 0) {
 		cli_error(sh, "stop timed out (%d)\r\n", rc);
 		return 1;

@@ -7,8 +7,9 @@ first use case is **camera face detection** (OV5640/DCMI → inference).
 !!! note "Phase status"
     **P1 complete** — null-backend foundation + X-CUBE-AI (`stedgeai`) backend +
     BlazeFace-128 face detection running on hardware (`ai run`/`ai stream` print
-    face boxes, ~1.5 fps).  SD model loading (P2), the TFLM backend (P3), and the
-    GUIX box overlay (P4) are follow-ups.
+    face boxes, ~1.5 fps).  **P4 complete** — face bboxes drawn on the GUIX live
+    preview (`gui overlay on`, #83).  SD model loading (P2) and the TFLM backend
+    (P3) are follow-ups.
 
 ## Design
 
@@ -161,5 +162,5 @@ cmake -B build ... -DCONFIG_NN_BACKEND=stedgeai -DSTEDGEAI_ROOT=/opt/ST/STEdgeAI
 | **P1 ✅** | `nn` abstraction + X-CUBE-AI backend + `ai` command + **BlazeFace-128 face detection first-light** |
 | P2 | Load the model/weights from the SD card (FileX → `.sdram.ai`) |
 | P3 | TFLM backend behind the same API; comparative bench |
-| P4 | GUIX overlay (live preview + face bbox) |
+| **P4 ✅** | GUIX overlay (live preview + face bbox, #83 → [GUIX camera UI](../rtos/guix.md#face-detect-overlay-83-epic-80-p4)) |
 | P5 | X-CUBE-AI relocatable network (swap the whole model from SD) |

@@ -60,6 +60,14 @@
 #define NNCAM_WORKER_STACK    8192u
 #define NNCAM_POLL_TICKS      100u        /* sem wait -> stop latency               */
 
+/* Throttle the external-feed (GUIX overlay) inference: sleep between runs so the
+ * worker's near-continuous bank3 (activation) SDRAM traffic does not starve the DCMI
+ * DMA of SDRAM bandwidth at 480x272 (which overruns the DCMI FIFO -- issue #83).  The
+ * camera-owning `ai stream` path (lighter: QVGA default, no GUIX copy-forward) keeps
+ * its full rate.  ~250 ms after a ~685 ms inference -> ~1/s detections and ~70% worker
+ * duty (was ~93%).  A live overlay does not need real-time detection. */
+#define NNCAM_FEED_THROTTLE   250u        /* ticks (ms) slept after a feed inference */
+
 /* Staging buffers live in the NN arena (bank3, .sdram.ai).  Raw bytes: hold either
  * int8 or float32 preprocessed input depending on the model's input dtype. */
 static uint8_t nncam_stage[NNCAM_STAGE_N][NNCAM_STAGE_BYTES]
@@ -83,8 +91,25 @@ static volatile int nncam_holds_session;  /* the stream currently holds the nn s
 static int          nncam_created;        /* worker/objects created once            */
 static uint8_t      nncam_res;            /* enum camera_res of the active stream    */
 
+/* Session mode (issue #83): separates the camera-OWNING stream (`ai stream`/`ai run`,
+ * which takes the DCMI itself) from the GUIX external feed (which pushes frames from a
+ * preview it already owns).  A shell `ai stream stop` must not tear down a feed
+ * session, and feed_abort must not tear down a camera session.  Updated under
+ * nncam_lock alongside nncam_holds_session. */
+enum nncam_mode { NNCAM_MODE_NONE = 0, NNCAM_MODE_CAMERA, NNCAM_MODE_FEED };
+static volatile uint8_t nncam_mode;
+
+/* Session generation, bumped on every (re)start.  An in-flight ingest that spans a
+ * session boundary reverts instead of injecting a stale frame into the new session. */
+static volatile uint32_t nncam_epoch;
+
+/* External-feed ingests in progress on the producer thread; feed_start waits for this
+ * to drain before it resets the session state. */
+static volatile int nncam_ingest_inflight;
+
 /* Release the nn session iff this stream still holds it (exactly once per stream;
- * called from both nn_camera_stop() and the worker's producer_dead auto-stop). */
+ * called from nn_camera_stop(), nn_camera_feed_abort() and the worker's producer_dead
+ * auto-stop).  Also clears the session mode on the real release. */
 static void nncam_release_session(void)
 {
 	int held;
@@ -92,6 +117,8 @@ static void nncam_release_session(void)
 	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
 	held = nncam_holds_session;
 	nncam_holds_session = 0;
+	if (held)
+		nncam_mode = NNCAM_MODE_NONE;
 	tx_mutex_put(&nncam_lock);
 	if (held)
 		nn_session_release();
@@ -164,6 +191,22 @@ static void nncam_preprocess(const struct frame_desc *f, void *dst)
 
 /* ---- frame-pipeline sink (synchronous copy) ------------------------------- */
 
+/* Reset per-session state (both attach paths: nncam_open for the camera-owning sink,
+ * nn_camera_feed_start for the external feed which never sees the sink open cb).
+ * Bumps the epoch so an in-flight ingest from a prior session reverts. */
+static void nncam_session_reset(void)
+{
+	nncam_producer_dead = 0;
+	nncam_ndet = 0;                     /* drop stale detections from a prior session */
+	for (int i = 0; i < NNCAM_STAGE_N; i++)
+		nncam_state[i] = ST_FREE;
+	memset(&nnstat, 0, sizeof nnstat);
+	nnstat.start_tick = HAL_GetTick();
+	nncam_epoch++;
+	while (tx_semaphore_get(&nncam_sem, TX_NO_WAIT) == TX_SUCCESS)
+		;
+}
+
 static int nncam_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t h)
 {
 	(void)ctx; (void)w; (void)h;
@@ -171,31 +214,23 @@ static int nncam_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t h)
 	if (fmt != FRAME_FMT_RGB565)
 		return -1;                          /* preview delivers RGB565 only        */
 
-	/* Fresh session on attach (single reset point, like eth_open). */
-	nncam_producer_dead = 0;
-	nncam_ndet = 0;                     /* drop stale detections from a prior session */
-	for (int i = 0; i < NNCAM_STAGE_N; i++)
-		nncam_state[i] = ST_FREE;
-	memset(&nnstat, 0, sizeof nnstat);
-	nnstat.start_tick = HAL_GetTick();
-	while (tx_semaphore_get(&nncam_sem, TX_NO_WAIT) == TX_SUCCESS)
-		;
+	nncam_session_reset();                  /* fresh session on attach (like eth_open) */
 	return 0;
 }
 
-static int nncam_consume(void *ctx, const struct frame_desc *f)
+/* Shared ingest for both the camera-owning sink and the external feed: claim a FREE
+ * stage, preprocess @p f into it, and (unless the session was torn down / rotated
+ * during preprocess) publish it READY and wake the worker.  Reads f->data.  Does NOT
+ * release the pipeline pin -- each caller owns pin release (the camera-owning consume
+ * puts its own pin; the external feed's pin is owned by the GUIX preview). */
+static void nncam_ingest(const struct frame_desc *f)
 {
+	uint32_t epoch0;
 	int i = -1;
 
-	(void)ctx;
-
-	if (!nncam_run) {
-		camera_frame_put(&nncam_sink, f);
-		return 0;
-	}
-
-	/* Claim a FREE staging buffer (short critical section). */
+	/* Claim a FREE staging buffer (short critical section), latching the epoch. */
 	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
+	epoch0 = nncam_epoch;
 	for (int k = 0; k < NNCAM_STAGE_N; k++) {
 		if (nncam_state[k] == ST_FREE) { nncam_state[k] = ST_FILLING; i = k; break; }
 	}
@@ -203,20 +238,34 @@ static int nncam_consume(void *ctx, const struct frame_desc *f)
 
 	if (i < 0) {                            /* no free buffer -> drop this frame    */
 		nnstat.drops++;
-		camera_frame_put(&nncam_sink, f);
-		return 0;
+		return;
 	}
 
-	/* Resize + convert while the slot is still pinned (reads f->data). */
+	/* Resize + convert while the slot is still pinned by the caller (reads f->data). */
 	nncam_preprocess(f, nncam_stage[i]);
-	camera_frame_put(&nncam_sink, f);       /* release the pin immediately (in-flight 0) */
 
 	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
+	if (nncam_epoch != epoch0 || !nncam_run) {
+		/* The session was aborted / rotated during preprocess: do NOT inject this
+		 * (now stale) frame into a new session.  Revert the stage to FREE. */
+		nncam_state[i] = ST_FREE;
+		tx_mutex_put(&nncam_lock);
+		return;
+	}
 	nncam_state[i] = ST_READY;
 	tx_mutex_put(&nncam_lock);
 
 	nnstat.frames++;
 	(void)tx_semaphore_put(&nncam_sem);     /* wake the worker                      */
+}
+
+static int nncam_consume(void *ctx, const struct frame_desc *f)
+{
+	(void)ctx;
+
+	if (nncam_run)
+		nncam_ingest(f);                    /* preprocess into staging (pin held)   */
+	camera_frame_put(&nncam_sink, f);       /* release the pin (in-flight 0)        */
 	return 0;
 }
 
@@ -302,7 +351,10 @@ static void nncam_entry(ULONG arg)
 		while (nncam_run && !nncam_producer_dead) {
 			if (tx_semaphore_get(&nncam_sem, NNCAM_POLL_TICKS) != TX_SUCCESS)
 				continue;                   /* timeout -> re-check run/dead         */
-			(void)nncam_step();
+			/* Throttle only the GUIX overlay feed (mode FEED): give the DCMI DMA a
+			 * bandwidth gap after each inference so it does not overrun (#83). */
+			if (nncam_step() && nncam_mode == NNCAM_MODE_FEED)
+				tx_thread_sleep(NNCAM_FEED_THROTTLE);
 		}
 		if (nncam_producer_dead) {
 			LOG_WRN("camera producer stopped -- auto-stopping inference");
@@ -314,17 +366,12 @@ static void nncam_entry(ULONG arg)
 	}
 }
 
-/* ---- public API ----------------------------------------------------------- */
-
-int nn_camera_start(enum camera_res res)
+/* Open the model + latch its input geometry, bounds-checked against the staging
+ * buffers.  Returns 0, -3 (model open) or -4 (geometry).  Shared by both start paths. */
+static int nncam_open_model(void)
 {
 	struct nn_tensor *in;
-	int rc;
 
-	if (nncam_run || nncam_active)
-		return -2;                          /* running or still tearing down        */
-
-	/* Open the model + latch its input geometry (bounds-checked). */
 	if (nn_model_open(&nncam_model) != 0)
 		return -3;
 	in = nn_input(nncam_model, 0);
@@ -338,30 +385,78 @@ int nn_camera_start(enum camera_res res)
 	if (nncam_in_w > NNCAM_IN_MAX_W || nncam_in_h > NNCAM_IN_MAX_H ||
 	    nncam_in_c > NNCAM_IN_MAX_C || nncam_in_bytes > NNCAM_STAGE_BYTES)
 		return -4;                          /* model input exceeds the staging bound */
+	return 0;
+}
 
-	/* Create ThreadX objects exactly once (idempotent across start/stop). */
-	if (!nncam_created) {
-		if (tx_mutex_create(&nncam_lock, "nncam", TX_INHERIT) != TX_SUCCESS)
-			return -5;
-		if (tx_semaphore_create(&nncam_sem, "nncam", 0) != TX_SUCCESS) {
-			tx_mutex_delete(&nncam_lock);
-			return -5;
+static volatile int nncam_creating;     /* one thread owns the one-time object create */
+
+/* Create the worker thread, mutex and semaphore exactly once, shared by both start
+ * paths.  Serializes the one-time creation across concurrent shells with a PRIMASK
+ * init latch (no pre-created mutex -- same idiom as nn_model_open): exactly one thread
+ * creates the objects, any other waits for nncam_created before returning.  Idempotent
+ * once created (lock-free fast path).  Returns 0 or -5. */
+static int nncam_create_objects(void)
+{
+	for (;;) {
+		uint32_t primask = __get_PRIMASK();
+		int owner = 0;
+
+		__disable_irq();
+		if (nncam_created) {
+			__set_PRIMASK(primask);
+			return 0;
 		}
-		nncam_sink.name    = "nncam";
-		nncam_sink.policy  = FRAME_POLICY_DROP;
-		nncam_sink.open    = nncam_open;
-		nncam_sink.consume = nncam_consume;
-		nncam_sink.close   = nncam_close;
-		if (tx_thread_create(&nncam_thread, "nn-worker", nncam_entry, 0,
-		                     nncam_stack, sizeof nncam_stack,
-		                     NNCAM_WORKER_PRIORITY, NNCAM_WORKER_PRIORITY,
-		                     TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS) {
-			tx_semaphore_delete(&nncam_sem);
-			tx_mutex_delete(&nncam_lock);
-			return -5;
-		}
-		nncam_created = 1;
+		if (!nncam_creating) { nncam_creating = 1; owner = 1; }
+		__set_PRIMASK(primask);
+
+		if (owner)
+			break;
+		tx_thread_sleep(1);             /* another thread is creating; wait + retry */
 	}
+
+	/* This thread owns the create. */
+	if (tx_mutex_create(&nncam_lock, "nncam", TX_INHERIT) != TX_SUCCESS) {
+		nncam_creating = 0;
+		return -5;
+	}
+	if (tx_semaphore_create(&nncam_sem, "nncam", 0) != TX_SUCCESS) {
+		tx_mutex_delete(&nncam_lock);
+		nncam_creating = 0;
+		return -5;
+	}
+	nncam_sink.name    = "nncam";
+	nncam_sink.policy  = FRAME_POLICY_DROP;
+	nncam_sink.open    = nncam_open;
+	nncam_sink.consume = nncam_consume;
+	nncam_sink.close   = nncam_close;
+	if (tx_thread_create(&nncam_thread, "nn-worker", nncam_entry, 0,
+	                     nncam_stack, sizeof nncam_stack,
+	                     NNCAM_WORKER_PRIORITY, NNCAM_WORKER_PRIORITY,
+	                     TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS) {
+		tx_semaphore_delete(&nncam_sem);
+		tx_mutex_delete(&nncam_lock);
+		nncam_creating = 0;
+		return -5;
+	}
+	nncam_created = 1;                   /* publish (waiters spin on this) */
+	nncam_creating = 0;
+	return 0;
+}
+
+/* ---- public API ----------------------------------------------------------- */
+
+int nn_camera_start(enum camera_res res)
+{
+	int rc;
+
+	if (nncam_run || nncam_active)
+		return -2;                          /* running or still tearing down        */
+
+	rc = nncam_open_model();                /* model + input geometry (bounds-checked) */
+	if (rc != 0)
+		return rc;
+	if (nncam_create_objects() != 0)
+		return -5;
 
 	/* Claim the single inference session: refused (-6) if `ai bench` or another
 	 * stream/run is already using the non-reentrant singleton model. */
@@ -378,7 +473,10 @@ int nn_camera_start(enum camera_res res)
 	}
 
 	nncam_res = (uint8_t)res;
+	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
+	nncam_mode = NNCAM_MODE_CAMERA;
 	nncam_holds_session = 1;
+	tx_mutex_put(&nncam_lock);
 	nncam_run = 1;
 	return 0;
 }
@@ -387,6 +485,8 @@ int nn_camera_stop(void)
 {
 	if (!nncam_run && !nncam_active)
 		return -1;
+	if (nncam_mode == NNCAM_MODE_FEED)
+		return -3;                          /* owned by the GUIX overlay feed (#83)  */
 
 	nncam_run = 0;
 	(void)tx_semaphore_put(&nncam_sem);     /* wake the worker if waiting           */
@@ -406,6 +506,77 @@ int nn_camera_stop(void)
 	 * did not already (idempotent via the holds flag). */
 	nncam_release_session();
 	return 0;
+}
+
+/* ---- external-feed mode (GUIX overlay, issue #83) ------------------------- */
+
+int nn_camera_feed_start(void)
+{
+	int rc;
+
+	if (nncam_run || nncam_active)
+		return -2;                          /* running or still tearing down        */
+
+	rc = nncam_open_model();                /* model + input geometry (bounds-checked) */
+	if (rc != 0)
+		return rc;
+	if (nncam_create_objects() != 0)
+		return -5;
+
+	/* Claim the single inference session; refused (-6) if a bench/stream/run holds it. */
+	if (nn_session_try_acquire() != 0)
+		return -6;
+
+	/* Wait (bounded) for any in-flight producer ingest to drain before resetting the
+	 * session state (so nncam_session_reset() cannot fight a live ingest).  On
+	 * timeout, release the just-claimed session and report busy -- try_acquire ran
+	 * before nncam_holds_session is set, so a raw release balances it. */
+	for (int i = 0; i < 10 && nncam_ingest_inflight; i++)
+		tx_thread_sleep(1);
+	if (nncam_ingest_inflight) {
+		nn_session_release();
+		return -2;
+	}
+
+	nncam_session_reset();
+	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
+	nncam_mode = NNCAM_MODE_FEED;
+	nncam_holds_session = 1;
+	tx_mutex_put(&nncam_lock);
+	nncam_run = 1;                          /* publish last: worker + feed see it ready */
+	return 0;
+}
+
+void nn_camera_feed(const struct frame_desc *f)
+{
+	/* Count this producer in-flight BEFORE the run/mode gate: otherwise
+	 * nn_camera_feed_start()'s drain could observe inflight==0 while a producer sits
+	 * between the gate and the increment, and then session_reset() would race that
+	 * producer's live ingest. */
+	nncam_ingest_inflight++;
+	if (nncam_run && nncam_mode == NNCAM_MODE_FEED)
+		nncam_ingest(f);                    /* preprocess into staging (pin held by caller) */
+	nncam_ingest_inflight--;
+}
+
+void nn_camera_feed_abort(void)
+{
+	if (nncam_mode != NNCAM_MODE_FEED)
+		return;                             /* only tear down a feed session         */
+	if (!nncam_run && !nncam_active)
+		return;                             /* nothing to abort                      */
+
+	nncam_run = 0;
+	nncam_producer_dead = 1;                /* worker's producer_dead path releases   */
+	(void)tx_semaphore_put(&nncam_sem);     /* wake the worker if waiting             */
+
+	/* If the worker never entered its run loop (pre-active abort), it will not reach
+	 * the producer_dead release path -- release here.  nncam_release_session() is
+	 * idempotent via the holds flag, so this and any worker release resolve to
+	 * exactly one nn_session_release().  run=0/dead=1 are set first, so the worker
+	 * never runs a real inference after this, making an early release harmless. */
+	if (!nncam_active)
+		nncam_release_session();
 }
 
 bool nn_camera_running(void)
