@@ -99,6 +99,26 @@ static void mpu_config_sdram(void)
     r.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
     HAL_MPU_ConfigRegion(&r);
 
+    /* Region 1: FMC internal bank3 (.sdram.ai, 0xC0600000, 2 MB) as Normal
+     * cacheable Write-Back/Write-Allocate (TEX=1,C=1,B=1).  A higher region
+     * number wins on overlap (ARMv7-M PMSAv7), so this overrides region0's
+     * non-cacheable attribute for bank3 only.  The NN inference arena (activations
+     * + camera->model staging) lives here and is CPU-only -- NO DMA writes into
+     * bank3 (camera DMA targets bank1, ETH bank2, LTDC bank0) -- so D-cache is
+     * coherent without any maintenance.  Non-cacheable SDRAM activations were
+     * ~20x slower for NN inference (issue #81 #6, measured on MNIST). */
+    r.Number           = MPU_REGION_NUMBER1;
+    r.BaseAddress      = 0xC0600000u;
+    r.Size             = MPU_REGION_SIZE_2MB;
+    r.SubRegionDisable = 0x00;
+    r.TypeExtField     = MPU_TEX_LEVEL1;           /* TEX=1, C=1, B=1: Normal WBWA */
+    r.IsCacheable      = MPU_ACCESS_CACHEABLE;
+    r.IsBufferable     = MPU_ACCESS_BUFFERABLE;
+    r.IsShareable      = MPU_ACCESS_NOT_SHAREABLE;
+    r.AccessPermission = MPU_REGION_FULL_ACCESS;
+    r.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
+    HAL_MPU_ConfigRegion(&r);
+
     HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 }
 

@@ -265,9 +265,24 @@ set(NN_SOURCES
 if(CONFIG_NN_BACKEND STREQUAL "null")
     list(APPEND NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/nn_null.c")
 elseif(CONFIG_NN_BACKEND STREQUAL "stedgeai")
-    message(FATAL_ERROR
-        "CONFIG_NN_BACKEND=stedgeai: X-CUBE-AI backend lands in issue #81 task 6 "
-        "(needs -DSTEDGEAI_ROOT + a generated model under port/nn/generated/)")
+    # X-CUBE-AI / ST Edge AI Core backend (issue #81 #6).  Links the ST-SLA
+    # GCC/Cortex-M7 runtime static library + the `stedgeai generate` output under
+    # port/nn/generated/ (both .gitignored).  Regenerate the model with:
+    #   $STEDGEAI_ROOT/Utilities/linux/stedgeai generate --model M.tflite \
+    #       --target stm32f7 --type tflite --name network --output port/nn/generated
+    set(STEDGEAI_ROOT "/opt/ST/STEdgeAI/4.0" CACHE PATH "ST Edge AI Core install root")
+    set(STEDGEAI_RT "${STEDGEAI_ROOT}/Middlewares/ST/AI/Lib/GCC/ARMCortexM7/NetworkRuntime1201_CM7_GCC.a")
+    set(STEDGEAI_INC "${STEDGEAI_ROOT}/Middlewares/ST/AI/Inc")
+    if(NOT EXISTS "${STEDGEAI_RT}")
+        message(FATAL_ERROR "stedgeai runtime not found:\n  ${STEDGEAI_RT}\nSet -DSTEDGEAI_ROOT=<install> (issue #81 #6)")
+    endif()
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/port/nn/generated/network.c")
+        message(FATAL_ERROR "generated model missing under port/nn/generated/ -- run `stedgeai generate` (issue #81 #6)")
+    endif()
+    list(APPEND NN_SOURCES
+        "${CMAKE_SOURCE_DIR}/port/nn/nn_stedgeai.c"
+        "${CMAKE_SOURCE_DIR}/port/nn/generated/network.c"
+        "${CMAKE_SOURCE_DIR}/port/nn/generated/network_data.c")
 else()
     message(FATAL_ERROR "CONFIG_NN_BACKEND must be 'null' or 'stedgeai'")
 endif()
@@ -376,4 +391,15 @@ target_compile_definitions(threadx PRIVATE TX_INCLUDE_USER_DEFINE_FILE
     CLI_BG_JOB_STACK_SIZE=4096)           # ... and in a bg worker: coremark & (issue #25)
 target_compile_options(threadx PRIVATE -O2)
 target_link_options(threadx PRIVATE -u _printf_float)   # CoreMark %f score line
+
+# X-CUBE-AI backend: generated + ST AI runtime include paths and the ST-SLA
+# GCC/Cortex-M7 runtime static library (issue #81 #6).  Only when selected.
+if(CONFIG_NN_BACKEND STREQUAL "stedgeai")
+    target_include_directories(threadx PRIVATE
+        "${CMAKE_SOURCE_DIR}/port/nn/generated"
+        "${STEDGEAI_INC}")
+    target_link_libraries(threadx PRIVATE "${STEDGEAI_RT}")
+    target_compile_definitions(threadx PRIVATE CONFIG_NN_BACKEND_STEDGEAI=1)
+endif()
+
 firmware_finalize(threadx)

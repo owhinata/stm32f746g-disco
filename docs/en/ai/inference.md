@@ -5,9 +5,10 @@ A backend-agnostic `nn` abstraction layer plus an `ai` shell command for running
 first use case is **camera face detection** (OV5640/DCMI → inference).
 
 !!! note "Phase status"
-    The P1 **foundation (null backend)** is implemented.  The X-CUBE-AI
-    (`stedgeai`) backend + BlazeFace decode (#6/#8), SD model loading (P2), the
-    TFLM backend (P3), and the GUIX overlay (P4) are follow-ups.
+    The P1 **null-backend foundation** and the **X-CUBE-AI (`stedgeai`) backend**
+    are implemented (the latter validated on hardware with an MNIST int8 sample:
+    runtime execution + cacheable arena).  The BlazeFace decode (#8), SD model
+    loading (P2), the TFLM backend (P3), and the GUIX overlay (P4) are follow-ups.
 
 ## Design
 
@@ -17,8 +18,10 @@ first use case is **camera face detection** (OV5640/DCMI → inference).
   - `null` — no runtime (default).  The firmware **always builds** without the
     stedgeai toolchain or a model; a stub with BlazeFace-shaped I/O exercises the
     full plumbing end to end.
-  - `stedgeai` — X-CUBE-AI / ST Edge AI Core (follow-up).  Links the generated C
-    plus the pre-compiled static library `libNetworkRuntime.a`.
+  - `stedgeai` — X-CUBE-AI / ST Edge AI Core.  Links the `stedgeai generate`
+    output (STAI API) plus the pre-compiled static library
+    `NetworkRuntime*_CM7_GCC.a`.  Tensor descriptors are built from the generated
+    `STAI_NETWORK_*` macros (model-agnostic, 1-in/1-out to multi-output).
   - `tflm` — LiteRT / TensorFlow Lite Micro (follow-up).
 - **Model-specific pre/post-processing** (BlazeFace anchor decode + NMS, etc.)
   lives *above* the `nn` layer (`port/nn/models/`); the generic `nn` layer stays
@@ -44,15 +47,18 @@ HAL/CMSIS/ThreadX  <-  svc  <-  port/nn  <-  ui  <-  shell/src
 | `port/nn/nn_backend.h` | Vtable each backend implements (`nn_backend_vt_selected`) |
 | `port/nn/nn.c` | Public API dispatch + **DWT CYCCNT** inference-latency timing |
 | `port/nn/nn_null.c` | Null backend (BlazeFace-shaped stub) |
+| `port/nn/nn_stedgeai.c` | X-CUBE-AI (STAI) backend (`generated/` + ST runtime .a) |
 | `port/nn/nn_camera.{c,h}` | Live camera → inference sink + worker |
 
 ## Memory layout
 
 - **`.sdram.ai` arena** — FMC internal **bank3** (`0xC0600000`–`0xC07FFFFF`, 2 MB).
   Its own bank, separate from the DMA banks (bank0 LTDC / bank1 camera DMA /
-  bank2 ETH DMA), so it can later be **remapped cacheable via an MPU region**
-  without touching the non-cacheable DMA banks (activations are CPU-only, hence
-  coherent).
+  bank2 ETH DMA).  **Remapped cacheable (WBWA) by MPU region1 in `src/bsp.c`**
+  (bank3 only, overriding region0; higher region number wins on ARMv7-M).  The
+  arena is CPU-only (**no DMA into it**), so D-cache needs no maintenance.
+  **Non-cacheable was ~20× slower for NN inference**; cacheable cut MNIST from
+  **9.5 ms to 2.5 ms** (#6).  Small models whose activations fit DTCM may use it.
 - **Weights** — Flash `.rodata` in P1.  **Performance note:** this linker places
   Flash at `0x08000000` = the **AXIM** side.  The ART accelerator (RM0385 §3.3.2)
   serves the **ITCM interface** flash path; AXIM `.rodata` weights are a
@@ -112,14 +118,18 @@ elapsed count is the real latency.
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
 cmake --build build
 
-# X-CUBE-AI backend (follow-up #6; needs a stedgeai install + generated model)
-# cmake -B build ... -DCONFIG_NN_BACKEND=stedgeai -DSTEDGEAI_ROOT=/path/to/stedgeai
+# X-CUBE-AI backend (needs a stedgeai install + a generated model, #6)
+# 1) generate the model (output is .gitignored under port/nn/generated/):
+$STEDGEAI_ROOT/Utilities/linux/stedgeai generate --model model.tflite \
+    --target stm32f7 --type tflite --name network --output port/nn/generated
+# 2) build:
+cmake -B build ... -DCONFIG_NN_BACKEND=stedgeai -DSTEDGEAI_ROOT=/opt/ST/STEdgeAI/4.0
 ```
 
 !!! warning "Licensing"
-    This repository is public.  The ST-SLA `libNetworkRuntime.a`, generated
-    weights, and ST Model Zoo model binaries are **not committed** (`.gitignore`
-    + `port/nn/generated/`).
+    This repository is public.  The ST-SLA runtime `.a`, generated code
+    (`port/nn/generated/`), and ST Model Zoo model binaries are **not committed**
+    (`.gitignore`).
 
 ## Roadmap (Epic #80)
 
