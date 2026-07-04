@@ -249,6 +249,29 @@ option(CLI_ENABLE_DANGEROUS_CMDS "Build the dangerous shell commands (reboot, de
 # default.  STRING (not option) because it carries a number, forwarded below.
 set(CLI_DEVMEM_DUMP_MAX_LEN "256" CACHE STRING "Max bytes per devmem dump")
 
+# --- On-device NN inference backend (issue #81 / Epic #80) ------------------
+# Backend-agnostic nn layer (port/nn) over one selectable runtime.  Default
+# `null` (no runtime -> the firmware always builds without the ST Edge AI Core
+# toolchain or any model; the `ai` command reports a BlazeFace-shaped stub).
+# `stedgeai` (X-CUBE-AI) links generated sources + libNetworkRuntime.a from a
+# local ST Edge AI Core install; those ST-SLA artifacts are NOT committed (public
+# repo, see .gitignore + port/nn/generated/) and land in issue #81 task 6.
+set(CONFIG_NN_BACKEND "null" CACHE STRING "NN inference backend: null | stedgeai")
+set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null stedgeai)
+
+set(NN_SOURCES
+    "${CMAKE_SOURCE_DIR}/port/nn/nn.c"
+    "${CMAKE_SOURCE_DIR}/port/nn/nn_camera.c")   # live camera -> inference glue
+if(CONFIG_NN_BACKEND STREQUAL "null")
+    list(APPEND NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/nn_null.c")
+elseif(CONFIG_NN_BACKEND STREQUAL "stedgeai")
+    message(FATAL_ERROR
+        "CONFIG_NN_BACKEND=stedgeai: X-CUBE-AI backend lands in issue #81 task 6 "
+        "(needs -DSTEDGEAI_ROOT + a generated model under port/nn/generated/)")
+else()
+    message(FATAL_ERROR "CONFIG_NN_BACKEND must be 'null' or 'stedgeai'")
+endif()
+
 add_executable(threadx
     "${CMAKE_SOURCE_DIR}/src/main.c"
     "${CMAKE_SOURCE_DIR}/src/fault.c"
@@ -276,6 +299,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_xfer.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sdram.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_net.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_ai.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/fs_cmd_core.c"
     "${CMAKE_SOURCE_DIR}/port/qspi/qspi_flash.c"
     "${CMAKE_SOURCE_DIR}/port/sd/sd_card.c"
@@ -303,6 +327,7 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/port/filex/fs_glue.c"
     "${CMAKE_SOURCE_DIR}/port/filex/sd_fs_glue.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
+    ${NN_SOURCES}                                                     # nn layer + backend (issue #81)
     "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c"  # EPK (issue #19 cpu%)
     ${TX_CORE}
     ${TX_ASM}
@@ -322,6 +347,7 @@ target_include_directories(threadx PRIVATE
     "${CMAKE_SOURCE_DIR}/port/touch"
     "${CMAKE_SOURCE_DIR}/port/sdram"
     "${CMAKE_SOURCE_DIR}/port/eth"
+    "${CMAKE_SOURCE_DIR}/port/nn"
     "${CMAKE_SOURCE_DIR}/lib/ov5640"
     "${FX_DIR}/common/inc" "${FX_DIR}/ports/cortex_m7/gnu/inc"
     "${LX_DIR}/common/inc"

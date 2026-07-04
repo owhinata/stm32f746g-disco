@@ -45,6 +45,7 @@ plugins:
             アーキテクチャ: Architecture
             ハードウェア: Hardware
             ネットワーク: Network
+            AI 推論: AI inference
             ビルド: Build
             RTOS: RTOS
 
@@ -65,6 +66,8 @@ nav:
   - ネットワーク:
       - network/ethernet.md
       - network/netxduo.md
+  - AI 推論:
+      - ai/inference.md
   - ビルド:
       - build/cmake.md
   - RTOS:

@@ -73,3 +73,10 @@ _ref/
 # mkdocs build output / python venv
 /site/
 .venv/
+
+# NN inference: ST Edge AI (X-CUBE-AI) generated code + ST-SLA runtime + model
+# blobs are NOT committed (public repo, ST SLA / model-zoo licenses) -- issue #81.
+/port/nn/generated/
+*.tflite
+*.onnx
+libNetworkRuntime.a

@@ -221,7 +221,10 @@ SECTIONS
    *     descriptors/buffers must be MPU non-cacheable -- the whole 8 MB SDRAM
    *     already is (src/bsp.c), and the FMC is unambiguously reachable by the ETH
    *     MAC DMA (AHB master), so this is the lowest-risk placement.
-   * Banks 2,3 (0xC0400000..0xC07FFFFF, 4 MB) host ETH (front) + future #49 NetX. */
+   *   .sdram.ai    (bank3, 0xC0600000..0xC07FFFFF): the 2 MB NN inference arena
+   *     (activations, issue #81).  Its own internal bank so it can later be
+   *     MPU-remapped cacheable (bsp.c region1) independently of the non-cacheable
+   *     DMA banks 0..2.  CPU-only (no DMA into it) -> cacheable is coherent. */
   .sdram (NOLOAD) :
   {
     . = ALIGN(32);
@@ -245,6 +248,12 @@ SECTIONS
     KEEP(*(.sdram.eth))           /* ETH DMA descriptors (+ future RX buffers, #49) */
     . = ALIGN(32);
     _esdram_eth = .;
+
+    . = ORIGIN(SDRAM) + 0x600000; /* advance to FMC internal bank3 (0xC0600000) */
+    _ssdram_ai = .;
+    KEEP(*(.sdram.ai))            /* NN inference arena (activations), issue #81 */
+    . = ALIGN(32);
+    _esdram_ai = .;
     _esdram = .;
   } >SDRAM
 
@@ -257,12 +266,19 @@ SECTIONS
          ".sdram.cam must start at FMC internal bank1 (0xC0200000)")
   ASSERT(_esdram_cam - _ssdram_cam == 0x200000,
          ".sdram.cam (cam_arena) must be exactly 2 MB (one FMC internal bank)")
-  /* ETH descriptors/buffers must start at bank2 and stay within the free 4 MB
-     (banks 2,3) -- issue #49. */
+  /* ETH descriptors/buffers must start at bank2 and now stay WITHIN bank2 (2 MB),
+     leaving bank3 free for the NN inference arena -- issue #49 / #81. */
   ASSERT(_ssdram_eth == ORIGIN(SDRAM) + 0x400000,
          ".sdram.eth must start at FMC internal bank2 (0xC0400000)")
-  ASSERT(_esdram_eth - _ssdram_eth <= 0x400000,
-         ".sdram.eth must fit in the free 4 MB (banks 2,3)")
+  ASSERT(_esdram_eth <= ORIGIN(SDRAM) + 0x600000,
+         ".sdram.eth must fit in bank2 (below the bank3 .sdram.ai boundary, #81)")
+  /* NN inference arena (activations) occupies FMC internal bank3 -- issue #81.
+     Kept in its own bank so it may later be MPU-remapped cacheable (bsp.c region1)
+     without touching the DMA-facing non-cacheable banks 0..2. */
+  ASSERT(_ssdram_ai == ORIGIN(SDRAM) + 0x600000,
+         ".sdram.ai must start at FMC internal bank3 (0xC0600000)")
+  ASSERT(_esdram_ai - _ssdram_ai <= 0x200000,
+         ".sdram.ai (NN arena) must fit in the 2 MB bank3")
   /* Overall guard: still inside the 8 MB SDRAM bank (issue #45/#65). */
   ASSERT(_esdram - _ssdram <= 0x800000, ".sdram exceeds the 8 MB SDRAM bank")
 
