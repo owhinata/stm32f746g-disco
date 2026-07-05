@@ -13,7 +13,9 @@ first use case is **camera face detection** (OV5640/DCMI → inference).
     128 int8 for real**: the same `.tflite` runs on both stedgeai and TFLM, and
     `ai info`/`ai bench`/`ai stream`/`gui overlay` all go through the TFLM runtime.
     With **CMSIS-NN optimized kernels** it runs at ~622 ms/inference, edging out
-    stedgeai (685 ms).  SD model loading (P2) is a follow-up.
+    stedgeai (685 ms).  **P2 complete** — a `.tflite` on the microSD card is
+    **loaded at runtime into `.sdram.ai`** and run (`ai model load <sd-path>`, #89);
+    a common-vision op superset lets any small int8 model be swapped in.
 
 ## Design
 
@@ -136,6 +138,9 @@ SSD face detector).
 | `ai stream start [qqvga\|qvga]` | start live continuous inference (default QVGA) |
 | `ai stream stop` | stop |
 | `ai stream stats` | inference rate / latency / drops / face boxes (+ maxscore diag) |
+| `ai model` | show the current model source (`builtin` / `sd:<name>`) |
+| `ai model load <sd-path>` | load + run a `.tflite` from the microSD (tflm only, #89) |
+| `ai model builtin` | revert to the built-in model |
 | `ai norm <0\|1>` | float input normalization toggle (1=[-1,1] / 0=[0,1] default) |
 
 **Latency** is measured with the Cortex-M7 DWT CYCCNT (RM0385 §40.10/§40.13/
@@ -242,12 +247,52 @@ cmake -B build-tflm ... -DCONFIG_NN_BACKEND=tflm -DNN_TFLM_CMSIS_NN=OFF
 # on hardware: ai info / ai bench / ai stream
 ```
 
+## Load a model from SD (P2, #89)
+
+Because TFLM interprets a `.tflite` flatbuffer in RAM, the model can be swapped at
+runtime with no recompile (unlike stedgeai).  P2 loads a `.tflite` from the microSD
+(FileX) into `.sdram.ai` and rebuilds the interpreter in place.
+
+- **Op superset**: since the runtime model is unknown, the resolver registers a broad
+  common-vision **superset (23 ops: Conv/DWConv/FC/Pool/Softmax/Logistic/Relu/Reshape/
+  Quantize/Dequantize/Pad/Add/Mul/Sub/Mean/Concat/Resize/StridedSlice/LeakyRelu/
+  Transpose ...)**, so any small int8 classifier/detector runs.  BlazeFace uses only 8
+  of them (the default path is unaffected; unused kernels are dropped by `--gc-sections`).
+- **Double model slot**: two 512 KB slots in `.sdram.ai`.  `ai model load` reads the SD
+  file into the **inactive** slot and only flips it active once the interpreter rebuild
+  succeeds, so the live flatbuffer is never corrupted mid-load -- the swap is
+  **transactional** (the previous model stays on failure).  bank3: staging 384 KB +
+  arena 512 KB + model 2x512 KB = 1920 KB < 2 MB.
+- **Safe rebuild**: `~MicroInterpreter()` calls `FreeSubgraphs()`, so a rebuild explicitly
+  destroys the old interpreter before placement-new.  The `.tflite` is length-checked with
+  `VerifyModelBuffer` before use (a truncated/corrupt file fails cleanly); the SD read
+  pre-checks the full size and rejects a short read.
+- **Exclusion**: the interpreter/arena/model are singletons, so `ai model load` runs with
+  the **stream stopped + the single session held** (the session is claimed *before* slot
+  selection, so another shell cannot flip our chosen slot).
+- **The SDMMC DMA never writes `.sdram.ai` directly**: the SD driver DMAs into a fixed SRAM
+  bounce buffer then `memcpy`s, so the bank3 write is a CPU store -- D-cache coherent, no
+  maintenance needed.
+
+```
+ai model                 # current source (builtin / sd:<name>)
+ai model load bf.tflite  # load a .tflite from microSD (check with `sd ls`)
+ai info                  # inspect the loaded I/O shapes / arena
+ai model builtin         # revert to the built-in model
+```
+
+!!! note "tflm live-stream bandwidth"
+    `ai stream` (tflm + CMSIS-NN) can saturate the SDRAM bus during inference and stop
+    the camera on a DCMI FIFO overrun (the F746 bus matrix is round-robin with no SDRAM
+    QoS).  Single-shot `ai bench` / `ai run` and the GUI overlay (which auto-recovers)
+    are fine; overrun resilience for the shell `ai stream` path is a follow-up.
+
 ## Roadmap (Epic #80)
 
 | Phase | Scope |
 |---|---|
 | **P1 ✅** | `nn` abstraction + X-CUBE-AI backend + `ai` command + **BlazeFace-128 face detection first-light** |
-| P2 | Load the model/weights from the SD card (FileX → `.sdram.ai`) — needs TFLM |
+| **P2 ✅** | **Load a model from SD (FileX → `.sdram.ai`, `ai model load`, #89)** |
 | **P3 ✅** | TFLM backend.  M1 spike (C++ enablement + hello_world, #86) → **M2 BlazeFace port + CMSIS-NN + comparative bench (#88)** |
 | **P4 ✅** | GUIX overlay (live preview + face bbox, #83 → [GUIX camera UI](../rtos/guix.md#face-detect-overlay-83-epic-80-p4)) |
 | P5 | X-CUBE-AI relocatable network (swap the whole model from SD) |
