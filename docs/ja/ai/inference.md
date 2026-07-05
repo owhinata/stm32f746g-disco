@@ -318,11 +318,13 @@ stedgeai ランタイム側でも実現する（両対応完成）。
   （`ai run`/`ai stream`/`gui overlay` は未ロードを明示エラーで拒否）。`ai model builtin` は
   アンロード（`(none)`）。
 
-**性能（実測）**: reloc は Flash でなく **SDRAM から XIP 実行**するが、cacheable SDRAM + I-cache
-のため速度は良好で、`ai bench` 実測 **~592ms/推論**（BlazeFace-front 128、@216MHz）＝Flash 焼込み
-`stedgeai`(685ms) を**下回り** TFLM CMSIS-NN(622ms) と同等（legacy ai_network ランタイムの
-カーネルが効く）。live `ai stream`/`gui overlay` は bank3 帯域が DCMI と競合するため ~1.4 inf/s
-（#90 と同根、単発 bench より遅い）。P5 の主眼は **X-CUBE-AI relocatable の実証 / Epic 完成**。
+**性能（実測 + 注意）**: `ai bench` は **LTDC/カメラ停止（`gui stop`/`lcd off`）＝SDRAM 帯域が
+静穏な状態で ~592ms/推論**（BlazeFace-front 128, @216MHz）。★**ただし XIP はコードを SDRAM(bank3)
+から fetch するため SDRAM 帯域競合に敏感**で、LTDC scan-out やカメラ DMA が動くと fetch が遅くなり
+bench 値は上がる（Flash 焼込み `stedgeai` はコードが Flash 実行ゆえ SDRAM 競合に非依存）。よって
+592ms は静穏時のベストケースで、**Flash 版(685ms)や TFLM CMSIS-NN(622ms) に対するクリーンな速度優位
+ではない**（表示/カメラ稼働時はそれ以上になり得る）。live `ai stream`/`gui overlay` は DCMI と bank3
+帯域が競合し ~1.4 inf/s（#90 と同根）。P5 の主眼は **X-CUBE-AI relocatable の実証 / Epic 完成**。
 
 キーファイル: `port/nn/nn_stedgeai_reloc.c`（backend + `.bin` 検証 + transactional reload + XIP 実行）、
 `src/bsp.c`（MPU region2）、`ldscript/STM32F746NGHx_FLASH.ld`（`.sdram.ai` 分割 + ASSERT）、

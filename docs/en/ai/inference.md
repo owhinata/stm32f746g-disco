@@ -345,12 +345,15 @@ as `CONFIG_NN_BACKEND=stedgeai_reloc`, the stedgeai-runtime counterpart to P2(tf
 - **SD-only**: no built-in model.  Until `ai model load network_rel.bin`, there is no model
   (`ai run`/`ai stream`/`gui overlay` reject with a clear error); `ai model builtin` unloads (`(none)`).
 
-**Performance (measured)**: the relocatable code runs **XIP from SDRAM**, not Flash, but cacheable
-SDRAM + the I-cache keep it fast — `ai bench` measures **~592 ms/inference** (BlazeFace-front 128,
-@216 MHz), *below* the Flash-baked `stedgeai` (685 ms) and on par with TFLM CMSIS-NN (622 ms) (the
-legacy ai_network runtime's kernels help here).  The live `ai stream`/`gui overlay` runs at ~1.4
-inf/s because the DCMI competes for bank3 bandwidth (same root cause as #90, slower than the
-single-shot bench).  P5's main value is **demonstrating X-CUBE-AI relocatable / completing the Epic**.
+**Performance (measured, with a caveat)**: `ai bench` measures **~592 ms/inference** (BlazeFace-front
+128, @216 MHz) **with the LTDC/camera stopped (`gui stop`/`lcd off`) — i.e. a quiet SDRAM bus**.
+★However, XIP fetches code from SDRAM (bank3), so it is **sensitive to SDRAM contention**: with LTDC
+scan-out or camera DMA active the fetch slows and the bench rises (the Flash-baked `stedgeai` executes
+code from Flash and is contention-independent).  So 592 ms is a quiet-bus best case, **not a clean win**
+over the Flash-baked stedgeai (685 ms) or TFLM CMSIS-NN (622 ms) — with the display/camera running it
+can be higher.  The live `ai stream`/`gui overlay` runs at ~1.4 inf/s (DCMI competes for bank3
+bandwidth, same root cause as #90).  P5's main value is **demonstrating X-CUBE-AI relocatable /
+completing the Epic**.
 
 Key files: `port/nn/nn_stedgeai_reloc.c` (backend + `.bin` verifier + transactional reload + XIP),
 `src/bsp.c` (MPU region2), `ldscript/STM32F746NGHx_FLASH.ld` (`.sdram.ai` split + ASSERTs),
