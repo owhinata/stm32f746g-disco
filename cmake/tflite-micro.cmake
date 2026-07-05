@@ -98,6 +98,55 @@ if(NOT EXISTS "${TFLM_STAMP}")
     file(WRITE "${TFLM_STAMP}" "${TFLM_GIT_SHA}\n")
 endif()
 
+# --- BlazeFace model -> compilable byte array (configure time) ---------------
+# The .tflite is NOT committed (public repo, model-zoo license -- see .gitignore
+# *.tflite).  We turn it into a C++ TU inside the `tflm` lib with a fixed symbol
+# name (g_blazeface_model_data) via our own generator (cmake/gen_model_array.py:
+# no numpy/Pillow, alignas(16) for tflite::GetModel's flatbuffer alignment).  The
+# default points at the same model the stedgeai backend consumes; override with
+# -DNN_TFLM_MODEL=<path>.  Epic #80 P3 M2, issue #88.
+set(NN_TFLM_MODEL
+    "${CMAKE_SOURCE_DIR}/_ref/stm32ai-modelzoo/face_detection/facedetect_front/Public_pretrainedmodel_public_dataset/widerface/blazeface_front_128/blazeface_front_128_int8.tflite"
+    CACHE FILEPATH "TFLite model fed to the tflm backend (int8 weights, float32 I/O)")
+if(NOT EXISTS "${NN_TFLM_MODEL}")
+    message(FATAL_ERROR "tflm: model not found:\n  ${NN_TFLM_MODEL}\n"
+                        "Set -DNN_TFLM_MODEL=<path to .tflite> (issue #88).")
+endif()
+
+set(TFLM_MODEL_DIR    "${CMAKE_BINARY_DIR}/tflm-model")
+set(TFLM_MODEL_CC     "${TFLM_MODEL_DIR}/blazeface_model_data.cc")
+set(TFLM_MODEL_H      "${TFLM_MODEL_DIR}/blazeface_model_data.h")
+set(TFLM_MODEL_SYMBOL "g_blazeface_model_data")
+
+# Re-run configure whenever the model file changes so the regeneration below is
+# actually reached on a swap (codex review: a timestamp check alone can miss it).
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${NN_TFLM_MODEL}")
+
+# Regenerate when the model IDENTITY (path + size + mtime) differs from the last
+# generated one, or the outputs are missing.  A pure IS_NEWER_THAN check would
+# reuse a stale array if -DNN_TFLM_MODEL is pointed at an OLDER file (codex review),
+# so we record the identity in a sidecar stamp and compare it instead.
+file(SIZE "${NN_TFLM_MODEL}" _model_size)
+file(TIMESTAMP "${NN_TFLM_MODEL}" _model_mtime "%Y%m%d%H%M%S" UTC)
+set(_model_stamp_want "${NN_TFLM_MODEL}|${_model_size}|${_model_mtime}")
+set(TFLM_MODEL_STAMP "${TFLM_MODEL_DIR}/.model-stamp")
+set(_model_stamp_have "")
+if(EXISTS "${TFLM_MODEL_STAMP}")
+    file(READ "${TFLM_MODEL_STAMP}" _model_stamp_have)
+endif()
+if(NOT _model_stamp_have STREQUAL _model_stamp_want OR
+   NOT EXISTS "${TFLM_MODEL_CC}" OR NOT EXISTS "${TFLM_MODEL_H}")
+    message(STATUS "tflm: generating model array from ${NN_TFLM_MODEL}")
+    execute_process(
+        COMMAND "${TFLM_PY}" "${CMAKE_SOURCE_DIR}/cmake/gen_model_array.py"
+                "${NN_TFLM_MODEL}" "${TFLM_MODEL_CC}" "${TFLM_MODEL_H}" "${TFLM_MODEL_SYMBOL}"
+        RESULT_VARIABLE _rc)
+    if(NOT _rc EQUAL 0 OR NOT EXISTS "${TFLM_MODEL_CC}")
+        message(FATAL_ERROR "tflm: model array generation failed (cmake/gen_model_array.py)")
+    endif()
+    file(WRITE "${TFLM_MODEL_STAMP}" "${_model_stamp_want}")
+endif()
+
 # --- Compile the generated tree with our flags (ABI = ours) ------------------
 # create_tflm_tree emits only library sources under tensorflow/, but exclude the
 # test-support cluster (helpers + mock/fake context) + any *_test.cc belt-and-suspenders.
@@ -111,10 +160,9 @@ list(FILTER TFLM_LIB_SOURCES EXCLUDE REGEX
 
 add_library(tflm STATIC
     ${TFLM_LIB_SOURCES}
-    "${TFLM_ROOT}/examples/hello_world/models/hello_world_int8_model_data.cc"  # spike model
+    "${TFLM_MODEL_CC}"                                  # generated BlazeFace model bytes
     "${CMAKE_SOURCE_DIR}/port/nn/tflm/cxx_runtime.cc"   # noexcept operator new/delete + traps
-    "${CMAKE_SOURCE_DIR}/port/nn/tflm/nn_tflm.cc"       # extern "C" nn_backend_vt_selected
-    "${CMAKE_SOURCE_DIR}/port/nn/tflm/tflm_spike.cc")   # extern "C" tflm_spike_selftest
+    "${CMAKE_SOURCE_DIR}/port/nn/tflm/nn_tflm.cc")      # extern "C" nn_backend_vt_selected
 
 target_link_libraries(tflm PRIVATE bsp_iface)   # MCU_OPTS (fpv5-sp-d16) + CMSIS/HAL includes
 
@@ -123,7 +171,7 @@ target_include_directories(tflm PRIVATE
     "${TFLM_ROOT}/third_party/flatbuffers/include"   # "flatbuffers/..."
     "${TFLM_ROOT}/third_party/gemmlowp"              # "fixedpoint/..."
     "${TFLM_ROOT}/third_party/ruy"                   # "ruy/..."
-    "${TFLM_ROOT}/examples/hello_world"              # model .cc: "models/hello_world_int8_..."
+    "${TFLM_MODEL_DIR}"                              # generated "blazeface_model_data.h"
     "${CMAKE_SOURCE_DIR}/port/nn")                   # nn.h / nn_backend.h for the bridge
 
 # TF_LITE_STATIC_MEMORY changes TFLM's context/tensor structs across the API boundary,

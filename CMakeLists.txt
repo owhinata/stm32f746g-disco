@@ -414,10 +414,10 @@ if(CONFIG_NN_BACKEND STREQUAL "stedgeai")
     target_compile_definitions(threadx PRIVATE CONFIG_NN_BACKEND_STEDGEAI=1)
 endif()
 
-# TFLM (tflite-micro) C++ backend (Epic #80 P3, issue #86).  Builds the `tflm`
-# static lib (C++ interpreter + vendored tree + nn_tflm/tflm_spike/cxx_runtime),
-# links it + the nano C++ runtime archives, and enables the `ai selftest` hook.
-# The final threadx link stays on the C driver (no C++ TU in threadx itself).
+# TFLM (tflite-micro) C++ backend (Epic #80 P3, issues #86/#88).  Builds the `tflm`
+# static lib (C++ interpreter + fetched tree + generated BlazeFace model +
+# nn_tflm/cxx_runtime) and links it + the nano C++ runtime archives.  The final
+# threadx link stays on the C driver (no C++ TU in threadx itself).
 if(CONFIG_NN_BACKEND STREQUAL "tflm")
     include("${CMAKE_SOURCE_DIR}/cmake/tflite-micro.cmake")
     target_link_libraries(threadx PRIVATE tflm)

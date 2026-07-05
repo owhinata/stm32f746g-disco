@@ -18,9 +18,9 @@
  *    versions are never extracted.
  *
  *  - operator new records every call (g_tflm_cxx_new_calls, exported) and routes to
- *    newlib malloc/free.  The spike's goal is to prove inference runs with NO heap:
- *    with TF_LITE_STATIC_MEMORY the bump allocator means new is never hit, and
- *    `ai selftest` asserts the counter stayed 0 (runtime proof).  Routing to malloc
+ *    newlib malloc/free.  With TF_LITE_STATIC_MEMORY the bump allocator means new is
+ *    never hit at runtime; the counter is kept as a diagnostic (it should stay 0 --
+ *    a non-zero value flags an unexpected heap allocation).  Routing to malloc
  *    (rather than returning nullptr) keeps the shell graceful if new is ever reached
  *    and avoids -Wnew-returns-null; it is NOT a link-level "no heap" guarantee.
  *
@@ -31,8 +31,8 @@
 #include <cstdint>
 #include <cstdlib>
 
-/* Exported so `ai selftest` (tflm_spike.cc / cmd_ai.c) can assert new was never
- * called during a successful inference (the TF_LITE_STATIC_MEMORY contract). */
+/* Diagnostic counter: stays 0 while TF_LITE_STATIC_MEMORY's bump allocator is in
+ * effect (no heap).  A non-zero value flags an unexpected runtime allocation. */
 extern "C" volatile uint32_t g_tflm_cxx_new_calls;
 volatile uint32_t g_tflm_cxx_new_calls = 0;
 

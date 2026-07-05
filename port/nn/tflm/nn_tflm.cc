@@ -4,27 +4,34 @@
  */
 /**
  * @file    nn_tflm.cc
- * @brief   TensorFlow Lite Micro (tflite-micro) nn backend (Epic #80 P3, issue #86).
+ * @brief   TensorFlow Lite Micro (tflite-micro) nn backend (Epic #80 P3, issue #88).
  *
  * Bridges a TFLM MicroInterpreter to the backend-agnostic nn vtable (nn_backend.h).
- * Compiled only when CONFIG_NN_BACKEND=tflm, into the `tflm` static lib alongside the
- * tflite-micro tree fetched + generated at CMake configure time (cmake/tflite-micro.cmake,
- * issue #86).  This M1 spike wires the tiny
- * committed **hello_world int8** sine model (FullyConnected only, int8 1x1 in/out) so
- * that `ai info` / `ai bench` and the `ai selftest` hook run through the *real* runtime
- * and exercise nn.c's DWT timing + session guard.  The real BlazeFace model + CMSIS-NN
- * come in M2 (this file is model-agnostic except for the compiled-in model + op set).
+ * Compiled only when CONFIG_NN_BACKEND=tflm, into the `tflm` static lib alongside
+ * the tflite-micro tree fetched + generated at CMake configure time
+ * (cmake/tflite-micro.cmake).  M1 (#86) wired a tiny hello_world spike; M2 (#88)
+ * runs the real **BlazeFace-front 128 int8** face-detection model, so `ai info` /
+ * `ai bench` / `ai stream` / `gui overlay` all execute through the real runtime.
  *
- * The interpreter is constructed lazily in open() (placement-new into a static buffer,
- * so no global ctor runs before SDRAM/clock are up, and the heap is never touched).
- * run() is CPU-bound and never yields (nn.c times it with the DWT cycle counter).
- * The activation arena lives in .sdram.ai (FMC bank3, already MPU cacheable WBWA /
- * CPU-only, issue #6), matching the stedgeai backend.
+ * The model is int8-compute with float32 I/O: a QUANTIZE op at the input and four
+ * DEQUANTIZE ops at the outputs, so this backend exposes one float32 input
+ * (1x128x128x3) and four float32 outputs (box/score at two anchor scales).  The
+ * op set is exactly QUANTIZE, CONV_2D, DEPTHWISE_CONV_2D, ADD, PAD, MAX_POOL_2D,
+ * RESHAPE, DEQUANTIZE (no LOGISTIC/SOFTMAX -- activations are fused), registered
+ * one-to-one in the capacity-8 op resolver.  The tensor descriptors are built
+ * generically from the interpreter (dtype/shape/quant), so blazeface.c locates
+ * the four outputs by SHAPE and this file stays model-agnostic beyond the op set.
+ *
+ * The interpreter is constructed lazily in open() (placement-new into a static
+ * buffer, so no global ctor runs before SDRAM/clock are up, and the heap is never
+ * touched).  run() is CPU-bound and never yields (nn.c times it with the DWT cycle
+ * counter).  The activation arena lives in .sdram.ai (FMC bank3, MPU cacheable
+ * WBWA / CPU-only, issue #6), matching the stedgeai backend.
  */
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "examples/hello_world/models/hello_world_int8_model_data.h"
+#include "blazeface_model_data.h"        /* g_blazeface_model_data[/_size] (generated) */
 
 #include "nn.h"
 #include "nn_backend.h"
@@ -35,17 +42,25 @@
 
 namespace {
 
-/* Activation arena in .sdram.ai (bank3).  hello_world int8 needs ~3 KB (upstream
- * uses 3000); 4 KB rounds it up.  32-aligned matches the other .sdram.ai residents
- * and TFLM's kBufferAlignment. */
-constexpr int kArenaSize = 4096;
+/* Activation arena in .sdram.ai (bank3).  BlazeFace's activations measured
+ * ~328 KB with ST Edge AI; TFLM's greedy planner is the same order.  512 KB is a
+ * documented reservation with headroom -- the true figure is reported by
+ * arena_used_bytes() (see tflm_bk_acts_bytes).  bank3 is 2 MB and also holds the
+ * 2x192 KB camera staging (nn_camera.c): 384 KB + 512 KB = 896 KB < 2 MB (linker
+ * ASSERT enforces the fit).  32-aligned matches the other .sdram.ai residents and
+ * TFLM's kBufferAlignment. */
+constexpr int kArenaSize = 512 * 1024;
 alignas(32) uint8_t g_arena[kArenaSize] __attribute__((section(".sdram.ai")));
 
-using OpResolver = tflite::MicroMutableOpResolver<1>;   /* FullyConnected only */
+/* BlazeFace op set (8 builtins, one resolver slot each). */
+using OpResolver = tflite::MicroMutableOpResolver<8>;
 
 struct tflm_model {
-	struct nn_tensor in[1];
-	struct nn_tensor out[1];
+	struct nn_tensor in[1];             /* BlazeFace: single 1x128x128x3 f32 input */
+	struct nn_tensor out[NN_MAX_IO];    /* up to 8 outputs (BlazeFace uses 4)      */
+	int n_in;
+	int n_out;
+	uint32_t used;                      /* arena_used_bytes() after AllocateTensors */
 	const char *name;
 	bool open;
 };
@@ -93,18 +108,25 @@ static int tflm_bk_open(void **impl_out)
 {
 	if (g_tm.open) { *impl_out = &g_tm; return 0; }
 
-	const tflite::Model *model = tflite::GetModel(g_hello_world_int8_model_data);
+	const tflite::Model *model = tflite::GetModel(g_blazeface_model_data);
 	if (model->version() != TFLITE_SCHEMA_VERSION)
 		return -1;
 
 	/* Function-local statics: constructed on first open() (post-boot, SDRAM up),
 	 * serialized by nn.c's PRIMASK open latch (-fno-threadsafe-statics = plain flag).
 	 * resolver_ready latches the op registration so a re-open after a later-stage
-	 * failure does not AddFullyConnected() twice into the capacity-1 resolver. */
+	 * failure does not register the ops twice into the capacity-8 resolver. */
 	static OpResolver resolver;
 	static bool resolver_ready = false;
 	if (!resolver_ready) {
-		if (resolver.AddFullyConnected() != kTfLiteOk)
+		if (resolver.AddQuantize()        != kTfLiteOk ||
+		    resolver.AddConv2D()          != kTfLiteOk ||
+		    resolver.AddDepthwiseConv2D() != kTfLiteOk ||
+		    resolver.AddAdd()             != kTfLiteOk ||
+		    resolver.AddPad()             != kTfLiteOk ||
+		    resolver.AddMaxPool2D()       != kTfLiteOk ||
+		    resolver.AddReshape()         != kTfLiteOk ||
+		    resolver.AddDequantize()      != kTfLiteOk)
 			return -2;
 		resolver_ready = true;
 	}
@@ -119,18 +141,39 @@ static int tflm_bk_open(void **impl_out)
 			tflite::MicroInterpreter(model, resolver, g_arena, kArenaSize);
 
 	if (g_interp->AllocateTensors() != kTfLiteOk)
-		return -3;
+		return -3;   /* arena too small -> bump kArenaSize (see cmd_ai `ai info`) */
 
-	TfLiteTensor *in  = g_interp->input(0);
-	TfLiteTensor *out = g_interp->output(0);
-	if (!in || !out || !in->data.data || !out->data.data)
-		return -4;
+	/* Validate the I/O shape before publishing descriptors: exactly one input,
+	 * 1..NN_MAX_IO outputs, every tensor present with a non-NULL buffer and a rank
+	 * within NN_MAX_DIMS (codex plan review -- fail loud instead of OOB later). */
+	size_t n_in  = g_interp->inputs_size();
+	size_t n_out = g_interp->outputs_size();
+	if (n_in != 1)
+		return -5;
+	if (n_out < 1 || n_out > (size_t)NN_MAX_IO)
+		return -6;
 
-	fill_tensor(&g_tm.in[0], in);
-	fill_tensor(&g_tm.out[0], out);
-	g_tm.name = "hello_world_int8 (tflm spike)";
-	g_tm.open = true;
-	*impl_out = &g_tm;
+	for (size_t i = 0; i < n_in; i++) {
+		TfLiteTensor *t = g_interp->input(i);
+		if (!t || !t->data.data || !t->dims || t->dims->size > NN_MAX_DIMS)
+			return -4;
+	}
+	for (size_t i = 0; i < n_out; i++) {
+		TfLiteTensor *t = g_interp->output(i);
+		if (!t || !t->data.data || !t->dims || t->dims->size > NN_MAX_DIMS)
+			return -4;
+	}
+
+	fill_tensor(&g_tm.in[0], g_interp->input(0));
+	for (size_t i = 0; i < n_out; i++)
+		fill_tensor(&g_tm.out[i], g_interp->output(i));
+
+	g_tm.n_in  = (int)n_in;
+	g_tm.n_out = (int)n_out;
+	g_tm.used  = (uint32_t)g_interp->arena_used_bytes();
+	g_tm.name  = "blazeface_front_128 (tflm)";
+	g_tm.open  = true;
+	*impl_out  = &g_tm;
 	return 0;
 }
 
@@ -140,22 +183,24 @@ static void tflm_bk_close(void *impl)
 }
 
 static const char *tflm_bk_name(void *impl) { return ((struct tflm_model *)impl)->name; }
-static int tflm_bk_in_count(void *impl)  { (void)impl; return 1; }
-static int tflm_bk_out_count(void *impl) { (void)impl; return 1; }
+static int tflm_bk_in_count(void *impl)  { return ((struct tflm_model *)impl)->n_in; }
+static int tflm_bk_out_count(void *impl) { return ((struct tflm_model *)impl)->n_out; }
 
 static struct nn_tensor *tflm_bk_input(void *impl, int idx)
 {
 	struct tflm_model *m = (struct tflm_model *)impl;
-	return (idx == 0) ? &m->in[0] : nullptr;
+	return (idx >= 0 && idx < m->n_in) ? &m->in[idx] : nullptr;
 }
 
 static struct nn_tensor *tflm_bk_output(void *impl, int idx)
 {
 	struct tflm_model *m = (struct tflm_model *)impl;
-	return (idx == 0) ? &m->out[0] : nullptr;
+	return (idx >= 0 && idx < m->n_out) ? &m->out[idx] : nullptr;
 }
 
-static uint32_t tflm_bk_acts_bytes(void *impl) { (void)impl; return kArenaSize; }
+/* Report the arena TFLM actually planned (not the 512 KB reservation), so `ai info`
+ * compares apples-to-apples with the stedgeai backend's ACTIVATIONS_SIZE. */
+static uint32_t tflm_bk_acts_bytes(void *impl) { return ((struct tflm_model *)impl)->used; }
 
 static int tflm_bk_run(void *impl)
 {
@@ -163,7 +208,7 @@ static int tflm_bk_run(void *impl)
 	return (g_interp && g_interp->Invoke() == kTfLiteOk) ? 0 : -1;
 }
 
-static const struct nn_backend_info g_info = { "tflm", "tflite-micro (hello_world spike)" };
+static const struct nn_backend_info g_info = { "tflm", "tflite-micro (BlazeFace)" };
 
 /* Positional init (C++17: no designated initializers).  Field order MUST match
  * struct nn_backend_vt in nn_backend.h:

@@ -342,70 +342,6 @@ static int cmd_ai_norm(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
-#ifdef CONFIG_NN_BACKEND_TFLM
-/* ---- TFLM feasibility self-test (issue #86 M1, temporary) ------------------ */
-/* Provided by port/nn/tflm/tflm_spike.cc (only in the CONFIG_NN_BACKEND=tflm build).
- * Proves the C++/TFLM toolchain: one hello_world int8 inference through the nn API,
- * static-ctor sentinel, and zero heap use.  Removed when the M2 backend lands. */
-extern int      tflm_spike_selftest(int32_t x_milli, int32_t *y_milli);
-extern uint32_t tflm_spike_ctor_sentinel(void);
-extern uint32_t tflm_spike_new_calls(void);
-
-static int cmd_ai_selftest(struct cli_instance *sh, int argc, char **argv)
-{
-	/* Golden sine points (upstream hello_world_test): x and sin(x)*1000, in milli,
-	 * checked within a generous int8-model tolerance. */
-	static const int32_t gx[4] = { 770, 1570, 2300, 3140 };
-	static const int32_t gy[4] = { 696, 1000, 746,    2  };
-	struct nn_model *m = NULL;
-	int pass = 1;
-	uint32_t hclk = HAL_RCC_GetHCLKFreq();
-	uint32_t mhz = hclk / 1000000u ? hclk / 1000000u : 1u;
-
-	(void)argc; (void)argv;
-
-	if (!sdram_is_up()) {
-		cli_error(sh, "SDRAM not up (needed for the NN arena)\r\n");
-		return 1;
-	}
-	if (nn_model_open(&m) != 0) {
-		cli_error(sh, "model open failed\r\n");
-		return 1;
-	}
-
-	cli_print(sh, "tflm self-test: %s\r\n", nn_model_name(m));
-	for (int i = 0; i < 4; i++) {
-		int32_t y = 0, d;
-		int rc = tflm_spike_selftest(gx[i], &y);
-		if (rc != 0) {
-			cli_error(sh, "selftest failed (rc=%d) at x=%ld milli\r\n",
-			          rc, (long)gx[i]);
-			return 1;
-		}
-		d = y - gy[i];
-		if (d < 0) d = -d;
-		if (d > 150) pass = 0;
-		cli_print(sh, "  x=%ld  y=%ld  golden=%ld  (milli)  %s\r\n",
-		          (long)gx[i], (long)y, (long)gy[i], d <= 150 ? "ok" : "FAIL");
-	}
-
-	{
-		uint32_t sent = tflm_spike_ctor_sentinel();
-		uint32_t nc = tflm_spike_new_calls();
-		uint32_t cyc = nn_last_cycles(m);
-		if (sent != 0xC0DECAFEu || nc != 0) pass = 0;
-		cli_print(sh, "ctor sentinel %s (0x%08lX)  heap new() calls %lu\r\n",
-		          sent == 0xC0DECAFEu ? "OK" : "MISSING",
-		          (unsigned long)sent, (unsigned long)nc);
-		cli_print(sh, "last run %lu cyc (~%lu us @%lu MHz)\r\n",
-		          (unsigned long)cyc, (unsigned long)(cyc / mhz),
-		          (unsigned long)mhz);
-	}
-	cli_print(sh, "%s\r\n", pass ? "SELFTEST PASS" : "SELFTEST FAIL");
-	return pass ? 0 : 1;
-}
-#endif /* CONFIG_NN_BACKEND_TFLM */
-
 CLI_SUBCMD_SET_CREATE(ai_stream_subcmds,
 	CLI_CMD_ARG(start, NULL, "start live inference [qqvga|qvga]",
 	            cmd_ai_stream_start, 1, 1),
@@ -421,10 +357,6 @@ CLI_SUBCMD_SET_CREATE(ai_subcmds,
 	CLI_CMD(stream, ai_stream_subcmds, "live camera inference", NULL),
 	CLI_CMD_ARG(norm, NULL, "float input norm <0|1> (1=[-1,1], 0=[0,1])",
 	            cmd_ai_norm, 1, 1),
-#ifdef CONFIG_NN_BACKEND_TFLM
-	CLI_CMD(selftest, NULL, "TFLM C++/interpreter feasibility self-test (issue #86)",
-	        cmd_ai_selftest),
-#endif
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(ai, ai_subcmds,
