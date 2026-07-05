@@ -8,11 +8,12 @@ first use case is **camera face detection** (OV5640/DCMI → inference).
     **P1 complete** — null-backend foundation + X-CUBE-AI (`stedgeai`) backend +
     BlazeFace-128 face detection running on hardware (`ai run`/`ai stream` print
     face boxes, ~1.5 fps).  **P4 complete** — face bboxes drawn on the GUIX live
-    preview (`gui overlay on`, #83).  **P3 M1 complete** — TFLM (tflite-micro)
-    backend feasibility spike (#86): brought C++ into the pure-C/ASM project and
-    proved a minimal `MicroInterpreter` builds, static-inits, and runs one inference
-    on hardware (`ai selftest` PASS).  The BlazeFace port (M2) and SD model loading
-    (P2) are follow-ups.
+    preview (`gui overlay on`, #83).  **P3 complete** — TFLM (tflite-micro) backend.
+    After the M1 spike (#86) proved C++ viability, **M2 (#88) ported BlazeFace-front
+    128 int8 for real**: the same `.tflite` runs on both stedgeai and TFLM, and
+    `ai info`/`ai bench`/`ai stream`/`gui overlay` all go through the TFLM runtime.
+    With **CMSIS-NN optimized kernels** it runs at ~622 ms/inference, edging out
+    stedgeai (685 ms).  SD model loading (P2) is a follow-up.
 
 ## Design
 
@@ -26,10 +27,12 @@ first use case is **camera face detection** (OV5640/DCMI → inference).
     output (STAI API) plus the pre-compiled static library
     `NetworkRuntime*_CM7_GCC.a`.  Tensor descriptors are built from the generated
     `STAI_NETWORK_*` macros (model-agnostic, 1-in/1-out to multi-output).
-  - `tflm` — LiteRT / TensorFlow Lite Micro (**P3 M1 spike, #86**).  The C++
+  - `tflm` — LiteRT / TensorFlow Lite Micro (**P3, #86/#88**).  The C++
     `MicroInterpreter` is confined to a separate `tflm` static lib, and C++ is
     enabled only for the `CONFIG_NN_BACKEND=tflm` build (the default null/stedgeai
-    builds are unchanged / byte-identical).  See [TFLM backend](#tflm-backend-p3-m1-86).
+    builds are unchanged / byte-identical).  Runs **BlazeFace-front 128 int8** with
+    **CMSIS-NN optimized kernels** (on by default) at stedgeai-class speed.  See
+    [TFLM backend](#tflm-backend-p3-8688).
 - **Model-specific pre/post-processing** (BlazeFace anchor decode + NMS, etc.)
   lives *above* the `nn` layer (`port/nn/models/`); the generic `nn` layer stays
   model-agnostic.
@@ -161,54 +164,82 @@ cmake -B build ... -DCONFIG_NN_BACKEND=stedgeai -DSTEDGEAI_ROOT=/opt/ST/STEdgeAI
     (`port/nn/generated/`), and ST Model Zoo model binaries are **not committed**
     (`.gitignore`).
 
-## TFLM backend (P3 M1, #86)
+## TFLM backend (P3, #86/#88)
 
 TensorFlow Lite Micro (tflite-micro) is C++17.  Bringing C++ into a pure-C/ASM
-project is the biggest risk, so a **feasibility spike** proves it works first
-(`ai selftest`).
+project is the biggest risk, so the M1 spike (#86) proved viability first; **M2
+(#88) ported BlazeFace-front 128 int8 for real**.  The same int8 `.tflite` feeds
+both stedgeai and TFLM.
 
 - **C++ only for the tflm build**: `cmake/tflite-micro.cmake` calls
   `enable_language(CXX)` only when `CONFIG_NN_BACKEND=tflm`.  All C++ is confined to
   the `tflm` static lib; `threadx`'s own TUs stay C, so the **final link keeps the C
-  driver (gcc)**, explicitly linking the nano C++ archives (`libstdc++_nano.a` /
-  `libsupc++_nano.a`).  Default null/stedgeai builds never see C++.
+  driver (gcc)** (`LINKER_LANGUAGE C`), explicitly linking the nano C++ archives
+  (`libstdc++_nano.a` / `libsupc++_nano.a`) + `libm`.  Default null/stedgeai builds
+  never see C++ (byte-identical).
 - **Bare-metal C++ runtime**: startup's `__libc_init_array` runs the static ctors
   (`.init_array` is `KEEP`t in the linker script).  `-fno-exceptions -fno-rtti
   -fno-threadsafe-statics -fno-use-cxa-atexit` + `TF_LITE_STATIC_MEMORY` (bump
   allocator = no heap).  Our own non-throwing `operator new/delete`
   (`port/nn/tflm/cxx_runtime.cc`) keeps libstdc++'s **throwing operator new**
   (→ `__cxa_throw`/`_Unwind_*`) from ever being linked.
-- **Arena**: `.sdram.ai` (bank3, cacheable WBWA, CPU-only), same placement as stedgeai.
-- **Single-precision FPU** (`fpv5-sp-d16` / multilib `v7e-m+fp/hard`) → `double` is
-  soft-float.  The spike's hello_world (FullyConnected only) has no double path — one
-  more reason it is the right spike model.
-- **Vendoring = fetch at configure (not checked in)**: tflite-micro does not check in
-  its third-party deps (flatbuffers/gemmlowp/ruy), so `cmake/tflite-micro.cmake` does a
-  `git fetch` of the pinned SHA **at CMake configure time** and runs upstream's
-  `create_tflm_tree.py -e hello_world` (reference kernels only) into a self-contained
-  tree under the **build dir**, which we then compile with our flags (mirrors the repo's
-  "download the toolchain at configure" convention).  A SHA-keyed stamp skips it after the
-  first run; only the tflm build pays the cost, the default builds are unaffected.  The
-  pin + command are in the `cmake/tflite-micro.cmake` header.  **numpy/Pillow are required**
-  (TFLM's Makefile evaluation uses them) → added to `requirements.txt`, installed into an
-  auto-created `./.venv`.
-- **CMSIS-NN is M2**: the vendored `lib/cmsis_core/NN` is the legacy CMSIS-5 API,
-  incompatible with TFLM's cmsis_nn kernels.  The spike uses reference kernels; the
-  optimized path needs a separate modern CMSIS-NN submodule (M2).
+- **Model array generated at configure**: the `.tflite` (`NN_TFLM_MODEL`, defaults
+  to the same BlazeFace int8 as stedgeai) is not committed (`.gitignore`).
+  `cmake/gen_model_array.py` emits an `alignas(16)` `g_blazeface_model_data[]` into
+  the **build dir** and adds it to the tflm lib; a path+size+mtime stamp detects a
+  model swap (`-DNN_TFLM_MODEL=<path>` overrides).
+- **Resolver / I/O**: a `MicroMutableOpResolver<8>` registers BlazeFace's ops
+  (QUANTIZE / CONV_2D / DEPTHWISE_CONV_2D / ADD / PAD / MAX_POOL_2D / RESHAPE /
+  DEQUANTIZE).  `nn_tflm.cc` builds 1-in / N-out generically from the interpreter
+  (reporting `arena_used_bytes()` to `ai info`), so `blazeface.c` locates the four
+  outputs by shape — no model-specific code in the backend.
+- **Arena**: `.sdram.ai` (bank3, cacheable WBWA, CPU-only).  BlazeFace activations
+  measured **~470 KB** (512 KB reserved; with the 384 KB staging it fits bank3's
+  2 MB).  Same bank as stedgeai.
+- **Single-precision FPU** (`fpv5-sp-d16`) → `double` is soft-float.  BlazeFace has
+  no Softmax/Logistic (activations are fused), so there is no heavy `std::exp`
+  (double) path.
+- **Vendoring = fetch at configure (not checked in)**: `cmake/tflite-micro.cmake`
+  `git fetch`es the pinned SHA at CMake configure time and runs `create_tflm_tree.py`
+  into a self-contained tree under the **build dir**, compiled with our flags.  A stamp
+  keyed on SHA + kernel (ref/cmsis_nn) skips it after the first run.  **numpy/Pillow are
+  required** (`requirements.txt`, auto-created `./.venv`).
 
-`port/nn/tflm/nn_tflm.cc` implements `nn_backend_vt` (`extern "C"`) over the
-spike model (`hello_world_int8`, 2.7 KB, FullyConnected only, int8 1×1
-I/O).  `ai selftest` (`CONFIG_NN_BACKEND_TFLM` only) runs one inference, checks the
-sine approximation against a golden, and confirms the static-ctor sentinel and
-**zero heap use** (`operator new` called 0 times).  Measured Flash cost is **+22.8 KB**
-over the null baseline (interpreter + the FullyConnected reference kernel).
+### CMSIS-NN optimized kernels (M2b)
+
+`NN_TFLM_CMSIS_NN` (default **ON**) passes `OPTIMIZED_KERNEL_DIR=cmsis_nn` to
+`create_tflm_tree.py`.  The tflm Makefile downloads **CMSIS_6 core + ARM-software/
+CMSIS-NN** (each at its own pinned SHA) and swaps in the cmsis_nn kernel wrappers
+(CONV_2D / DEPTHWISE_CONV_2D / ADD / PAD / MAX_POOL_2D) for the reference ones.
+`-DCMSIS_NN` flips the kernel headers from inline reference registrations to extern
+declarations (without it the optimized kernels redefine them).  **Cortex-M7 is
+armv7e-m**, so GCC defines `__ARM_FEATURE_DSP` and CMSIS-NN's **SIMD (SMLAD) int8
+path** is compiled (a `#error` canary in `nn_tflm.cc` asserts it; MVE is absent on
+the M7).  `NN_TFLM_CMSIS_NN=OFF` reverts to pure reference kernels for comparison.
+
+**`ai bench`** (BlazeFace-front 128 int8, 31.8M MACC, @216 MHz, isolated `nn_run`):
+
+| backend | kernel | latency/inference | cyc/MACC |
+|---|---|---|---|
+| `stedgeai` (X-CUBE-AI) | ST optimized | ~685 ms | ~4.6 |
+| `tflm` | reference | ~2,418 ms | ~16.4 |
+| **`tflm`** | **CMSIS-NN** | **~622 ms** | **~4.2** |
+
+CMSIS-NN accelerates CONV_2D / DEPTHWISE_CONV_2D with SIMD — **~3.9× over reference**
+and a hair faster than stedgeai.  Detections (bbox / score) agree across all three.
+Live `ai stream` runs ~1.5 s/inference (~0.5 inf/s) — slower than the isolated bench
+because the DCMI competes for bank3 bandwidth (the F746 bus matrix is round-robin
+with no SDRAM QoS).  Flash cost is **~+60 KB** over the null baseline (interpreter +
+CMSIS-NN lib + the 189 KB model).
 
 ```bash
-# TFLM backend (fetches tflite-micro at configure -- needs network + python3)
-cmake -B build_tflm -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
-    -DCONFIG_NN_BACKEND=tflm
-cmake --build build_tflm
-# on hardware: ai selftest / ai info / ai bench
+# TFLM backend (fetches tflite-micro + CMSIS-NN at configure -- needs network + python3)
+cmake -B build-tflm -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+    -DCONFIG_NN_BACKEND=tflm                 # CMSIS-NN on by default
+cmake --build build-tflm
+# to compare against reference kernels:
+cmake -B build-tflm ... -DCONFIG_NN_BACKEND=tflm -DNN_TFLM_CMSIS_NN=OFF
+# on hardware: ai info / ai bench / ai stream
 ```
 
 ## Roadmap (Epic #80)
@@ -217,6 +248,6 @@ cmake --build build_tflm
 |---|---|
 | **P1 ✅** | `nn` abstraction + X-CUBE-AI backend + `ai` command + **BlazeFace-128 face detection first-light** |
 | P2 | Load the model/weights from the SD card (FileX → `.sdram.ai`) — needs TFLM |
-| **P3 M1 ✅** | TFLM backend feasibility spike (C++ enablement + hello_world inference, #86).  M2 = BlazeFace port + CMSIS-NN + comparative bench |
+| **P3 ✅** | TFLM backend.  M1 spike (C++ enablement + hello_world, #86) → **M2 BlazeFace port + CMSIS-NN + comparative bench (#88)** |
 | **P4 ✅** | GUIX overlay (live preview + face bbox, #83 → [GUIX camera UI](../rtos/guix.md#face-detect-overlay-83-epic-80-p4)) |
 | P5 | X-CUBE-AI relocatable network (swap the whole model from SD) |
