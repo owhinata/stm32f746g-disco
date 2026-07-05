@@ -313,6 +313,17 @@ static struct frame_sink *cam_ext_sink;   /* GUIX live-preview sink (#56), owner
                                              NULL = no preview (cam_lock-guarded) */
 
 static volatile int      cam_stream_active;  /* streaming mode gate             */
+static volatile int      cam_stream_mirror;   /* #82: JPEG stream mirrors each frame
+                                                 into cam_frame for save/send (plain
+                                                 stream only).  A session latch fixed for
+                                                 the stream's lifetime: set (= ext==NULL)
+                                                 by the start caller before the producer
+                                                 wakeup, read and cleared only by the
+                                                 producer.  The async preview/mjpeg stop
+                                                 NULLs cam_ext_sink on another thread, so
+                                                 reading that pointer lock-free could flip
+                                                 the mirror decision mid-pass -- this latch
+                                                 cannot. */
 static volatile int      cam_stop_req;       /* stop requested (producer drains)*/
 static volatile int      cam_stream_err;     /* DCMI OVR -> terminal stop       */
 static volatile uint32_t cam_stream_ovr;     /* DCMI overrun count              */
@@ -1643,6 +1654,7 @@ static void cam_stream_teardown(void)
 	(void)tx_mutex_get(&cam_lock, TX_WAIT_FOREVER);
 	if (cam_stream_active) {
 		cam_stream_active = 0;
+		cam_stream_mirror = 0;                /* #82: producer clears the mirror latch */
 		cam_elapsed_ms = HAL_GetTick() - cam_start_tick;
 		(void)HAL_DCMI_Stop(&hdcmi);          /* aborts the DMA internally */
 		/* The JPEG snapshot-loop arms DCMI_IT_FRAME, but HAL_DCMI_Stop does NOT
@@ -1796,9 +1808,10 @@ static int cam_stream_should_stop(void)
 }
 
 /* Service one JPEG frame: finalise the current slot (Stop -> NDTR -> EOI trim),
-   publish it at its real length, mirror it for save/send, then re-arm into a free
-   slot.  Every HAL failure (Stop / re-arm) is terminal -> teardown, so the stream
-   never sticks "active" with no frame coming.  Producer-thread only. */
+   publish it at its real length, mirror it for save/send (plain stream only, #82),
+   then re-arm into a free slot.  Every HAL failure (Stop / re-arm) is terminal ->
+   teardown, so the stream never sticks "active" with no frame coming.
+   Producer-thread only. */
 static void cam_stream_service_jpeg(int had_sem)
 {
 	uint32_t ndtr, eff, valid;
@@ -1825,7 +1838,16 @@ static void cam_stream_service_jpeg(int had_sem)
 		if (freed != NULL) {
 			frame_pipeline_publish(&cam_pipe, cam_jpeg_slot, valid,
 			                       FRAME_FMT_JPEG, mode.width, mode.height, 0u);
-			mirror_to_cam_frame(cam_jpeg_slot, valid);
+			/* #82: only a plain `camera stream` (no external sink) keeps cam_frame
+			   live for camera save/send.  While an external sink is attached
+			   (MJPEG stream #78 / GUIX preview #56) skip the per-frame ~19.5KB
+			   non-cacheable SDRAM mirror -- matching the raster preview path, which
+			   never mirrors.  save/send then return the last non-external-sink frame
+			   (or CAM_ERR_NO_FRAME).  Gate on the session latch, NOT cam_ext_sink:
+			   an async preview/mjpeg stop NULLs that pointer from another thread and
+			   could otherwise flip the decision mid-pass. */
+			if (cam_stream_mirror)
+				mirror_to_cam_frame(cam_jpeg_slot, valid);
 			cam_jpeg_slot = freed;       /* fill a fresh slot next */
 		} else {
 			cam_ring_ovr++;              /* no free slot: drop, reuse this slot */
@@ -1981,6 +2003,7 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 			return CAM_ERR_HAL;
 		}
 		cam_ext_sink = ext;               /* #49 P5: record the MJPEG sink owner */
+		cam_stream_mirror = (ext == NULL); /* #82: plain stream mirrors; ext skips */
 		(void)tx_semaphore_put(&cam_start_sem);
 		LOG_INF("stream start jpeg (frames=%lu secs=%lu)",
 		        (unsigned long)frames, (unsigned long)secs);
@@ -2025,6 +2048,8 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	hdcmi.State = HAL_DCMI_STATE_BUSY;
 
 	cam_ext_sink = ext;               /* record preview ownership (NULL = plain) */
+	cam_stream_mirror = (ext == NULL); /* #82: unused on the raster path (no mirror),
+	                                      set for symmetry / a clean latch lifecycle */
 
 	/* Wake the producer out of its idle FOREVER wait on the dedicated start
 	   semaphore -- never the completion semaphore, so it cannot be miscounted. */

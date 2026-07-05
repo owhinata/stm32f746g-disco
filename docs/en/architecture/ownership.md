@@ -116,7 +116,10 @@ state/frame only.
   (GUIX owns it) — deliberately allowed (blanking the panel is harmless to the
   UI). Everything *visible* still belongs to GUIX until `gui stop`.
 - **Read-only commands** (`*info`, `camera save`/`send`, `camera stream stats`)
-  work in every state; they never re-arm hardware.
+  work in every state; they never re-arm hardware. During an external-sink stream
+  (MJPEG / GUIX preview), though, `camera save`/`send` return the **last
+  non-external-sink frame** (or `CAM_ERR_NO_FRAME` if none) -- see the JPEG
+  streaming section in [Camera](../hardware/camera.md) (#82).
 - See [Camera](../hardware/camera.md), [Display](../hardware/display.md),
   [Touch](../hardware/touch.md) and [GUIX](../rtos/guix.md) for each
   subsystem's details.

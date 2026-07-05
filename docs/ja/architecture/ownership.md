@@ -108,6 +108,8 @@ Copyright (c) 2026 ThreadX Shell Project
   所有）— 意図的に許可している（パネル消灯は UI に無害）。`gui stop` までは *見える* もの
   はすべて GUIX のもの。
 - **read-only コマンド**（`*info`・`camera save`/`send`・`camera stream stats`）は全状態で
-  動作する。ハードウェアを再 arm しない。
+  動作する。ハードウェアを再 arm しない。ただし外部 sink 付き配信中（MJPEG / GUIX preview）は
+  `camera save`/`send` が **最後に外部 sink 無しで撮ったフレーム**（無ければ `CAM_ERR_NO_FRAME`）を
+  返す（#82、[カメラ](../hardware/camera.md) の JPEG streaming 節を参照）。
 - 各サブシステムの詳細は [カメラ](../hardware/camera.md)・[ディスプレイ](../hardware/display.md)・
   [タッチ](../hardware/touch.md)・[GUIX](../rtos/guix.md) を参照。
