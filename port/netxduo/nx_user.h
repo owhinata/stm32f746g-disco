@@ -52,6 +52,16 @@
  * instead of timing out.  Without this the API returns NX_NOT_SUPPORTED. */
 #define NX_ENABLE_TCP_QUEUE_DEPTH_UPDATE_NOTIFY
 
+/* Enable per-interface hardware offload capability (issue #98).  Lets the ETH
+ * driver report the STM32 MAC's TX checksum insertion (IPv4 header + TCP), so
+ * NetX skips the matching SW checksum (a redundant read pass over non-cacheable
+ * SDRAM) and instead leaves the field 0 + flags the packet; the driver maps that
+ * per-packet flag to the TDES0 CIC field.  Adds a ULONG to NX_PACKET/NX_INTERFACE
+ * and enables the capability branches in the nx_* checksum paths.  We do NOT
+ * define NX_ENABLE_TCPIP_OFFLOAD (that would require a full offload driver) and
+ * report no RX capability, so RX checksums stay SW-verified. */
+#define NX_ENABLE_INTERFACE_CAPABILITY
+
 /* DHCP client thread stack (issue #93).  nxd_dhcp_client.h declares
  * nx_dhcp_thread_stack[NX_DHCP_THREAD_STACK_SIZE] as a member of the NX_DHCP
  * control block with a #ifndef-guarded 4096 default; measured high-water-mark is

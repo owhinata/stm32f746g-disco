@@ -47,6 +47,18 @@ ARP キャッシュは CPU 専用なので通常 SRAM（`.bss`）に置く。
   `ETH_BufferTypeDef` チェーン → `HAL_ETH_Transmit_IT`。送信完了（`HAL_ETH_TxFreeCallback`）で
   `NX_PACKET` を解放。fragment 数が `ETH_TX_DESC_CNT`(4) を超える稀なケースは scratch バッファへ
   coalesce する。
+- **TX checksum オフロード**（#98）: MAC の HW checksum 挿入で **IPv4 ヘッダ + TCP** の
+  checksum を計算させ、NetX の SW 計算（非キャッシュ SDRAM を毎チャンク 1 パス余分に read）を
+  省く。`nx_user.h` の `NX_ENABLE_INTERFACE_CAPABILITY` を定義し、ドライバは
+  `NX_LINK_INITIALIZE` で `nx_interface_capability_flag` に `IPV4_TX | TCP_TX` を報告
+  （IP スレッド init の flag クリア後に実行されるため race しない）。NetX はオフロードした
+  checksum フィールドを **0 のまま**残し、`NX_PACKET` 毎に `nx_packet_interface_capability_flag`
+  を立てる。ドライバはこれを読んで TDES0 の CIC を per-packet に決める:
+  payload 系ビット（TCP/UDP/ICMP）あり→CIC=11（IP ヘッダ+payload+pseudo を HW 計算）、
+  `IPV4_TX` のみ（IP フラグメント等）→CIC=01（IP ヘッダのみ）、フラグ無し（ARP/RARP）→CIC=00。
+  HW 挿入は TX store-and-forward（`HAL_ETH_Init` 既定で有効。ES0290 §2.14.4 の checksum
+  offload workaround も TSF=1 を要求）を前提とする。**RX capability は未報告**のため、受信
+  パケットは NetX が従来どおり SW 検証する。UDP/ICMP payload のオフロードは #103 で検討。
 - **RX プール枯渇からの回復**: プールが枯れて RxAllocate が NULL を返すと descriptor の再 arm が
   止まるが、`HAL_ETH_ReadData()` は `RxBuildDescCnt!=0` のとき毎回 `ETH_UpdateDescriptor()`（=starved
   descriptor の再 arm）を呼ぶため、eth-link スレッドが 200 ms 毎に deferred を kick する watchdog で

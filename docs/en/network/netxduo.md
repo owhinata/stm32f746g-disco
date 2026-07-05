@@ -55,6 +55,20 @@ CPU-only, so they stay in regular SRAM (`.bss`).
   = 16` headroom), build an `ETH_BufferTypeDef` chain, `HAL_ETH_Transmit_IT`; on
   completion (`HAL_ETH_TxFreeCallback`) release the `NX_PACKET`. A chain longer
   than `ETH_TX_DESC_CNT` (4) -- rare -- is coalesced into a scratch buffer.
+- **TX checksum offload** (#98): the MAC's HW checksum insertion computes the
+  **IPv4-header + TCP** checksums, sparing NetX the SW computation (a redundant
+  read pass over non-cacheable SDRAM per chunk). `nx_user.h` defines
+  `NX_ENABLE_INTERFACE_CAPABILITY` and the driver reports `IPV4_TX | TCP_TX` in
+  `nx_interface_capability_flag` from `NX_LINK_INITIALIZE` (which runs after the
+  IP thread's init-time flag clear, so it does not race). NetX leaves each
+  offloaded checksum field **0** and sets `nx_packet_interface_capability_flag`
+  per `NX_PACKET`; the driver maps that flag to the TDES0 CIC field per packet:
+  a payload bit (TCP/UDP/ICMP) -> CIC=11 (IP header + payload + pseudo-header in
+  HW), `IPV4_TX` only (e.g. an IP fragment) -> CIC=01 (IP header only), no flag
+  (ARP/RARP) -> CIC=00. HW insertion requires TX store-and-forward (enabled by
+  `HAL_ETH_Init` default; ES0290 §2.14.4's checksum-offload workaround also
+  requires TSF=1). **No RX capability is reported**, so received packets stay
+  SW-verified by NetX. UDP/ICMP payload offload is tracked by #103.
 - **RX pool-exhaustion recovery**: when the pool empties and RxAllocate returns
   NULL the descriptors stop re-arming, but `HAL_ETH_ReadData()` calls
   `ETH_UpdateDescriptor()` (which retries RxAllocate for starved descriptors)

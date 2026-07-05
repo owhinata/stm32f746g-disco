@@ -278,6 +278,32 @@ static void eth_tx(NX_IP_DRIVER *req)
 	cfg.Length     = pkt->nx_packet_length;
 	cfg.Attributes = ETH_TX_PACKETS_FEATURES_CRCPAD;
 	cfg.CRCPadCtrl = ETH_CRC_PAD_INSERT;
+
+	/* HW TX checksum insertion (issue #98).  NetX flags, per packet, which
+	   checksums it offloaded (leaving those header fields 0); map that to the
+	   TDES0 CIC field.  Always set CSUM so ChecksumCtrl is written on every
+	   transmit -- the descriptors are init'd with CIC=FULL and DMA write-back
+	   does not restore it, so leaving CIC untouched would be non-deterministic.
+	   ETH_CHECKSUM_DISABLE (0) then means "HW must not touch the SW-computed
+	   field" for ARP/RARP and any non-offloaded protocol. */
+	cfg.Attributes |= ETH_TX_PACKETS_FEATURES_CSUM;
+	cfg.ChecksumCtrl = ETH_CHECKSUM_DISABLE;
+#ifdef NX_ENABLE_INTERFACE_CAPABILITY
+	{
+		ULONG capf = pkt->nx_packet_interface_capability_flag;
+
+		if (capf & (NX_INTERFACE_CAPABILITY_TCP_TX_CHECKSUM |
+		            NX_INTERFACE_CAPABILITY_UDP_TX_CHECKSUM |
+		            NX_INTERFACE_CAPABILITY_ICMPV4_TX_CHECKSUM))
+			/* IP header + payload + pseudo-header all in HW (CIC=11).  Payload
+			   offload always covers the IP header too, so NetX also zeroed it. */
+			cfg.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
+		else if (capf & NX_INTERFACE_CAPABILITY_IPV4_TX_CHECKSUM)
+			/* IP header only (CIC=01): e.g. an IP fragment, whose payload
+			   checksum the MAC would bypass anyway. */
+			cfg.ChecksumCtrl = ETH_CHECKSUM_IPHDR_INSERT;
+	}
+#endif
 	cfg.pData      = pkt;            /* TxFree releases this NX_PACKET            */
 
 	eth_lock_acquire();
@@ -385,6 +411,18 @@ VOID nx_eth_driver(NX_IP_DRIVER *req)
 		nx_ip_interface_physical_address_set(ip, g.iface_index,
 		                                     g.mac_msw, g.mac_lsw, NX_FALSE);
 		nx_ip_interface_address_mapping_configure(ip, g.iface_index, NX_TRUE);
+
+		/* Report the MAC's TX checksum insertion (issue #98).  Set the flag
+		   directly here rather than via nx_ip_interface_capability_set() from the
+		   glue: NX_LINK_INITIALIZE runs on the IP thread *after* it clears the
+		   capability flag to 0 (nx_ip_thread_entry.c), so a glue-side set would
+		   race that clear.  IPv4-header + TCP only (see eth_tx CIC mapping); no
+		   UDP/ICMP payload (UDP zero-checksum special case unverified) and no RX. */
+#ifdef NX_ENABLE_INTERFACE_CAPABILITY
+		iface->nx_interface_capability_flag =
+		        NX_INTERFACE_CAPABILITY_IPV4_TX_CHECKSUM |
+		        NX_INTERFACE_CAPABILITY_TCP_TX_CHECKSUM;
+#endif
 		/* NetX optimistically set link_up = TRUE; start from the real (down)
 		   state until the first PHY poll reports up (see nx_eth_on_link). */
 		iface->nx_interface_link_up = NX_FALSE;
