@@ -140,7 +140,7 @@ lcd on | lcd off    表示全体の ON/OFF（バックライト + LTDC スキャ
 
 → **DCMI streaming の FE は 100% が LTDC 連続リードとの SDRAM 競合**で、スキャンアウトを止めると **完全にゼロ**。DCMI→SDRAM 書込み単独（リフレッシュ/行管理込み）では FE は出ない＝**床は無い**。よって残 FE を 0 近傍へ追い込むには **DCMI を優先する FMC/AXI アービトレーション**が原理的に有効（#59 で deferred）。
 
-`lcd info` の **errors 行**は `LTDC->ISR` の FIFO underrun / transfer error フラグ（RM0385 §18.7.9）を表示する — **underrun=YES は SDRAM 帯域不足の証拠**になる。`state` 行は `up` / `disabled (scanout off)` / `DOWN` を表示する。
+`lcd info` の **errors 行**は `LTDC->ISR` の FIFO underrun / transfer error フラグ（RM0385 §18.7.9）を表示する — **underrun=YES は SDRAM 帯域不足の証拠**になる。`state` 行は `up` / `disabled (scanout off)` / `DOWN` を表示する。**DMA2D 行**は固定値 `on` ではなく `RCC->AHB1ENR` の `DMA2DEN` クロックゲートビット（`__HAL_RCC_DMA2D_IS_CLK_ENABLED()`）を read-back する（#91）。DMA2D（Chrom-ART）は **on-demand の AHB マスタ**で、fill/blit 転送中のみバイトを動かし **idle 時は SDRAM 帯域を消費しない**ため「止める」対象ではない — 連続リードするのは LTDC scanout の方で、そちらは `lcd off` が停止する（`state: disabled (scanout off)`）。
 
 `lcd info` の **errors 行**は `LTDC->ISR` の FIFO underrun / transfer error フラグ（RM0385 §18.7.9）を表示する — **underrun=YES は SDRAM 帯域不足の証拠**になる。
 
@@ -153,7 +153,7 @@ clock:   LCD_CLK 4.80 MHz (PLLSAI N=192 R=5, DIVR/8)
 fb:      0xc00bb800 (.sdram, non-cacheable)
 buffers: 2 (double, tear-free VBR)
 front:   0
-DMA2D:   on
+DMA2D:   on (Chrom-ART clock enabled; on-demand, idle=no SDRAM traffic)
 state:   up
 errors:  underrun=no transfer=no
 sh> lcd bar

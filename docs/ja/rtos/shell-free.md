@@ -22,7 +22,7 @@ region start          total      used      free use%
 Flash  0x08000000   1048576    295796    752780  28%  .isr/.text/.rodata/.data
 DTCM   0x20000000     65536      8224     57312  12%  .log_noinit (reset-persistent)
 SRAM   0x20010000    262144     82656    179488  31%  .data/.bss/.sram1_dma + heap
-SDRAM  0xC0000000   8388608   2506240   5882368  29%  .sdram (camera/LTDC NOLOAD)
+SDRAM  0xC0000000   8388608   4657024   3731584  55%  .sdram fixed/cam/eth/ai/model (banks0-3)
 
 heap:  base 0x200242E0  arena 0  in-use 0  free-pool 0
 stack: top  0x20050000  main-reserve 1024 B (MSP/ISR grow down into SRAM free)
@@ -47,12 +47,19 @@ stack: top  0x20050000  main-reserve 1024 B (MSP/ISR grow down into SRAM free)
 | **Flash** 1MB @0x08000000 | LENGTH | `LOADADDR(.data) + sizeof(.data) − ORIGIN(FLASH)` | `.data` のロードイメージは FLASH 配置の最後尾なので、これが全フットプリント（= `size` の text+data） |
 | **DTCM** 64KB @0x20000000 | LENGTH | `_elog_noinit − _slog_noinit` | `.log_noinit`（リセット永続ログリング）が唯一の常駐 |
 | **SRAM** 256KB @0x20010000 | LENGTH | `(heap break) − ORIGIN(RAM)` | 静的（`_end − ORIGIN` = `.data`+`.bss`+`.sram1_dma`）+ heap arena |
-| **SDRAM** 8MB @0xC0000000 | LENGTH | `_esdram − _ssdram` | `.sdram`（カメラ/LTDC の NOLOAD バッファ） |
+| **SDRAM** 8MB @0xC0000000 | LENGTH | バンク別 NOLOAD サブリージョンの**合算**（下記） | `.sdram.fixed`(bank0 LTDC/表示) + `.sdram.cam`(bank1 カメラ) + `.sdram.eth`(bank2 ETH DMA, #49) + `.sdram.ai`(bank3 下位 NN アリーナ, #81/#88) + `.sdram.ai.model`(bank3 上位 reloc スロット, #92) |
 
 リージョンの ORIGIN/LENGTH はリンカ MEMORY ブロックを典拠にした**コンパイル時定数**として
 `cmd_free.c` に持つ（リンカを単一の真実源とし、`free` を**リンカ無改変・読み取り専用**に保つ）。
 これらは bsp.c の MPU 設定や SDRAM/QSPI ドライバでも同じ値をハードコードしており、リンカ編集なしには
 変わらない。
+
+!!! note "SDRAM は `_esdram − _ssdram` ではなくバンク合算"
+    `.sdram` は FMC 内部バンク境界（2MB/1MB アライン）で `fixed`/`cam`/`eth`/`ai`/`ai.model` の
+    サブリージョンに分かれ、各バンク末尾から次バンク先頭までに**アライメントの穴**が空く（#65/#81/#92）。
+    `_esdram − _ssdram` は穴込みのスパン（本例では 7MB/87.5%）になり実使用を過大報告するため、`free` は
+    各サブリージョン（`_e… − _s…`）を**個別に合算**して穴を計上しない。ビルドが使わないサブリージョンは
+    空（start == end）で 0 加算になる（例: reloc NN backend 以外では `.sdram.ai.model` = 0）。
 
 ### SRAM のレイアウト（heap と stack の共有）
 

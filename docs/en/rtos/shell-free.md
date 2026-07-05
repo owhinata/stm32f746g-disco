@@ -24,7 +24,7 @@ region start          total      used      free use%
 Flash  0x08000000   1048576    295796    752780  28%  .isr/.text/.rodata/.data
 DTCM   0x20000000     65536      8224     57312  12%  .log_noinit (reset-persistent)
 SRAM   0x20010000    262144     82656    179488  31%  .data/.bss/.sram1_dma + heap
-SDRAM  0xC0000000   8388608   2506240   5882368  29%  .sdram (camera/LTDC NOLOAD)
+SDRAM  0xC0000000   8388608   4657024   3731584  55%  .sdram fixed/cam/eth/ai/model (banks0-3)
 
 heap:  base 0x200242E0  arena 0  in-use 0  free-pool 0
 stack: top  0x20050000  main-reserve 1024 B (MSP/ISR grow down into SRAM free)
@@ -50,13 +50,22 @@ The `used` value of each region is derived from symbols provided by
 | **Flash** 1MB @0x08000000 | LENGTH | `LOADADDR(.data) + sizeof(.data) − ORIGIN(FLASH)` | `.data`'s load image is the last thing in FLASH, so this is the whole footprint (== `size`'s text+data) |
 | **DTCM** 64KB @0x20000000 | LENGTH | `_elog_noinit − _slog_noinit` | `.log_noinit` (reset-persistent log ring) is the only resident |
 | **SRAM** 256KB @0x20010000 | LENGTH | `(heap break) − ORIGIN(RAM)` | static (`_end − ORIGIN` = `.data`+`.bss`+`.sram1_dma`) + heap arena |
-| **SDRAM** 8MB @0xC0000000 | LENGTH | `_esdram − _ssdram` | `.sdram` (camera/LTDC NOLOAD buffers) |
+| **SDRAM** 8MB @0xC0000000 | LENGTH | **sum** of the per-bank NOLOAD sub-regions (see note) | `.sdram.fixed` (bank0 LTDC/display) + `.sdram.cam` (bank1 camera) + `.sdram.eth` (bank2 ETH DMA, #49) + `.sdram.ai` (bank3 lower NN arena, #81/#88) + `.sdram.ai.model` (bank3 upper reloc slots, #92) |
 
 Region ORIGIN/LENGTH are kept in `cmd_free.c` as **compile-time constants**
 mirroring the linker MEMORY block (single source of truth: the `.ld`), which keeps
 `free` a **zero-linker-change, read-only** command. The same addresses are already
 hardcoded in bsp.c (MPU) and the SDRAM/QSPI drivers; they never change without a
 linker edit.
+
+!!! note "SDRAM is a per-bank sum, not `_esdram − _ssdram`"
+    `.sdram` splits into the `fixed`/`cam`/`eth`/`ai`/`ai.model` sub-regions at FMC
+    internal bank boundaries (2 MB/1 MB aligned), leaving **alignment holes** between
+    each bank's end and the next bank's start (#65/#81/#92). `_esdram − _ssdram` would
+    be the hole-inclusive span (7 MB / 87.5% here) and over-report the true footprint,
+    so `free` sums each sub-region (`_e… − _s…`) **individually** and never counts the
+    holes. A sub-region a given build does not use is empty (start == end) and adds 0
+    (e.g. `.sdram.ai.model` is 0 unless the reloc NN backend is compiled in).
 
 ### SRAM layout (heap and stack share the tail)
 

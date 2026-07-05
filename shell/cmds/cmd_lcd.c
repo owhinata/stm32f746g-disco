@@ -26,6 +26,7 @@
  */
 #include "cli.h"
 #include "ltdc_display.h"
+#include "stm32f7xx_hal.h"   /* __HAL_RCC_DMA2D_IS_CLK_ENABLED (AHB1ENR read-back) */
 
 #include <stdint.h>
 #include <string.h>
@@ -139,7 +140,15 @@ static int cmd_lcd_info(struct cli_instance *sh, int argc, char **argv)
 	          (unsigned long)(uintptr_t)ltdc_framebuffer());
 	cli_print(sh, "buffers: 2 (double, tear-free VBR)\r\n");
 	cli_print(sh, "front:   %u\r\n", (unsigned)ltdc_active_buffer());
-	cli_print(sh, "DMA2D:   on\r\n");
+	/* DMA2D (Chrom-ART) is an on-demand AHB master: it moves bytes only while a
+	   fill/blit transfer is in flight and consumes no SDRAM bandwidth at idle, so
+	   it is not something to "turn off" (the continuous SDRAM reader is LTDC
+	   scanout, stopped by 'lcd off' -> state: disabled).  Report the real AHB1ENR
+	   clock-gate bit rather than a hardcoded "on" so the line reflects hardware. */
+	cli_print(sh, "DMA2D:   %s\r\n",
+	          __HAL_RCC_DMA2D_IS_CLK_ENABLED()
+	                  ? "on (Chrom-ART clock enabled; on-demand, idle=no SDRAM traffic)"
+	                  : "off (clock gated)");
 	cli_print(sh, "state:   %s\r\n",
 	          ltdc_scanout_off() ? "disabled (scanout off)"
 	                             : (ltdc_is_up() ? "up" : "DOWN (init failed)"));

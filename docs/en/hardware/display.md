@@ -140,7 +140,7 @@ Uses: **bandwidth/power control** and **isolating the FE root cause for #59**. M
 
 → The DCMI streaming FE is **100% SDRAM contention with the LTDC continuous read** — stop scanout and it drops to **exactly zero**. The DCMI→SDRAM write path alone (refresh / row management included) produces no FE, i.e. **there is no floor**. So driving the residual FE toward 0 fundamentally needs **FMC/AXI arbitration that prioritizes the DCMI** (deferred in #59).
 
-The **errors line** of `lcd info` shows the `LTDC->ISR` FIFO-underrun / transfer-error flags (RM0385 §18.7.9) — **underrun=YES is evidence of SDRAM bandwidth starvation**. The `state` line shows `up` / `disabled (scanout off)` / `DOWN`.
+The **errors line** of `lcd info` shows the `LTDC->ISR` FIFO-underrun / transfer-error flags (RM0385 §18.7.9) — **underrun=YES is evidence of SDRAM bandwidth starvation**. The `state` line shows `up` / `disabled (scanout off)` / `DOWN`. The **DMA2D line** read-backs the real `RCC->AHB1ENR` `DMA2DEN` clock-gate bit (`__HAL_RCC_DMA2D_IS_CLK_ENABLED()`) rather than printing a fixed `on` (#91). DMA2D (Chrom-ART) is an **on-demand AHB master**: it moves bytes only while a fill/blit is in flight and consumes **zero SDRAM bandwidth at idle**, so it is not something to "turn off" — the continuous SDRAM reader is the LTDC scanout, which `lcd off` stops (`state: disabled (scanout off)`).
 
 The **errors line** of `lcd info` shows the `LTDC->ISR` FIFO-underrun / transfer-error flags (RM0385 §18.7.9) — **underrun=YES is evidence of SDRAM bandwidth starvation**.
 
@@ -153,7 +153,7 @@ clock:   LCD_CLK 4.80 MHz (PLLSAI N=192 R=5, DIVR/8)
 fb:      0xc00bb800 (.sdram, non-cacheable)
 buffers: 2 (double, tear-free VBR)
 front:   0
-DMA2D:   on
+DMA2D:   on (Chrom-ART clock enabled; on-demand, idle=no SDRAM traffic)
 state:   up
 errors:  underrun=no transfer=no
 sh> lcd bar

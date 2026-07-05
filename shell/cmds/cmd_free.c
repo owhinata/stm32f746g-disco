@@ -18,7 +18,7 @@
  *   Flash    0x08000000  1048576    294752    753824   28%   .isr/.text/.rodata/.data(load)
  *   DTCM     0x20000000    65536      8224     57312   12%   .log_noinit (reset-persistent ring)
  *   SRAM     0x20010000   262144     ......    ......  ..%   .data/.bss/.sram1_dma + heap
- *   SDRAM    0xC0000000  8388608   ........  ........  ..%   .sdram (camera/LTDC NOLOAD)
+ *   SDRAM    0xC0000000  8388608   ........  ........  ..%   .sdram banks0-3 (LTDC/cam/eth/NN NOLOAD)
  *
  * Per-region accounting (linker symbols in ldscript/STM32F746NGHx_FLASH.ld):
  *   Flash  used = LOADADDR(.data) + sizeof(.data) - ORIGIN(FLASH).  .data's load
@@ -28,9 +28,12 @@
  *   SRAM   static = _end - ORIGIN(RAM) (.data + .bss + .sram1_dma); the heap then
  *          grows up from _end and the main/ISR stack grows down from _estack, so
  *          used = (heap break) - ORIGIN(RAM) and free = _estack - (heap break).
- *   SDRAM  used = .sdram.fixed (bank0) + .sdram.cam (bank1 camera arena); the two
- *          bank-aligned sub-regions are summed so the 2 MB-alignment hole between
- *          them is not counted (issue #65).
+ *   SDRAM  used = sum of the bank-aligned NOLOAD sub-regions: .sdram.fixed (bank0
+ *          LTDC/display) + .sdram.cam (bank1 camera arena) + .sdram.eth (bank2 ETH
+ *          DMA + NetX pool, #49) + .sdram.ai (bank3 lower, NN arena, #81/#88) +
+ *          .sdram.ai.model (bank3 upper, reloc model slots, #92).  Each is summed
+ *          individually so the bank-alignment holes between them are not counted
+ *          (issues #65/#81/#92); sub-regions a build does not use are empty.
  *
  * Region ORIGIN/LENGTH are compile-time constants mirroring the linker MEMORY
  * block (single source of truth: the .ld).  They never change without a linker
@@ -76,10 +79,16 @@
 extern uint8_t _sdata[], _edata[];          /* .data run image in SRAM        */
 extern uint8_t _sidata[];                   /* .data load image in FLASH      */
 extern uint8_t _slog_noinit[], _elog_noinit[]; /* DTCM reset-persistent ring  */
-/* .sdram is split into two bank-aligned sub-regions with a 2 MB-alignment hole
- * between them (issue #65); sum the two residents so the hole is not counted. */
-extern uint8_t _ssdram_fixed[], _esdram_fixed[]; /* .sdram.fixed (bank0)       */
-extern uint8_t _ssdram_cam[],   _esdram_cam[];   /* .sdram.cam   (bank1 arena) */
+/* .sdram is split into bank-aligned sub-regions separated by alignment holes
+ * (issues #65/#81/#92); each resident is summed individually so the holes are
+ * not counted.  All boundary symbols are defined unconditionally by the linker
+ * script, so any sub-region a given build does not use is simply empty (start
+ * == end), e.g. .sdram.ai.model is 0 bytes unless the reloc NN backend is in. */
+extern uint8_t _ssdram_fixed[], _esdram_fixed[];       /* .sdram.fixed (bank0 LTDC/display) */
+extern uint8_t _ssdram_cam[],   _esdram_cam[];         /* .sdram.cam   (bank1 camera arena)  */
+extern uint8_t _ssdram_eth[],   _esdram_eth[];         /* .sdram.eth   (bank2 ETH DMA, #49)  */
+extern uint8_t _ssdram_ai[],    _esdram_ai[];          /* .sdram.ai    (bank3 NN arena, #81) */
+extern uint8_t _ssdram_ai_model[], _esdram_ai_model[]; /* .sdram.ai.model (bank3 reloc, #92) */
 extern uint8_t _end[];                       /* top of static SRAM = heap base */
 extern uint8_t _estack[];                    /* top of SRAM (initial MSP)      */
 extern uint8_t _Min_Stack_Size[];            /* reserved main-stack bytes      */
@@ -109,8 +118,11 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	uint32_t flash_used = (sym(_sidata) - FLASH_ORIGIN)
 	                    + (sym(_edata) - sym(_sdata));
 	uint32_t dtcm_used  = sym(_elog_noinit) - sym(_slog_noinit);
-	uint32_t sdram_used = (sym(_esdram_fixed) - sym(_ssdram_fixed))
-	                    + (sym(_esdram_cam) - sym(_ssdram_cam));
+	uint32_t sdram_used = (sym(_esdram_fixed)    - sym(_ssdram_fixed))     /* bank0 fixed    */
+	                    + (sym(_esdram_cam)      - sym(_ssdram_cam))       /* bank1 cam      */
+	                    + (sym(_esdram_eth)      - sym(_ssdram_eth))       /* bank2 eth      */
+	                    + (sym(_esdram_ai)       - sym(_ssdram_ai))        /* bank3 ai data  */
+	                    + (sym(_esdram_ai_model) - sym(_ssdram_ai_model)); /* bank3 ai model */
 
 	uint32_t heap_arena = (uint32_t)(unsigned)mi.arena;   /* bytes sbrk'd from system */
 	uint32_t heap_base  = sym(_end);
@@ -129,7 +141,7 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	print_region(sh, "SRAM",  SRAM_ORIGIN,  SRAM_LENGTH,  sram_used,
 	             ".data/.bss/.sram1_dma + heap");
 	print_region(sh, "SDRAM", SDRAM_ORIGIN, SDRAM_LENGTH, sdram_used,
-	             ".sdram.fixed(bank0)+.sdram.cam(bank1)");
+	             ".sdram fixed/cam/eth/ai/model (banks0-3)");
 
 	cli_print(sh, "\r\n");
 	cli_print(sh, "heap:  base 0x%08lX  arena %lu  in-use %lu  free-pool %lu\r\n",
