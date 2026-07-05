@@ -363,6 +363,10 @@ static int nncam_open_model(void)
 
 	if (nn_model_open(&nncam_model) != 0)
 		return -3;
+	/* No model loaded (e.g. the stedgeai_reloc backend before `ai model load`): the
+	 * single choke point that rejects `ai run`/`ai stream`/`gui overlay` cleanly. */
+	if (nn_input_count(nncam_model) == 0)
+		return -3;
 	in = nn_input(nncam_model, 0);
 	if (!in || in->ndim < 3)
 		return -4;

@@ -251,9 +251,21 @@ SECTIONS
 
     . = ORIGIN(SDRAM) + 0x600000; /* advance to FMC internal bank3 (0xC0600000) */
     _ssdram_ai = .;
-    KEEP(*(.sdram.ai))            /* NN inference arena (activations), issue #81 */
+    KEEP(*(.sdram.ai))            /* NN data-only: activations/staging/RT-RAM (issue #81/#92) */
     . = ALIGN(32);
     _esdram_ai = .;
+
+    /* Bank3 upper half: executable model .bin double-slot for the X-CUBE-AI
+     * relocatable backend (Epic #80 P5, issue #92).  bsp.c region2 makes exactly
+     * this 0xC0700000/1 MB window instruction-fetchable (region1 keeps the lower
+     * half XN); XIP runs the PIC code in place from here.  Empty (0 bytes) for the
+     * null/stedgeai/tflm builds -- then region2 is a harmless exec window over
+     * unused SDRAM. */
+    . = ORIGIN(SDRAM) + 0x700000; /* advance to bank3 upper half (0xC0700000) */
+    _ssdram_ai_model = .;
+    KEEP(*(.sdram.ai.model))      /* reloc model .bin slots (executable, P5) */
+    . = ALIGN(32);
+    _esdram_ai_model = .;
     _esdram = .;
   } >SDRAM
 
@@ -272,13 +284,20 @@ SECTIONS
          ".sdram.eth must start at FMC internal bank2 (0xC0400000)")
   ASSERT(_esdram_eth <= ORIGIN(SDRAM) + 0x600000,
          ".sdram.eth must fit in bank2 (below the bank3 .sdram.ai boundary, #81)")
-  /* NN inference arena (activations) occupies FMC internal bank3 -- issue #81.
-     Kept in its own bank so it may later be MPU-remapped cacheable (bsp.c region1)
-     without touching the DMA-facing non-cacheable banks 0..2. */
+  /* NN inference arena occupies FMC internal bank3 -- issue #81.  Bank3 is split
+     into two 1 MB halves (issue #92 P5): the LOWER half (.sdram.ai, data-only:
+     activations/staging/RT-RAM) stays XN cacheable (bsp.c region1); the UPPER half
+     (.sdram.ai.model, executable reloc .bin slots) is made instruction-fetchable by
+     bsp.c region2.  Keeping the executable window to just the upper half preserves
+     W^X for the data buffers. */
   ASSERT(_ssdram_ai == ORIGIN(SDRAM) + 0x600000,
          ".sdram.ai must start at FMC internal bank3 (0xC0600000)")
-  ASSERT(_esdram_ai - _ssdram_ai <= 0x200000,
-         ".sdram.ai (NN arena) must fit in the 2 MB bank3")
+  ASSERT(_esdram_ai <= ORIGIN(SDRAM) + 0x700000,
+         ".sdram.ai data (activations/staging/RT-RAM) must fit in bank3 lower 1 MB (below the 0xC0700000 exec window)")
+  ASSERT(_ssdram_ai_model == ORIGIN(SDRAM) + 0x700000,
+         ".sdram.ai.model must start at bank3 upper half (0xC0700000, bsp.c region2 exec window)")
+  ASSERT(_esdram_ai_model <= ORIGIN(SDRAM) + 0x800000,
+         ".sdram.ai.model (reloc .bin slots) must fit in bank3 upper 1 MB")
   /* Overall guard: still inside the 8 MB SDRAM bank (issue #45/#65). */
   ASSERT(_esdram - _ssdram <= 0x800000, ".sdram exceeds the 8 MB SDRAM bank")
 

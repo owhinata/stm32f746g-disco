@@ -145,6 +145,12 @@ static int cmd_ai_bench(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	}
 
+	/* No model loaded (e.g. the stedgeai_reloc backend before a load) -> nothing to run. */
+	if (nn_input_count(m) == 0) {
+		cli_error(sh, "no model loaded -- run 'ai model load <sd-path>' first\r\n");
+		return 1;
+	}
+
 	/* Claim the single inference session so bench cannot run concurrently with a
 	 * live `ai stream`/`ai run` (or another bench) on the non-reentrant model. */
 	if (nn_session_try_acquire() != 0) {
@@ -249,7 +255,8 @@ static int cmd_ai_run(struct cli_instance *sh, int argc, char **argv)
 	}
 	rc = nn_camera_start(CAM_RES_QVGA);
 	if (rc != 0) {
-		cli_error(sh, "start failed (%d): camera busy or no sensor?\r\n", rc);
+		cli_error(sh, "start failed (%d): camera busy, no sensor, or no model "
+		              "('ai model load <bin>')?\r\n", rc);
 		return 1;
 	}
 	/* Wait (bounded ~2 s, cancellable) for one inference to complete. */
@@ -288,7 +295,8 @@ static int cmd_ai_stream_start(struct cli_instance *sh, int argc, char **argv)
 	}
 	rc = nn_camera_start(res);
 	if (rc != 0) {
-		cli_error(sh, "start failed (%d): camera busy / no sensor / SDRAM down?\r\n", rc);
+		cli_error(sh, "start failed (%d): camera busy / no sensor / SDRAM down / "
+		              "no model ('ai model load <bin>')?\r\n", rc);
 		return 1;
 	}
 	cli_print(sh, "inference stream started (worker prio 18, best-effort)\r\n");
@@ -389,7 +397,7 @@ static int cmd_ai_model_load(struct cli_instance *sh, const char *path)
 	if (nn_model_load_region(&buf, &cap) != 0 || !buf) {
 		nn_session_release();
 		cli_error(sh, "runtime model load unsupported by backend '%s' "
-		              "(build CONFIG_NN_BACKEND=tflm)\r\n", nn_backend()->name);
+		              "(build CONFIG_NN_BACKEND=tflm or stedgeai_reloc)\r\n", nn_backend()->name);
 		return 1;
 	}
 

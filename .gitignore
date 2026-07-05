@@ -58,6 +58,8 @@ dkms.conf
 /build/
 # tflm backend variant build dir (CONFIG_NN_BACKEND=tflm, #88)
 /build-tflm/
+# stedgeai_reloc backend variant build dir (CONFIG_NN_BACKEND=stedgeai_reloc, #92)
+/build-reloc/
 /tools/
 
 # flash image backups
@@ -82,3 +84,8 @@ _ref/
 *.tflite
 *.onnx
 libNetworkRuntime.a
+# X-CUBE-AI relocatable model binaries: PIC network_rel.bin loaded from SD at
+# runtime (ST-SLA / model-zoo licensed) -- issue #92 P5.  scripts/gen-reloc-model.sh
+# writes here; copy the .bin to the microSD card.
+*_rel.bin
+/port/nn/reloc-out/

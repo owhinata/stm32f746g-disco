@@ -16,6 +16,11 @@ first use case is **camera face detection** (OV5640/DCMI → inference).
     stedgeai (685 ms).  **P2 complete** — a `.tflite` on the microSD card is
     **loaded at runtime into `.sdram.ai`** and run (`ai model load <sd-path>`, #89);
     a common-vision op superset lets any small int8 model be swapped in.
+    **P5 complete** — the X-CUBE-AI **relocatable network** loads a `network_rel.bin`
+    from SD and runs it **XIP** (`CONFIG_NN_BACKEND=stedgeai_reloc`,
+    `ai model load network_rel.bin`, #92), giving the same SD swap as P2(tflm) on the
+    stedgeai runtime (both backends covered).  See
+    [X-CUBE-AI relocatable backend](#x-cube-ai-relocatable-backend-p5-92).
 
 ## Design
 
@@ -35,6 +40,12 @@ first use case is **camera face detection** (OV5640/DCMI → inference).
     builds are unchanged / byte-identical).  Runs **BlazeFace-front 128 int8** with
     **CMSIS-NN optimized kernels** (on by default) at stedgeai-class speed.  See
     [TFLM backend](#tflm-backend-p3-8688).
+  - `stedgeai_reloc` — X-CUBE-AI **relocatable network** (**P5, #92**).  Loads the
+    position-independent single `network_rel.bin` (PIC code + embedded weights) that
+    `stedgeai generate --relocatable` emits from SD and runs it **XIP** via the ST host
+    loader + the legacy `ai_rel_network_*` API.  No runtime `.a` is linked (the PIC
+    kernels are baked into the `.bin`).  **SD-only** (no Flash-baked builtin model).  See
+    [X-CUBE-AI relocatable backend](#x-cube-ai-relocatable-backend-p5-92).
 - **Model-specific pre/post-processing** (BlazeFace anchor decode + NMS, etc.)
   lives *above* the `nn` layer (`port/nn/models/`); the generic `nn` layer stays
   model-agnostic.
@@ -72,6 +83,12 @@ HAL/CMSIS/ThreadX  <-  svc  <-  port/nn  <-  ui  <-  shell/src
   arena is CPU-only (**no DMA into it**), so D-cache needs no maintenance.
   **Non-cacheable was ~20× slower for NN inference**; cacheable cut MNIST from
   **9.5 ms to 2.5 ms** (#6).  Small models whose activations fit DTCM may use it.
+    - **bank3 split in two (P5, #92)** — for `stedgeai_reloc`, bank3 (2 MB) is halved.
+      The **lower 1 MB** (`0xC0600000`+, `.sdram.ai`) is data-only (activations / staging /
+      the XIP RW image) and stays **XN** (region1).  The **upper 1 MB** (`0xC0700000`+,
+      `.sdram.ai.model`) is made **instruction-fetchable by MPU region2** in `src/bsp.c`
+      to hold the relocatable `.bin` double-slot and run it **XIP**.  Keeping the exec
+      window to just the model slots preserves W^X for the data buffers.
 - **Weights** — Flash `.rodata` in P1.  **Performance note:** this linker places
   Flash at `0x08000000` = the **AXIM** side.  The ART accelerator (RM0385 §3.3.2)
   serves the **ITCM interface** flash path; AXIM `.rodata` weights are a
@@ -139,8 +156,8 @@ SSD face detector).
 | `ai stream stop` | stop |
 | `ai stream stats` | inference rate / latency / drops / face boxes (+ maxscore diag) |
 | `ai model` | show the current model source (`builtin` / `sd:<name>`) |
-| `ai model load <sd-path>` | load + run a `.tflite` from the microSD (tflm only, #89) |
-| `ai model builtin` | revert to the built-in model |
+| `ai model load <sd-path>` | load + run a model from the microSD (`tflm`=`.tflite` / `stedgeai_reloc`=`network_rel.bin`, #89/#92) |
+| `ai model builtin` | revert to the built-in model (`stedgeai_reloc` has none, so this unloads → `(none)`) |
 | `ai norm <0\|1>` | float input normalization toggle (1=[-1,1] / 0=[0,1] default) |
 
 **Latency** is measured with the Cortex-M7 DWT CYCCNT (RM0385 §40.10/§40.13/
@@ -162,11 +179,20 @@ $STEDGEAI_ROOT/Utilities/linux/stedgeai generate --model model.tflite \
     --target stm32f7 --type tflite --name network --output port/nn/generated
 # 2) build:
 cmake -B build ... -DCONFIG_NN_BACKEND=stedgeai -DSTEDGEAI_ROOT=/opt/ST/STEdgeAI/4.0
+
+# X-CUBE-AI relocatable backend (load the model from SD, P5 #92)
+# 1) generate the model .bin (not committed; puts the project toolchain on PATH):
+scripts/gen-reloc-model.sh [model.tflite] [out]     # default = BlazeFace int8 → port/nn/reloc-out/
+#    → copy out/network_rel.bin to the microSD root
+# 2) build + flash:
+cmake -B build-reloc ... -DCONFIG_NN_BACKEND=stedgeai_reloc
+# 3) on hardware:  ai model load network_rel.bin
 ```
 
 !!! warning "Licensing"
     This repository is public.  The ST-SLA runtime `.a`, generated code
-    (`port/nn/generated/`), and ST Model Zoo model binaries are **not committed**
+    (`port/nn/generated/`), the ST host loader `ai_reloc_network.c`, the relocatable
+    `network_rel.bin`, and ST Model Zoo model binaries are **not committed**
     (`.gitignore`).
 
 ## TFLM backend (P3, #86/#88)
@@ -287,6 +313,49 @@ ai model builtin         # revert to the built-in model
     QoS).  Single-shot `ai bench` / `ai run` and the GUI overlay (which auto-recovers)
     are fine; overrun resilience for the shell `ai stream` path is a follow-up.
 
+## X-CUBE-AI relocatable backend (P5, #92)
+
+X-CUBE-AI normally bakes the topology into Flash, but a **relocatable network** makes it
+position-independent so the model can be swapped **without reflashing**.  P5 implements this
+as `CONFIG_NN_BACKEND=stedgeai_reloc`, the stedgeai-runtime counterpart to P2(tflm)'s SD swap
+(both backends covered).
+
+- **Artifact = a single `network_rel.bin`**: `stedgeai generate --relocatable --target stm32f7`
+  emits a ~208 KB blob (PIC code + embedded weights) via `scripts/gen-reloc-model.sh`.
+  **Not committed** (ST-SLA / model-zoo).
+- **Firmware compiles just the loader**: the ST host loader `ai_reloc_network.c` (compiled from
+  the ST install, `APP_DEBUG=0` to drop its printf) + the legacy `ai_rel_network_*` API.  **No
+  runtime `.a` is linked** — the PIC kernels, weights, and memcpy/memset all live inside the
+  `.bin`, and each model entry is dispatched indirectly through an r9=GOT-base trampoline.
+- **XIP + MPU**: the `.bin` is loaded into bank3's upper 1 MB (`.sdram.ai.model`, `0xC0700000`),
+  which `src/bsp.c` **MPU region2** makes instruction-fetchable (the lower half stays XN).  Code
+  executes in place from the `.bin` buffer (only data/got/bss go to the RT RAM).  ★**Cache**: the
+  loader does no cache maintenance in XIP, so the backend does a **`SCB_CleanDCache_by_Addr` +
+  `SCB_InvalidateICache`** before install (the Cortex-M7 I/D caches are separate; I-fetch does not
+  snoop D-cache; RM0385 §2.1.3 AXIM).
+- **Transactional double-slot**: two `.bin` slots in `.sdram.ai.model`.  Because **XIP runs the old
+  code from the old `.bin`**, overwriting a single buffer would be fatal — a reload reads the new
+  `.bin` into the *inactive* slot and only flips once install/init/get_report validate (the old
+  model stays alive until then; on any failure the old one is kept).
+- **Bounded `.bin` verifier**: the ST loader takes no length and blindly follows in-object offsets,
+  so the backend self-parses the header (magic `0x4E49424E` / CM7-FPU-hard variant / all section
+  bounds / entry vectors / `.rel` scan) **before any ST API call**.  Sizing (`acts_sz` / RT RAM /
+  weights) is derived from the verified header + ctx file image rather than `ai_rel_network_rt_get_info()`
+  (which does a scaled-pointer OOB read pre-install).
+- **SD-only**: no built-in model.  Until `ai model load network_rel.bin`, there is no model
+  (`ai run`/`ai stream`/`gui overlay` reject with a clear error); `ai model builtin` unloads (`(none)`).
+
+**Performance (measured)**: the relocatable code runs **XIP from SDRAM**, not Flash, but cacheable
+SDRAM + the I-cache keep it fast — `ai bench` measures **~592 ms/inference** (BlazeFace-front 128,
+@216 MHz), *below* the Flash-baked `stedgeai` (685 ms) and on par with TFLM CMSIS-NN (622 ms) (the
+legacy ai_network runtime's kernels help here).  The live `ai stream`/`gui overlay` runs at ~1.4
+inf/s because the DCMI competes for bank3 bandwidth (same root cause as #90, slower than the
+single-shot bench).  P5's main value is **demonstrating X-CUBE-AI relocatable / completing the Epic**.
+
+Key files: `port/nn/nn_stedgeai_reloc.c` (backend + `.bin` verifier + transactional reload + XIP),
+`src/bsp.c` (MPU region2), `ldscript/STM32F746NGHx_FLASH.ld` (`.sdram.ai` split + ASSERTs),
+`scripts/gen-reloc-model.sh` (offline `.bin` generation).
+
 ## Roadmap (Epic #80)
 
 | Phase | Scope |
@@ -295,4 +364,4 @@ ai model builtin         # revert to the built-in model
 | **P2 ✅** | **Load a model from SD (FileX → `.sdram.ai`, `ai model load`, #89)** |
 | **P3 ✅** | TFLM backend.  M1 spike (C++ enablement + hello_world, #86) → **M2 BlazeFace port + CMSIS-NN + comparative bench (#88)** |
 | **P4 ✅** | GUIX overlay (live preview + face bbox, #83 → [GUIX camera UI](../rtos/guix.md#face-detect-overlay-83-epic-80-p4)) |
-| P5 | X-CUBE-AI relocatable network (swap the whole model from SD) |
+| **P5 ✅** | **X-CUBE-AI relocatable network — swap the whole model from SD, XIP (`stedgeai_reloc`, #92)** |

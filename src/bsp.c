@@ -119,6 +119,30 @@ static void mpu_config_sdram(void)
     r.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
     HAL_MPU_ConfigRegion(&r);
 
+    /* Region 2: bank3 UPPER half (0xC0700000, 1 MB) -- same Normal WBWA cacheable as
+     * region1 but INSTRUCTION-FETCH ENABLED (higher region number wins on PMSAv7
+     * overlap, so this un-XNs just the upper 1 MB; the lower 1 MB stays XN under
+     * region1).  This is the .sdram.ai.model window (ldscript), where the X-CUBE-AI
+     * relocatable backend loads a position-independent network_rel.bin from SD and
+     * runs it XIP -- instruction fetch out of external FMC SDRAM (RM0385 s2.1.3 AXIM).
+     * Executing code from cacheable SDRAM needs a D-cache clean + I-cache invalidate
+     * of the freshly-written .bin before first fetch; the backend does that itself
+     * (the ST loader does none in XIP mode).  Backend-agnostic: for the null/stedgeai/
+     * tflm builds .sdram.ai.model is empty, so this is a harmless exec window over
+     * unused SDRAM and no data buffer ever sits here (they are all XN in the lower
+     * half -- W^X preserved).  Issue #92 (Epic #80 P5). */
+    r.Number           = MPU_REGION_NUMBER2;
+    r.BaseAddress      = 0xC0700000u;
+    r.Size             = MPU_REGION_SIZE_1MB;
+    r.SubRegionDisable = 0x00;
+    r.TypeExtField     = MPU_TEX_LEVEL1;           /* TEX=1, C=1, B=1: Normal WBWA */
+    r.IsCacheable      = MPU_ACCESS_CACHEABLE;
+    r.IsBufferable     = MPU_ACCESS_BUFFERABLE;
+    r.IsShareable      = MPU_ACCESS_NOT_SHAREABLE;
+    r.AccessPermission = MPU_REGION_FULL_ACCESS;
+    r.DisableExec      = MPU_INSTRUCTION_ACCESS_ENABLE;   /* XIP: allow code fetch */
+    HAL_MPU_ConfigRegion(&r);
+
     HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 }
 

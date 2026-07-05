@@ -260,8 +260,13 @@ set(CLI_DEVMEM_DUMP_MAX_LEN "256" CACHE STRING "Max bytes per devmem dump")
 # separate `tflm` static lib (cmake/tflite-micro.cmake); it enables C++ only for
 # that build so the default (null/stedgeai) firmware stays byte-identical and
 # needs no C++ toolchain (Epic #80 P3, issue #86).
-set(CONFIG_NN_BACKEND "null" CACHE STRING "NN inference backend: null | stedgeai | tflm")
-set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null stedgeai tflm)
+# `stedgeai_reloc` (X-CUBE-AI relocatable network, Epic #80 P5, issue #92) loads a
+# position-independent `network_rel.bin` (PIC code + weights) from SD at runtime and
+# runs it XIP via the ST host loader (ai_reloc_network.c) + the legacy ai_rel_network_*
+# API -- no model is baked into Flash and no runtime .a is linked (the PIC kernels are
+# embedded in the .bin).  Same SD-swap capability as tflm, but on the X-CUBE-AI runtime.
+set(CONFIG_NN_BACKEND "null" CACHE STRING "NN inference backend: null | stedgeai | stedgeai_reloc | tflm")
+set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null stedgeai stedgeai_reloc tflm)
 
 set(NN_SOURCES
     "${CMAKE_SOURCE_DIR}/port/nn/nn.c"
@@ -288,6 +293,23 @@ elseif(CONFIG_NN_BACKEND STREQUAL "stedgeai")
         "${CMAKE_SOURCE_DIR}/port/nn/nn_stedgeai.c"
         "${CMAKE_SOURCE_DIR}/port/nn/generated/network.c"
         "${CMAKE_SOURCE_DIR}/port/nn/generated/network_data.c")
+elseif(CONFIG_NN_BACKEND STREQUAL "stedgeai_reloc")
+    # X-CUBE-AI relocatable network backend (Epic #80 P5, issue #92).  Compiles the
+    # ST host loader (Middlewares/ST/AI/Reloc/Src/ai_reloc_network.c, ST-SLA -> NOT
+    # committed) + our backend TU.  NO runtime .a is linked: the PIC kernels + weights
+    # live inside the SD-loaded network_rel.bin (generated offline with
+    #   stedgeai generate --model M.tflite --target stm32f7 --relocatable ...).
+    # No port/nn/generated model is needed (the model is loaded from SD at runtime).
+    set(STEDGEAI_ROOT "/opt/ST/STEdgeAI/4.0" CACHE PATH "ST Edge AI Core install root")
+    set(STEDGEAI_INC "${STEDGEAI_ROOT}/Middlewares/ST/AI/Inc")
+    set(STEDGEAI_RELOC_INC "${STEDGEAI_ROOT}/Middlewares/ST/AI/Reloc/Inc")
+    set(STEDGEAI_RELOC_LOADER "${STEDGEAI_ROOT}/Middlewares/ST/AI/Reloc/Src/ai_reloc_network.c")
+    if(NOT EXISTS "${STEDGEAI_RELOC_LOADER}")
+        message(FATAL_ERROR "stedgeai reloc loader not found:\n  ${STEDGEAI_RELOC_LOADER}\nSet -DSTEDGEAI_ROOT=<install> (issue #92)")
+    endif()
+    list(APPEND NN_SOURCES
+        "${CMAKE_SOURCE_DIR}/port/nn/nn_stedgeai_reloc.c"
+        "${STEDGEAI_RELOC_LOADER}")
 elseif(CONFIG_NN_BACKEND STREQUAL "tflm")
     # TFLM (tflite-micro) C++ backend (Epic #80 P3, issue #86).  The C++ backend
     # (nn_tflm.cc providing nn_backend_vt_selected) + the interpreter + the vendored
@@ -296,7 +318,7 @@ elseif(CONFIG_NN_BACKEND STREQUAL "tflm")
     # own TUs stay C, so the final link keeps the C driver (gcc) and does NOT pull the full
     # libstdc++.  nn.c's undefined ref to nn_backend_vt_selected pulls nn_tflm.o from the lib.
 else()
-    message(FATAL_ERROR "CONFIG_NN_BACKEND must be 'null', 'stedgeai' or 'tflm'")
+    message(FATAL_ERROR "CONFIG_NN_BACKEND must be 'null', 'stedgeai', 'stedgeai_reloc' or 'tflm'")
 endif()
 
 add_executable(threadx
@@ -412,6 +434,19 @@ if(CONFIG_NN_BACKEND STREQUAL "stedgeai")
         "${STEDGEAI_INC}")
     target_link_libraries(threadx PRIVATE "${STEDGEAI_RT}")
     target_compile_definitions(threadx PRIVATE CONFIG_NN_BACKEND_STEDGEAI=1)
+endif()
+
+# X-CUBE-AI relocatable backend (Epic #80 P5, issue #92): legacy ai_rel_network_* +
+# ST host loader.  Add the ST AI + Reloc include paths and mark the backend; NO
+# runtime .a is linked (PIC kernels are inside the SD-loaded .bin).  The ST loader TU
+# gets APP_DEBUG=0 (drops its printf trace) scoped to that source only -- and we do
+# NOT define STM32F7 for it, so in XIP mode it has zero HAL/CMSIS dependency (its only
+# SCB_CleanDCache is COPY-mode-guarded; our backend does the cache maintenance itself).
+if(CONFIG_NN_BACKEND STREQUAL "stedgeai_reloc")
+    target_include_directories(threadx PRIVATE "${STEDGEAI_INC}" "${STEDGEAI_RELOC_INC}")
+    target_compile_definitions(threadx PRIVATE CONFIG_NN_BACKEND_STEDGEAI_RELOC=1)
+    set_source_files_properties("${STEDGEAI_RELOC_LOADER}" PROPERTIES
+        COMPILE_DEFINITIONS "APP_DEBUG=0")
 endif()
 
 # TFLM (tflite-micro) C++ backend (Epic #80 P3, issues #86/#88).  Builds the `tflm`
