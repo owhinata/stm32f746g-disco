@@ -44,6 +44,24 @@ struct nn_backend_vt {
 
 	/** Pure inference (no timing). Inputs pre-filled; 0 on success, <0 on error. */
 	int  (*run)(void *impl);
+
+	/* --- Optional: runtime model reload from a RAM buffer (issue #89 P2) ------
+	 * A backend that cannot swap the model at runtime leaves BOTH NULL; nn.c then
+	 * reports the feature unsupported.  Only the tflm backend implements them
+	 * (it can interpret an arbitrary .tflite flatbuffer in RAM). */
+
+	/** Return, via the out-params, a writable staging buffer (address + capacity)
+	 *  for an SD-loaded .tflite: the caller fills it, then calls reload().  The buffer
+	 *  is NOT the currently-active model's (so filling it cannot corrupt a live
+	 *  flatbuffer).  0 on success, <0 otherwise. */
+	int  (*load_region)(void **buf, uint32_t *cap);
+
+	/** Rebuild the model from @p data (@p len bytes); @p data==NULL reverts to the
+	 *  built-in model.  @p name is copied for display.  Transactional: on failure
+	 *  the previous model is restored.  *impl_out is ALWAYS set to the resulting
+	 *  active handle -- the new model (returns 0), the restored previous model
+	 *  (returns <0, recoverable), or NULL (returns <0, unrecoverable). */
+	int  (*reload)(const void *data, uint32_t len, const char *name, void **impl_out);
 };
 
 /** The one backend selected at build time (provided by exactly one backend TU). */

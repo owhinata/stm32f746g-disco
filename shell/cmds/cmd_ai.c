@@ -20,6 +20,7 @@
 #include "nn_camera.h"        /* live camera inference (ai run / ai stream) */
 #include "camera.h"           /* enum camera_res */
 #include "sdram.h"            /* sdram_is_up() */
+#include "fs_cmd_core.h"      /* fs_sd_device() + fs_core_read_file() (ai model load) */
 
 #include "stm32f7xx_hal.h"   /* HAL_RCC_GetHCLKFreq */
 
@@ -342,6 +343,129 @@ static int cmd_ai_norm(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* ---- runtime model load (ai model, issue #89 P2) -------------------------- */
+
+/* Basename of an SD path for the display name ("dir/x.tflite" -> "x.tflite"). */
+static const char *ai_basename(const char *p)
+{
+	const char *b = p;
+	for (const char *s = p; *s; s++)
+		if (*s == '/' || *s == '\\')
+			b = s + 1;
+	return b;
+}
+
+static int cmd_ai_model_load(struct cli_instance *sh, const char *path)
+{
+	struct nn_model *m = NULL;
+	void *buf = NULL;
+	uint32_t cap = 0, len = 0;
+	int rc;
+
+	if (nn_camera_running()) {
+		cli_error(sh, "stop the inference stream first "
+		              "('ai stream stop' / 'gui overlay off')\r\n");
+		return 1;
+	}
+	if (!sdram_is_up()) {
+		cli_error(sh, "SDRAM not up (needed for the model buffer)\r\n");
+		return 1;
+	}
+	if (nn_model_open(&m) != 0) {
+		cli_error(sh, "model open failed\r\n");
+		return 1;
+	}
+
+	/* Claim the single inference session FIRST, so slot selection + SD read + swap
+	 * all happen atomically w.r.t. any other shell: otherwise a second shell could
+	 * flip our chosen (inactive) slot to active between load_region() and the read,
+	 * and we would then corrupt the live flatbuffer.  Every exit below releases. */
+	if (nn_session_try_acquire() != 0) {
+		cli_error(sh, "NN busy (a stream/run or bench is active)\r\n");
+		return 1;
+	}
+
+	/* Backend's writable staging buffer (the INACTIVE model slot for tflm). */
+	if (nn_model_load_region(&buf, &cap) != 0 || !buf) {
+		nn_session_release();
+		cli_error(sh, "runtime model load unsupported by backend '%s' "
+		              "(build CONFIG_NN_BACKEND=tflm)\r\n", nn_backend()->name);
+		return 1;
+	}
+
+	if (fs_core_read_file(fs_sd_device(), sh, path, buf, cap, &len) != 0) {
+		nn_session_release();
+		return 1;                       /* fs_core_read_file printed the error */
+	}
+
+	rc = nn_model_reload(buf, len, ai_basename(path));
+	nn_session_release();
+	if (rc != 0) {
+		cli_error(sh, "load failed (%d) -- previous model kept\r\n", rc);
+		return 1;
+	}
+
+	cli_print(sh, "loaded %s (%lu B)\r\n", nn_model_name(m), (unsigned long)len);
+	for (int i = 0; i < nn_input_count(m); i++)
+		ai_print_tensor(sh, "in", i, nn_input(m, i));
+	for (int i = 0; i < nn_output_count(m); i++)
+		ai_print_tensor(sh, "out", i, nn_output(m, i));
+	cli_print(sh, "arena %lu B\r\n", (unsigned long)nn_activations_bytes(m));
+	return 0;
+}
+
+static int cmd_ai_model(struct cli_instance *sh, int argc, char **argv)
+{
+	struct nn_model *m = NULL;
+
+	if (argc == 1) {                        /* status */
+		if (nn_model_open(&m) != 0) {
+			cli_error(sh, "model open failed\r\n");
+			return 1;
+		}
+		cli_print(sh, "backend : %s\r\n", nn_backend()->name);
+		cli_print(sh, "model   : %s\r\n", nn_model_name(m));
+		cli_print(sh, "use 'ai model load <sd-path>' or 'ai model builtin'\r\n");
+		return 0;
+	}
+
+	if (!strcmp(argv[1], "load")) {
+		if (argc < 3) {
+			cli_error(sh, "usage: ai model load <sd-path>\r\n");
+			return 1;
+		}
+		return cmd_ai_model_load(sh, argv[2]);
+	}
+
+	if (!strcmp(argv[1], "builtin")) {
+		int rc;
+		if (nn_camera_running()) {
+			cli_error(sh, "stop the inference stream first "
+			              "('ai stream stop' / 'gui overlay off')\r\n");
+			return 1;
+		}
+		if (nn_model_open(&m) != 0) {
+			cli_error(sh, "model open failed\r\n");
+			return 1;
+		}
+		if (nn_session_try_acquire() != 0) {
+			cli_error(sh, "NN busy (a stream/run or bench is active)\r\n");
+			return 1;
+		}
+		rc = nn_model_reload(NULL, 0, NULL);
+		nn_session_release();
+		if (rc != 0) {
+			cli_error(sh, "revert failed (%d)\r\n", rc);
+			return 1;
+		}
+		cli_print(sh, "reverted to built-in model: %s\r\n", nn_model_name(m));
+		return 0;
+	}
+
+	cli_error(sh, "usage: ai model [load <sd-path> | builtin]\r\n");
+	return 1;
+}
+
 CLI_SUBCMD_SET_CREATE(ai_stream_subcmds,
 	CLI_CMD_ARG(start, NULL, "start live inference [qqvga|qvga]",
 	            cmd_ai_stream_start, 1, 1),
@@ -355,6 +479,8 @@ CLI_SUBCMD_SET_CREATE(ai_subcmds,
 	            cmd_ai_bench, 1, 1),
 	CLI_CMD(run, NULL, "single-shot inference on one camera frame", cmd_ai_run),
 	CLI_CMD(stream, ai_stream_subcmds, "live camera inference", NULL),
+	CLI_CMD_ARG(model, NULL, "runtime model: load <sd-path> | builtin | (status)",
+	            cmd_ai_model, 1, 2),
 	CLI_CMD_ARG(norm, NULL, "float input norm <0|1> (1=[-1,1], 0=[0,1])",
 	            cmd_ai_norm, 1, 1),
 	CLI_SUBCMD_SET_END);

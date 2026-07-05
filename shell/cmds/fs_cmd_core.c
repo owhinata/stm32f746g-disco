@@ -16,6 +16,7 @@
 #include "cli.h"
 #include "fs_cmd_core.h"
 
+#include <stdint.h>
 #include <string.h>
 
 /* One read/copy unit for `cat`; small enough for the 4 KB shell stack. */
@@ -401,5 +402,86 @@ int fs_core_umount(const struct fs_device *dev, struct cli_instance *sh,
 	}
 
 	dev->excl_end();
+	return rc;
+}
+
+/*
+ * Read an entire file into a caller buffer through the device's shared op gate
+ * (issue #89: `ai model load` slurps a .tflite from SD into the NN model buffer,
+ * reusing the same ownership model as the fs/sd commands and `camera save`).  The
+ * size is checked up front against @p cap (fx_file_current_file_size is filled by
+ * fx_file_open), so the buffer is never partially filled on an oversize file.
+ * Returns 0 and sets *out_len to the byte count, or 1 with a message printed.
+ */
+int fs_core_read_file(const struct fs_device *dev, struct cli_instance *sh,
+                      const char *path, void *buf, uint32_t cap, uint32_t *out_len)
+{
+	FX_MEDIA *media;
+	FX_FILE   file;
+	ULONG64   fsize;
+	uint32_t  off = 0;
+	UINT      status;
+	int       rc = 0;
+
+	if (out_len)
+		*out_len = 0;
+
+	status = dev->op_begin();
+	if (status != FX_SUCCESS) {
+		cli_error(sh, "%s: %s\r\n", dev->name, fs_strerror(status));
+		return 1;
+	}
+	media = fs_core_mount(dev, sh);      /* prints its own failure + hint */
+	if (media == NULL) {
+		dev->op_end();
+		return 1;
+	}
+
+	status = fx_file_open(media, &file, (CHAR *)path, FX_OPEN_FOR_READ);
+	if (status != FX_SUCCESS) {
+		cli_error(sh, "%s: %s: %s (0x%02x)\r\n",
+		          dev->name, path, fs_strerror(status), status);
+		dev->op_end();
+		return 1;
+	}
+
+	/* Reject oversize before reading a single byte (fx_file_open filled the size). */
+	fsize = file.fx_file_current_file_size;
+	if (fsize > (ULONG64)cap) {
+		cli_error(sh, "%s: %s too large: %lu B > %lu B cap\r\n",
+		          dev->name, path, (unsigned long)fsize, (unsigned long)cap);
+		rc = 1;
+	}
+
+	while (rc == 0) {
+		ULONG got;
+
+		if (cli_cancel_requested(sh)) { rc = 1; break; }
+		status = fx_file_read(&file, (UCHAR *)buf + off, cap - off, &got);
+		if (status == FX_END_OF_FILE)
+			break;
+		if (status != FX_SUCCESS) {
+			cli_error(sh, "%s: read failed: %s (0x%02x)\r\n",
+			          dev->name, fs_strerror(status), status);
+			rc = 1;
+			break;
+		}
+		off += (uint32_t)got;
+		if (got == 0 || off >= cap)      /* done or buffer full */
+			break;
+	}
+
+	/* A short read (off != size) must not read as success -- otherwise a truncated
+	 * transfer would hand a partial .tflite to the model loader (codex review). */
+	if (rc == 0 && (ULONG64)off != fsize) {
+		cli_error(sh, "%s: short read: %lu of %lu B\r\n",
+		          dev->name, (unsigned long)off, (unsigned long)fsize);
+		rc = 1;
+	}
+
+	(void)fx_file_close(&file);
+	dev->op_end();
+	if (rc == 0 && out_len)
+		*out_len = off;
 	return rc;
 }

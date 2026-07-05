@@ -23,6 +23,8 @@
 
 #include "fx_api.h"
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -79,6 +81,15 @@ int fs_core_rm    (const struct fs_device *dev, struct cli_instance *sh, int arg
 int fs_core_mkdir (const struct fs_device *dev, struct cli_instance *sh, int argc, char **argv);
 int fs_core_info  (const struct fs_device *dev, struct cli_instance *sh, int argc, char **argv);
 int fs_core_umount(const struct fs_device *dev, struct cli_instance *sh, int argc, char **argv);
+
+/**
+ * Read an entire file from @p dev into @p buf (capacity @p cap bytes) through the
+ * device's shared op gate; fails if the file is larger than @p cap.  Returns 0
+ * with *out_len set to the bytes read, or 1 (a message is printed).  Cross-command
+ * reuse for `ai model load` (#89), same ownership model as `camera save`.
+ */
+int fs_core_read_file(const struct fs_device *dev, struct cli_instance *sh,
+                      const char *path, void *buf, uint32_t cap, uint32_t *out_len);
 
 /* Device accessors for cross-command reuse (issue #42: `camera save` writes
  * a frame through the same ownership gates as the fs/sd commands).  Defined

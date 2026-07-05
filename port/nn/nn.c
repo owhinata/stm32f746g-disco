@@ -206,6 +206,42 @@ uint32_t nn_last_cycles(const struct nn_model *m)
 	return (m && m->open) ? m->last_cycles : 0u;
 }
 
+/* ---- runtime model swap (issue #89 P2) ------------------------------------- */
+
+int nn_model_load_region(void **buf, uint32_t *cap)
+{
+	if (!buf || !cap)
+		return -1;
+	if (!nn_backend_vt_selected.load_region)
+		return -2;                  /* backend has no runtime model buffer */
+	return nn_backend_vt_selected.load_region(buf, cap);
+}
+
+int nn_model_reload(const void *data, uint32_t len, const char *name)
+{
+	void *impl = NULL;
+	int rc;
+
+	if (!g_model.open)                  /* caller must nn_model_open() first */
+		return -1;
+	if (!nn_backend_vt_selected.reload)
+		return -2;                      /* backend cannot swap models        */
+
+	/* The backend is transactional and ALWAYS reports the resulting active handle
+	 * in *impl: the new model (rc==0), the restored previous model (rc<0), or NULL
+	 * if even the restore failed.  Mirror that into g_model so a NULL handle forces
+	 * a fresh open() next time rather than leaving a dangling impl. */
+	rc = nn_backend_vt_selected.reload(data, len, name, &impl);
+	if (impl) {
+		g_model.impl = impl;
+		g_model.last_cycles = 0;
+	} else {
+		g_model.impl = NULL;
+		g_model.open = 0;
+	}
+	return rc;
+}
+
 /* ---- single-session guard -------------------------------------------------- */
 
 /* A plain flag test-set under a brief PRIMASK critical section: interrupt-safe,

@@ -117,6 +117,21 @@ int nn_run(struct nn_model *m);
 uint32_t nn_last_cycles(const struct nn_model *m);
 
 /*
+ * Runtime model swap (issue #89 P2).  Only backends that interpret a .tflite in
+ * RAM support it (tflm); others return <0 (unsupported).  Usage:
+ *   nn_model_load_region(&buf,&cap);   // backend's writable staging buffer
+ *   ...fill buf with up to cap bytes of a .tflite read from SD...
+ *   nn_model_reload(buf, len, "name"); // activate it (data==NULL => built-in)
+ * The caller MUST serialize these against inference: stop any live stream and
+ * hold nn_session_try_acquire(), since the interpreter/arena/model are singletons.
+ * nn_model_reload is transactional -- on failure the previous model stays active
+ * (or, only if even that could not be rebuilt, the model is closed and a later
+ * nn_model_open() rebuilds it).  Both return 0 on success, <0 on error.
+ */
+int nn_model_load_region(void **buf, uint32_t *cap);
+int nn_model_reload(const void *data, uint32_t len, const char *name);
+
+/*
  * Coarse single-session guard.  The singleton model + the backends are NOT
  * reentrant, and multiple shells (UART + telnet) can issue `ai` commands, so
  * only ONE inference activity may use the model at a time: a one-shot `ai bench`,
