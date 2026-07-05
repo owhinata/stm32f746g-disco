@@ -20,10 +20,10 @@
 #include "cli.h"
 #include "eth_link.h"
 #include "nx_glue.h"
-#include "nx_echo.h"
 #include "nx_mjpeg.h"
 
 #include <stdint.h>
+#include <string.h>   /* strcmp for the mjpeg-resolution name lookup */
 
 static const char *speed_name(enum eth_speed s)
 {
@@ -188,13 +188,9 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 	if (nx_net_is_up()) {
 		struct nx_net_info ni;
 		struct nx_mjpeg_stats ms;
-		unsigned ep, ec, eb;
 
 		if (nx_net_info_get(&ni) == NXG_OK)
 			net_print_ip(sh, &ni);
-		if (nx_echo_status(&ep, &ec, &eb))
-			cli_print(sh, "echo:  listening on :%u (%u conns, %u bytes)\r\n",
-			          ep, ec, eb);
 		if (nx_mjpeg_stats_get(&ms))
 			cli_print(sh, "mjpeg: http://board:80 (%s, %lu frames)\r\n",
 			          ms.client ? "streaming" : "idle",
@@ -326,58 +322,6 @@ static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
-static int cmd_net_echo_start(struct cli_instance *sh, int argc, char **argv)
-{
-	uint32_t port = 0;
-	int rc;
-
-	if (!net_ip_ready(sh))
-		return 1;
-	if (argc >= 2 && (parse_uint(argv[1], &port) != 0 || port == 0 || port > 65535)) {
-		cli_error(sh, "net: bad port '%s'\r\n", argv[1]);
-		return 1;
-	}
-	rc = nx_echo_start((unsigned)port);
-	if (rc == -2) {
-		cli_error(sh, "net: echo already running\r\n");
-		return 1;
-	}
-	if (rc != 0) {
-		cli_error(sh, "net: echo start failed\r\n");
-		return 1;
-	}
-	cli_print(sh, "net: echo listening on :%u\r\n",
-	          port ? (unsigned)port : NX_ECHO_DEFAULT_PORT);
-	return 0;
-}
-
-static int cmd_net_echo_stop(struct cli_instance *sh, int argc, char **argv)
-{
-	int rc;
-
-	(void)argc;
-	(void)argv;
-	if (!net_ready(sh))
-		return 1;
-	rc = nx_echo_stop();
-	if (rc == -1) {
-		cli_error(sh, "net: echo not running\r\n");
-		return 1;
-	}
-	if (rc != 0) {
-		cli_error(sh, "net: echo stop timed out\r\n");
-		return 1;
-	}
-	cli_print(sh, "net: echo stopped\r\n");
-	return 0;
-}
-
-CLI_SUBCMD_SET_CREATE(net_echo_subcmds,
-	CLI_CMD_ARG(start, NULL, "start the TCP echo server [port] (default 7)",
-	            cmd_net_echo_start, 1, 1),
-	CLI_CMD(stop, NULL, "stop the TCP echo server", cmd_net_echo_stop),
-	CLI_SUBCMD_SET_END);
-
 /* ---- MJPEG-over-HTTP camera streaming (#49 P5) --------------------------- */
 
 static const struct {
@@ -490,7 +434,6 @@ CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_CMD_ARG(ping, NULL, "ICMP echo <a.b.c.d> [count]", cmd_net_ping, 2, 1),
 	CLI_CMD_ARG(ip, NULL, "set static <a.b.c.d/mask> [gw]", cmd_net_ip, 2, 1),
 	CLI_CMD(dhcp, NULL, "(re)acquire an address via DHCP", cmd_net_dhcp),
-	CLI_CMD(echo, net_echo_subcmds, "TCP echo server (start/stop)", NULL),
 	CLI_CMD(mjpeg, net_mjpeg_subcmds,
 	        "MJPEG-over-HTTP camera stream (start/stop/stats)", NULL),
 	CLI_SUBCMD_SET_END);

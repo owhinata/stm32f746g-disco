@@ -360,7 +360,6 @@ add_executable(threadx
     "${CMAKE_SOURCE_DIR}/port/eth/eth_phy.c"
     "${CMAKE_SOURCE_DIR}/port/netxduo/nx_eth_driver.c"
     "${CMAKE_SOURCE_DIR}/port/netxduo/nx_glue.c"
-    "${CMAKE_SOURCE_DIR}/port/netxduo/nx_echo.c"
     "${CMAKE_SOURCE_DIR}/port/netxduo/nx_shell.c"
     "${CMAKE_SOURCE_DIR}/port/netxduo/nx_mjpeg.c"
     "${NX_DIR}/addons/dhcp/nxd_dhcp_client.c"

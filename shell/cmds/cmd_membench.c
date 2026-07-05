@@ -33,7 +33,7 @@
  * core's speculative issue and line reuse).
  *
  * Cache semantics (RM0385 §2.1/§3.2, bsp.c MPU): SRAM is cacheable write-back, so
- * the `4KB cached` row is L1 D$ speed and the `64KB refill` row exceeds the D$;
+ * the `4KB cached` row is L1 D$ speed and the `32KB refill` row exceeds the D$;
  * for write/copy that row is CPU-observed streaming throughput, NOT an external
  * write-completion figure (the last dirty footprint is not written back here).
  * DTCM and SDRAM are non-cacheable (DTCM is tightly coupled; SDRAM is MPU Normal
@@ -50,23 +50,26 @@
 #include "stm32f7xx_hal.h"   /* DWT/CoreDebug/SCB, HAL_RCC_GetHCLKFreq, HAL_GetTick, __DSB/__ISB */
 
 #include <stdint.h>
+#include <stdlib.h>          /* malloc / free for the on-demand SRAM buffer */
 #include <stdio.h>           /* snprintf for table cells */
 #include <string.h>          /* strcpy */
 
 /* Per-region benchmark buffers (see plan / linker).  DTCM needs a dedicated
- * NOLOAD section (the region otherwise holds only the log ring); SRAM uses a
- * plain .bss array; SDRAM reuses the existing .sdram NOLOAD section.  All are
- * diagnostic-only and show up in `free`'s per-region used. */
+ * NOLOAD section (the region otherwise holds only the log ring); SDRAM reuses the
+ * existing .sdram NOLOAD section.  These are diagnostic-only and show up in
+ * `free`'s per-region used.  The SRAM buffer is NOT a static .bss array: at 32 KB
+ * it would permanently reserve ~1/8 of the internal SRAM for a command that is
+ * rarely run, so it is malloc'd on demand and freed when the command returns
+ * (issue #94).  32 KB is 2x the 16 KB L1 D-cache, enough to defeat it for the
+ * refill row, so the measured out-of-cache rate is unchanged from the old 64 KB. */
 #define DTCM_BENCH_BYTES   (16u * 1024u)
-#define SRAM_BENCH_BYTES   (64u * 1024u)
+#define SRAM_BENCH_BYTES   (32u * 1024u)
 #define SDRAM_BENCH_BYTES  (64u * 1024u)
 #define FLASH_BENCH_BYTES  (64u * 1024u)
 #define SRAM_CACHED_BYTES  ( 4u * 1024u)   /* in-D$ working set for the cached row */
 
 static uint32_t dtcm_bench_buf[DTCM_BENCH_BYTES / 4]
 	__attribute__((aligned(32), section(".dtcm_bench")));
-static uint32_t sram_bench_buf[SRAM_BENCH_BYTES / 4]
-	__attribute__((aligned(32)));                       /* .bss */
 static uint32_t sdram_bench_buf[SDRAM_BENCH_BYTES / 4]
 	__attribute__((aligned(32), section(".sdram.fixed")));
 
@@ -356,6 +359,8 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	int do_dtcm = 1, do_sram = 1, do_sdram = 1, do_flash = 1;
 	uint32_t hclk, i;
 	int sdram_ok;
+	void     *sram_raw = NULL;   /* malloc base (freed on every exit via `done`) */
+	uint32_t *sram_bench_buf = NULL;   /* 32-byte-aligned working pointer         */
 
 	if (argc >= 2) {
 		const char *r = argv[1];
@@ -379,6 +384,22 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	hclk = HAL_RCC_GetHCLKFreq();
 	sdram_ok = sdram_is_up();
 
+	/* On-demand SRAM buffer (issue #94): malloc'd from the heap (which lives in
+	 * internal SRAM, so it is the right region to measure) instead of a permanent
+	 * 32 KB .bss array.  Over-allocate by 32 to hand the bench a cache-line-aligned
+	 * pointer.  On failure, skip the SRAM rows rather than run on a null buffer. */
+	if (do_sram) {
+		sram_raw = malloc(SRAM_BENCH_BYTES + 32u);
+		if (sram_raw == NULL) {
+			cli_warn(sh, "membench: no heap for the 32 KB SRAM buffer; "
+			             "skipping SRAM rows\r\n");
+			do_sram = 0;
+		} else {
+			sram_bench_buf = (uint32_t *)
+				(((uintptr_t)sram_raw + 31u) & ~(uintptr_t)31u);
+		}
+	}
+
 	cli_print(sh, "DWT CYCCNT @%luMHz; warm-up + tick-guarded min; "
 	          "D$=16KB/32B line; SDRAM/DTCM non-cacheable.\r\n\r\n",
 	          (unsigned long)(hclk / 1000000u));
@@ -386,23 +407,23 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	/* bandwidth table */
 	cli_print(sh, "%-24s %8s %8s %8s\r\n", "bandwidth (MB/s)", "read", "write", "copy");
 	if (do_dtcm) {
-		if (cli_cancel_requested(sh)) return 0;
+		if (cli_cancel_requested(sh)) goto done;
 		bw_row(sh, "DTCM   (16KB)", dtcm_bench_buf, DTCM_BENCH_BYTES / 4u, hclk, 1);
 	}
 	if (do_sram) {
-		if (cli_cancel_requested(sh)) return 0;
+		if (cli_cancel_requested(sh)) goto done;
 		bw_row(sh, "SRAM   ( 4KB, cached)", sram_bench_buf, SRAM_CACHED_BYTES / 4u, hclk, 1);
-		bw_row(sh, "SRAM   (64KB, refill)", sram_bench_buf, SRAM_BENCH_BYTES / 4u, hclk, 1);
+		bw_row(sh, "SRAM   (32KB, refill)", sram_bench_buf, SRAM_BENCH_BYTES / 4u, hclk, 1);
 	}
 	if (do_sdram) {
-		if (cli_cancel_requested(sh)) return 0;
+		if (cli_cancel_requested(sh)) goto done;
 		if (sdram_ok)
 			bw_row(sh, "SDRAM  (64KB, non-cache)", sdram_bench_buf, SDRAM_BENCH_BYTES / 4u, hclk, 1);
 		else
 			cli_print(sh, "  %-22s %8s %8s %8s\r\n", "SDRAM  (64KB)", "down", "--", "--");
 	}
 	if (do_flash) {
-		if (cli_cancel_requested(sh)) return 0;
+		if (cli_cancel_requested(sh)) goto done;
 		bw_row(sh, "Flash  (64KB, AXIM+L1D$)", (uint32_t *)FLASH_BASE, FLASH_BENCH_BYTES / 4u, hclk, 0);
 	}
 
@@ -415,14 +436,14 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 			char d[12], s[12], m[12], wlbl[8];
 
 			if (cli_cancel_requested(sh))
-				return 0;
+				goto done;
 
 			if (do_dtcm && wb <= DTCM_BENCH_BYTES)
 				fmt_ns(d, sizeof d, lat_ns10(dtcm_bench_buf, wb, hclk));
 			else
 				strcpy(d, "--");
 
-			if (do_sram)
+			if (do_sram && wb <= SRAM_BENCH_BYTES)
 				fmt_ns(s, sizeof s, lat_ns10(sram_bench_buf, wb, hclk));
 			else
 				strcpy(s, "--");
@@ -437,6 +458,8 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		}
 	}
 
+done:
+	free(sram_raw);   /* NULL when SRAM was not benched (free(NULL) is a no-op) */
 	return 0;
 }
 

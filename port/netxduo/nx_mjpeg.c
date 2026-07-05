@@ -14,8 +14,8 @@
  * the pipeline.  A single buf_busy flag (set by consume after the copy, cleared
  * by the HTTP thread on every send-exit path) gates the one-deep handoff.
  *
- * Lifecycle follows nx_echo.c: one thread created once and parked when stopped;
- * the socket create + listen run in the thread (thread-only NetX APIs).
+ * Lifecycle: one thread created once and parked when stopped; the socket create
+ * + listen run in the thread (thread-only NetX APIs).
  */
 #include <stdio.h>           /* snprintf */
 #include <string.h>          /* memcpy / memset */
@@ -36,7 +36,7 @@
 #define MJPEG_MSS_CAP        1400u       /* max bytes per TX packet               */
 #define MJPEG_BUF_BYTES      262144u     /* = JPEG frame budget (65535*4): a frame
                                             never exceeds it, so no oversized drop */
-#define MJPEG_PRIORITY       14          /* below IP(12)/DHCP(13), with echo/shell */
+#define MJPEG_PRIORITY       14          /* below IP(12)/DHCP(13), with net-shell */
 #define MJPEG_STACK          2048u
 #define MJPEG_ACCEPT_TICKS   500u        /* accept timeout -> stop latency         */
 #define MJPEG_POLL_TICKS     200u        /* frame wait -> disconnect latency       */

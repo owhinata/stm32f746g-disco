@@ -36,13 +36,18 @@
 #define BF_NMS_IOU     0.5f
 #define BF_MAX_CAND    64
 
-/* Anchor cell centres (normalized).  w=h=1 fixed, so only the centre matters. */
-static float bf_cx[BF_NANCHOR];
-static float bf_cy[BF_NANCHOR];
-static int   bf_anchors_ready;
+/* Anchor cell centres (normalized) + pre-NMS candidate scratch.  Placed in the
+ * .sdram.ai arena (FMC bank3, MPU region1 cacheable) to keep them off the tight
+ * internal SRAM (issue #94): bf_cx/bf_cy are computed once at init and read many
+ * times, bf_cand is write-before-read scratch, and all access is CPU-only (the
+ * worker is the sole, serialized caller), so there is no DMA-coherency concern.
+ * w=h=1 fixed for the anchors, so only the centre matters. */
+static float bf_cx[BF_NANCHOR] __attribute__((aligned(32), section(".sdram.ai")));
+static float bf_cy[BF_NANCHOR] __attribute__((aligned(32), section(".sdram.ai")));
+static int   bf_anchors_ready;   /* stays in SRAM .bss (a 4-byte flag) */
 
-/* Candidate boxes before NMS (worker is the sole, serialized caller). */
-static struct bf_det bf_cand[BF_MAX_CAND];
+static struct bf_det bf_cand[BF_MAX_CAND]
+	__attribute__((aligned(32), section(".sdram.ai")));
 
 /* Diagnostic: highest raw (pre-sigmoid) score seen in the last decode -- tells
  * whether the model responds to the input (tuning normalization/threshold). */
