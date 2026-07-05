@@ -83,21 +83,31 @@ HAL/CMSIS/ThreadX  <-  svc  <-  port/nn  <-  ui  <-  shell/src
   arena is CPU-only (**no DMA into it**), so D-cache needs no maintenance.
   **Non-cacheable was ~20× slower for NN inference**; cacheable cut MNIST from
   **9.5 ms to 2.5 ms** (#6).  Small models whose activations fit DTCM may use it.
-    - **bank3 split in two (P5, #92)** — for `stedgeai_reloc`, bank3 (2 MB) is halved.
-      The **lower 1 MB** (`0xC0600000`+, `.sdram.ai`) is data-only (activations / staging /
-      the XIP RW image) and stays **XN** (region1).  The **upper 1 MB** (`0xC0700000`+,
-      `.sdram.ai.model`) is made **instruction-fetchable by MPU region2** in `src/bsp.c`
-      to hold the relocatable `.bin` double-slot and run it **XIP**.  Keeping the exec
-      window to just the model slots preserves W^X for the data buffers.
+    - **bank3 split is reloc-only (P5 #92 / #95)** — **only** `stedgeai_reloc` halves bank3
+      (2 MB).  The **lower 1 MB** (`0xC0600000`+, `.sdram.ai`) is data-only (activations /
+      staging / the XIP RW image) and stays **XN** (region1).  The **upper 1 MB**
+      (`0xC0700000`+, `.sdram.ai.model`) is made **instruction-fetchable by MPU region2** in
+      `src/bsp.c` to hold the relocatable `.bin` double-slot and run it **XIP**.  Keeping the
+      exec window to just the model slots preserves W^X for the data buffers.
+    - **Non-reloc (null/stedgeai/tflm) lets `.sdram.ai` use up to bank3's full 2 MB (#95)** —
+      `.sdram.ai.model` is empty, so the linker's `. = MAX(., 0xC0700000)` applies the split
+      only for reloc (a large arena like TFLM's ~1.9 MB grows past `0xC0700000` with the empty
+      model right after it; a small stedgeai arena just rounds the empty model up to
+      `0xC0700000`, harmless NOLOAD), and **`src/bsp.c` explicitly disables region2** so region1
+      governs all 2 MB as XN cacheable data.  This lets **TFLM's ~1.9 MB arena (512 KB +
+      2×512 KB SD slots + 384 KB staging) fit** — before #95 the unconditional split wasted the
+      upper 1 MB and made the TFLM build fail to link.
 - **Weights** — Flash `.rodata` in P1.  **Performance note:** this linker places
   Flash at `0x08000000` = the **AXIM** side.  The ART accelerator (RM0385 §3.3.2)
   serves the **ITCM interface** flash path; AXIM `.rodata` weights are a
   **D-cache + Flash wait-state (7 WS at 216 MHz)** matter, not ART/I-cache.
   Measure with `ai bench` rather than assuming.
 
-The linker (`ldscript/STM32F746NGHx_FLASH.ld`) guards placement with three
-ASSERTs: `_ssdram_ai == bank3 start` / `.sdram.ai <= 2 MB` / `.sdram.eth` stays
-within bank2.
+The linker (`ldscript/STM32F746NGHx_FLASH.ld`) guards placement with ASSERTs:
+`_ssdram_ai == bank3 start` / `.sdram.ai (+ .sdram.ai.model) <= 2 MB` / `.sdram.eth`
+stays within bank2 / a backend-agnostic W^X guard that `.sdram.ai.model` is either
+empty (non-reloc) or at `0xC0700000` (reloc) — #95, since only `nn_stedgeai_reloc.c`
+emits `.sdram.ai.model`.
 
 ## Camera → inference pipeline (`nn_camera.c`)
 

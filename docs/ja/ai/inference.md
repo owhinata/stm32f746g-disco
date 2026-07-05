@@ -75,18 +75,26 @@ HAL/CMSIS/ThreadX  <-  svc  <-  port/nn  <-  ui  <-  shell/src
   ARMv7-M は高番号 region 優先）。arena は CPU-only（**DMA 流入なし**）なので D-cache は
   maintenance 不要でコヒーレント。**非 cacheable では NN 推論が約 20x 遅く**、cacheable 化で
   MNIST 実測 **9.5ms→2.5ms**（#6）。活性化が DTCM に収まる小モデルは DTCM も可。
-    - **bank3 の 2 分割（P5 #92）** — `stedgeai_reloc` では bank3(2MB) を分ける。**下位 1MB**
-      （`0xC0600000`〜, `.sdram.ai`）は data-only（activations / staging / XIP RW イメージ）で
+    - **bank3 の分割は reloc 限定（P5 #92 / #95）** — `stedgeai_reloc` **のみ** bank3(2MB) を分ける。
+      **下位 1MB**（`0xC0600000`〜, `.sdram.ai`）は data-only（activations / staging / XIP RW イメージ）で
       **XN 維持**（region1）。**上位 1MB**（`0xC0700000`〜, `.sdram.ai.model`）は `src/bsp.c` の
       **MPU region2 で命令フェッチ許可**し、relocatable `.bin` の double-slot を置いて **XIP 実行**する。
       W^X を保つため実行窓はモデルスロットのみ（data バッファは XN）。
+    - **非 reloc（null/stedgeai/tflm）は `.sdram.ai` が bank3 全 2MB まで使える（#95）** — `.sdram.ai.model`
+      は空。リンカは `. = MAX(., 0xC0700000)` で split を reloc のみに効かせる（大きい arena=TFLM ~1.9MB は
+      0xC0700000 を越えて伸び、空 model が直後。小さい arena=stedgeai は空 model が 0xC0700000 へ丸まるだけで
+      NOLOAD ゆえ無害）。**`src/bsp.c` は region2 を明示 disable** し bank3 全域を region1 の XN cacheable data に保つ。
+      これで **TFLM の ~1.9MB arena（512KB + 2×512KB SD slot + 384KB staging）が収まる**（#95 以前は
+      split が無条件で上位 1MB を死蔵し TFLM がリンク不能だった）。
 - **重み** — P1 は Flash `.rodata`。**性能上の注意**: 本 linker は Flash を `0x08000000`
   = **AXIM 側**に置く。RM0385 §3.3.2 の ART accelerator は **ITCM interface 側**の flash
   access 用であり、AXIM `.rodata` の重みは ART/I$ ではなく **D-cache + Flash wait-state
   (216MHz = 7WS)** の話。性能は `ai bench` で**実測**して判断すること。
 
-リンカ（`ldscript/STM32F746NGHx_FLASH.ld`）は 3 本の ASSERT で配置を保証する:
-`_ssdram_ai == bank3 起点` / `.sdram.ai <= 2MB` / `.sdram.eth` を bank2 内に留める。
+リンカ（`ldscript/STM32F746NGHx_FLASH.ld`）は ASSERT で配置を保証する: `_ssdram_ai == bank3 起点` /
+`.sdram.ai(+ .sdram.ai.model) <= 2MB` / `.sdram.eth` を bank2 内に留める / **`.sdram.ai.model` は空
+（非 reloc） or `0xC0700000`（reloc）** の backend 非依存 W^X ガード（#95、`.sdram.ai.model` を出すのは
+`nn_stedgeai_reloc.c` のみ）。
 
 ## カメラ → 推論パイプライン（`nn_camera.c`）
 

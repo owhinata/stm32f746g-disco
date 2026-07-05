@@ -127,10 +127,17 @@ static void mpu_config_sdram(void)
      * runs it XIP -- instruction fetch out of external FMC SDRAM (RM0385 s2.1.3 AXIM).
      * Executing code from cacheable SDRAM needs a D-cache clean + I-cache invalidate
      * of the freshly-written .bin before first fetch; the backend does that itself
-     * (the ST loader does none in XIP mode).  Backend-agnostic: for the null/stedgeai/
-     * tflm builds .sdram.ai.model is empty, so this is a harmless exec window over
-     * unused SDRAM and no data buffer ever sits here (they are all XN in the lower
-     * half -- W^X preserved).  Issue #92 (Epic #80 P5). */
+     * (the ST loader does none in XIP mode).  Note the model slots themselves are
+     * RWX here (FULL_ACCESS + exec) -- data buffers stay XN in the lower half, so W^X
+     * holds for the arena, but the loaded code region is not strictly W^X (existing
+     * P5 design).  Issue #92 (Epic #80 P5).
+     *
+     * REGION 2 IS RELOC-ONLY (issue #95): only CONFIG_NN_BACKEND=stedgeai_reloc emits
+     * .sdram.ai.model.  For non-reloc builds (null/stedgeai/tflm) the ldscript lets
+     * .sdram.ai (data) grow into bank3's upper 1 MB (TFLM needs ~1.9 MB), so an exec
+     * window there would make data executable (W^X break) -- instead we leave the
+     * whole 2 MB governed by region1 (XN cacheable) and explicitly disable region2. */
+#ifdef CONFIG_NN_BACKEND_STEDGEAI_RELOC
     r.Number           = MPU_REGION_NUMBER2;
     r.BaseAddress      = 0xC0700000u;
     r.Size             = MPU_REGION_SIZE_1MB;
@@ -142,6 +149,11 @@ static void mpu_config_sdram(void)
     r.AccessPermission = MPU_REGION_FULL_ACCESS;
     r.DisableExec      = MPU_INSTRUCTION_ACCESS_ENABLE;   /* XIP: allow code fetch */
     HAL_MPU_ConfigRegion(&r);
+#else
+    /* HAL_MPU_Disable() clears only MPU->CTRL, not the per-region enable bit, so
+     * explicitly disable region2 in case a warm boot / bootloader jump left it set. */
+    HAL_MPU_DisableRegion(MPU_REGION_NUMBER2);
+#endif
 
     HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 }

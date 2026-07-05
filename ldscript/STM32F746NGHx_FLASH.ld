@@ -258,10 +258,21 @@ SECTIONS
     /* Bank3 upper half: executable model .bin double-slot for the X-CUBE-AI
      * relocatable backend (Epic #80 P5, issue #92).  bsp.c region2 makes exactly
      * this 0xC0700000/1 MB window instruction-fetchable (region1 keeps the lower
-     * half XN); XIP runs the PIC code in place from here.  Empty (0 bytes) for the
-     * null/stedgeai/tflm builds -- then region2 is a harmless exec window over
-     * unused SDRAM. */
-    . = ORIGIN(SDRAM) + 0x700000; /* advance to bank3 upper half (0xC0700000) */
+     * half XN); XIP runs the PIC code in place from here.
+     *
+     * Backend-aware layout (issue #95): use MAX() rather than an unconditional
+     * `. = ORIGIN + 0x700000` so the model window never forces the location counter
+     * BACKWARDS.  Only .sdram.ai.model has to sit at the fixed 0xC0700000 (its MPU
+     * exec region is size-aligned there) and ONLY the reloc backend emits it, so:
+     *   - reloc:   .sdram.ai (data) fits below 1 MB, MAX = 0xC0700000 -- the model
+     *              slots land at the exec window exactly as before (byte-identical).
+     *   - non-reloc (null/stedgeai/tflm): .sdram.ai.model is empty, so MAX lets
+     *              .sdram.ai grow up to the full 2 MB of bank3.  A large arena (TFLM
+     *              ~1.9 MB) flows PAST 0xC0700000 with the empty model right after it;
+     *              a small arena (null/stedgeai) still rounds the empty model up to
+     *              0xC0700000 (harmless, NOLOAD -- no bytes reserved).  Either way there
+     *              is no "cannot move location counter backwards" link error. */
+    . = MAX(., ORIGIN(SDRAM) + 0x700000);
     _ssdram_ai_model = .;
     KEEP(*(.sdram.ai.model))      /* reloc model .bin slots (executable, P5) */
     . = ALIGN(32);
@@ -284,20 +295,22 @@ SECTIONS
          ".sdram.eth must start at FMC internal bank2 (0xC0400000)")
   ASSERT(_esdram_eth <= ORIGIN(SDRAM) + 0x600000,
          ".sdram.eth must fit in bank2 (below the bank3 .sdram.ai boundary, #81)")
-  /* NN inference arena occupies FMC internal bank3 -- issue #81.  Bank3 is split
-     into two 1 MB halves (issue #92 P5): the LOWER half (.sdram.ai, data-only:
-     activations/staging/RT-RAM) stays XN cacheable (bsp.c region1); the UPPER half
-     (.sdram.ai.model, executable reloc .bin slots) is made instruction-fetchable by
-     bsp.c region2.  Keeping the executable window to just the upper half preserves
-     W^X for the data buffers. */
+  /* NN inference arena occupies FMC internal bank3 -- issue #81.  For the reloc
+     backend bank3 is split into two 1 MB halves (issue #92 P5): the LOWER half
+     (.sdram.ai, data-only: activations/staging/RT-RAM) stays XN cacheable (bsp.c
+     region1); the UPPER half (.sdram.ai.model, executable reloc .bin slots) is made
+     instruction-fetchable by bsp.c region2, preserving W^X for the data buffers.
+     For non-reloc backends .sdram.ai.model is empty and .sdram.ai uses the full 2 MB
+     of bank3 (issue #95).  Only nn_stedgeai_reloc.c emits .sdram.ai.model, and CMake
+     compiles it only for CONFIG_NN_BACKEND=stedgeai_reloc, so "model non-empty" is
+     equivalent to "reloc build" -- the backend-agnostic ASSERT below relies on that. */
   ASSERT(_ssdram_ai == ORIGIN(SDRAM) + 0x600000,
          ".sdram.ai must start at FMC internal bank3 (0xC0600000)")
-  ASSERT(_esdram_ai <= ORIGIN(SDRAM) + 0x700000,
-         ".sdram.ai data (activations/staging/RT-RAM) must fit in bank3 lower 1 MB (below the 0xC0700000 exec window)")
-  ASSERT(_ssdram_ai_model == ORIGIN(SDRAM) + 0x700000,
-         ".sdram.ai.model must start at bank3 upper half (0xC0700000, bsp.c region2 exec window)")
+  ASSERT((_esdram_ai_model == _ssdram_ai_model) ||
+         (_ssdram_ai_model == ORIGIN(SDRAM) + 0x700000),
+         ".sdram.ai.model (reloc slots): when present it must sit at the 0xC0700000 exec window (bsp.c region2); it is empty for non-reloc builds. A non-empty model not at the window means .sdram.ai data spilled into the exec window (W^X violation) -- shrink the NN data or the reloc slots.")
   ASSERT(_esdram_ai_model <= ORIGIN(SDRAM) + 0x800000,
-         ".sdram.ai.model (reloc .bin slots) must fit in bank3 upper 1 MB")
+         ".sdram.ai (+ .sdram.ai.model) must fit in FMC internal bank3 (2 MB)")
   /* Overall guard: still inside the 8 MB SDRAM bank (issue #45/#65). */
   ASSERT(_esdram - _ssdram <= 0x800000, ".sdram exceeds the 8 MB SDRAM bank")
 

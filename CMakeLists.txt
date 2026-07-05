@@ -444,6 +444,11 @@ endif()
 if(CONFIG_NN_BACKEND STREQUAL "stedgeai_reloc")
     target_include_directories(threadx PRIVATE "${STEDGEAI_INC}" "${STEDGEAI_RELOC_INC}")
     target_compile_definitions(threadx PRIVATE CONFIG_NN_BACKEND_STEDGEAI_RELOC=1)
+    # src/bsp.c (MPU region2 = the XIP exec window, issue #95) is compiled in the
+    # `common` object library, which only sees its own defines -- NOT threadx's -- so
+    # the reloc flag must be set on `common` too, else bsp.c disables the exec window
+    # even for the reloc build and XIP faults.
+    target_compile_definitions(common PRIVATE CONFIG_NN_BACKEND_STEDGEAI_RELOC=1)
     set_source_files_properties("${STEDGEAI_RELOC_LOADER}" PROPERTIES
         COMPILE_DEFINITIONS "APP_DEBUG=0")
 endif()
