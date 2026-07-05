@@ -280,7 +280,9 @@ static uint8_t cam_frame[CAM_FRAME_MAX_BYTES]
  * hdma_dcmi and are mutually exclusive (cam_stream_active gate).
  */
 #define CAM_PRODUCER_PRIO  10u     /* below IWDG petter (5), like LED (10)      */
-#define CAM_PRODUCER_STACK 2048u
+/* Sized from the measured high-water-mark (`thread` peak = 508 B, #93); 1024
+ * keeps ~2x margin for this well-exercised DCMI sem-wait producer.             */
+#define CAM_PRODUCER_STACK 1024u
 #define CAM_PRODUCER_TICK  10u     /* bounded sem wait so --secs/stop fire even
                                       when no frames arrive (sync lost), ms      */
 

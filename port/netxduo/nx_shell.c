@@ -37,7 +37,10 @@
 #define NX_SHELL_RX_RING     512u
 #define NX_SHELL_EXTRACT     1500u      /* per-packet RX extraction buffer        */
 #define NX_SHELL_PRIORITY    14
-#define NX_SHELL_STACK       1536u
+/* Sized from the measured high-water-mark (`thread` peak = 496 B, #93); 1024
+ * keeps ~2x margin.  This is the accept/dispatch server thread -- command
+ * execution runs in the bound cli instance (4096), not here.                  */
+#define NX_SHELL_STACK       1024u
 
 /* ---- transport backend (cli_transport_api over the TCP socket) ------------- */
 

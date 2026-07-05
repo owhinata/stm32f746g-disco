@@ -52,4 +52,12 @@
  * instead of timing out.  Without this the API returns NX_NOT_SUPPORTED. */
 #define NX_ENABLE_TCP_QUEUE_DEPTH_UPDATE_NOTIFY
 
+/* DHCP client thread stack (issue #93).  nxd_dhcp_client.h declares
+ * nx_dhcp_thread_stack[NX_DHCP_THREAD_STACK_SIZE] as a member of the NX_DHCP
+ * control block with a #ifndef-guarded 4096 default; measured high-water-mark is
+ * 436 B (`thread` peak), so 2048 keeps ~4.7x margin.  Overriding here (reached by
+ * the addon via nx_api.h -> nx_port.h -> nx_user.h) shrinks the member without
+ * editing the read-only lib/netxduo submodule. */
+#define NX_DHCP_THREAD_STACK_SIZE    2048
+
 #endif /* NX_USER_H */

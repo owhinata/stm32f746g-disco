@@ -26,9 +26,10 @@
 
 /*
  * GUIX system thread stack.  Widget-tree traversal plus glyph rendering nests a
- * fair bit; 8 KiB gives margin over the 4 KiB default (tune down once measured).
+ * fair bit.  Measured high-water-mark is 896 B (`thread` peak, #93), so 4 KiB
+ * (== GUIX's own default) keeps ~4.6x margin -- down from the initial 8 KiB.
  */
-#define GX_THREAD_STACK_SIZE        8192
+#define GX_THREAD_STACK_SIZE        4096
 
 /*
  * Single managed + visible full-screen (480x272) canvas bound to the LTDC

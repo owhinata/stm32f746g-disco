@@ -57,7 +57,10 @@
 #endif
 
 #define NNCAM_WORKER_PRIORITY 18          /* full best-effort (below BG-17)        */
-#define NNCAM_WORKER_STACK    8192u
+/* Sized from the measured high-water-mark (`thread` peak = 1024 B under the
+ * stedgeai backend, #93); 4096 keeps ~4x margin.  NOTE: re-measure if switching
+ * to the tflm/reloc backend -- CMSIS-NN kernels + the interpreter nest deeper. */
+#define NNCAM_WORKER_STACK    4096u
 #define NNCAM_POLL_TICKS      100u        /* sem wait -> stop latency               */
 
 /* Staging buffers live in the NN arena (bank3, .sdram.ai).  Raw bytes: hold either

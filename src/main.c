@@ -75,7 +75,9 @@ _Static_assert(SHELL_COUNT <= CLI_MAX_INSTANCES,
 
 /* ---- background threads ------------------------------------------------- */
 
-#define LED_STACK_SIZE  1024
+/* Sized from the measured high-water-mark (`thread` peak = 300 B, #93); 512 B
+ * keeps ~1.7x margin for this GPIO-toggle-and-sleep thread. */
+#define LED_STACK_SIZE  512
 
 static TX_THREAD led_thread;
 static UCHAR     led_stack[LED_STACK_SIZE];
@@ -115,7 +117,9 @@ static void led_entry(ULONG arg)
  * watchdog then fires only on a tick/scheduler stall, an IRQ-off lockup, or a
  * runaway at priority < 5.  ~1 s pet is <= T/2 at every LSI corner (T = 2.04 s at
  * the 47 kHz fast corner), the standard refresh margin. */
-#define IWDG_PETTER_STACK_SIZE  512
+/* Sized from the measured high-water-mark (`thread` peak = 128 B, #93); 256 B
+ * keeps ~2x margin for this pet-and-sleep thread. */
+#define IWDG_PETTER_STACK_SIZE  256
 #define IWDG_PETTER_PRIORITY    5
 
 static TX_THREAD iwdg_thread;
