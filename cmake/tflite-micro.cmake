@@ -21,8 +21,26 @@ set(TFLM_GIT_URL "https://github.com/tensorflow/tflite-micro.git")
 set(TFLM_GIT_SHA "e142972d4f4382f77faa8212b7c70b37d28b9cb9")   # tflite-micro main, 2026-07
 set(TFLM_SRC  "${CMAKE_BINARY_DIR}/tflm-src")     # shallow clone at the pinned SHA
 set(TFLM_ROOT "${CMAKE_BINARY_DIR}/tflm-tree")    # generated self-contained source tree
-set(TFLM_STAMP "${TFLM_ROOT}/.tflm-generated-${TFLM_GIT_SHA}")
 set(TFLM_GEN   "${TFLM_SRC}/tensorflow/lite/micro/tools/project_generation/create_tflm_tree.py")
+
+# --- Optimized kernels: CMSIS-NN vs reference (Epic #80 P3 M2b, issue #88) ----
+# ON (default) generates the tree with OPTIMIZED_KERNEL_DIR=cmsis_nn: the tflm
+# Makefile downloads ARM-software/CMSIS-NN (+ CMSIS_6 core, pinned by its own
+# ext_libs/*_download.sh) and lists the cmsis_nn kernel wrappers instead of the
+# reference conv/depthwise_conv/add/pad/pooling.  On Cortex-M7 (armv7e-m) GCC
+# defines __ARM_FEATURE_DSP, so the SIMD int8 path is compiled (a compile-time
+# canary in nn_tflm.cc asserts it).  OFF keeps pure reference kernels (M2a) for
+# an `ai bench` A/B.  The choice is part of the tree-generation stamp key, so
+# flipping it regenerates the tree.
+set(NN_TFLM_CMSIS_NN ON CACHE BOOL "Use CMSIS-NN optimized kernels in the tflm backend (#88 M2b)")
+if(NN_TFLM_CMSIS_NN)
+    set(TFLM_KERNEL_TAG "cmsisnn")
+    set(TFLM_GEN_EXTRA "--makefile_options=OPTIMIZED_KERNEL_DIR=cmsis_nn")
+else()
+    set(TFLM_KERNEL_TAG "ref")
+    set(TFLM_GEN_EXTRA "")
+endif()
+set(TFLM_STAMP "${TFLM_ROOT}/.tflm-generated-${TFLM_GIT_SHA}-${TFLM_KERNEL_TAG}")
 
 # --- Python venv (numpy/Pillow are required by TFLM's Makefile evaluation) ----
 # Create the venv if missing here; the dependency INSTALL happens in the generation
@@ -85,12 +103,14 @@ if(NOT EXISTS "${TFLM_STAMP}")
 
     file(REMOVE_RECURSE "${TFLM_ROOT}")
     execute_process(
-        # reference kernels only (no OPTIMIZED_KERNEL_DIR); CMSIS-NN is a separate M2 task.
-        # Prepend the venv to PATH so the Makefile's own `python3` subprocess (which runs
-        # generate_cc_arrays.py) resolves numpy/Pillow -- running create_tflm_tree.py with
-        # the venv python alone is not enough, as make spawns a fresh `python3`.
+        # TFLM_GEN_EXTRA is "--makefile_options=OPTIMIZED_KERNEL_DIR=cmsis_nn" (CMSIS-NN)
+        # or empty (reference).  With cmsis_nn the Makefile downloads CMSIS/CMSIS-NN and
+        # swaps in the optimized kernel wrappers.  Prepend the venv to PATH so the
+        # Makefile's own `python3` subprocess (generate_cc_arrays.py) resolves
+        # numpy/Pillow -- running create_tflm_tree.py with the venv python alone is not
+        # enough, as make spawns a fresh `python3`.
         COMMAND "${CMAKE_COMMAND}" -E env "PATH=${TFLM_VENV}/bin:$ENV{PATH}"
-                "${TFLM_PY}" "${TFLM_GEN}" -e hello_world "${TFLM_ROOT}"
+                "${TFLM_PY}" "${TFLM_GEN}" -e hello_world ${TFLM_GEN_EXTRA} "${TFLM_ROOT}"
         WORKING_DIRECTORY "${TFLM_SRC}" RESULT_VARIABLE _rc)
     if(NOT _rc EQUAL 0 OR NOT EXISTS "${TFLM_ROOT}/tensorflow/lite/micro/micro_interpreter.cc")
         message(FATAL_ERROR "tflm: create_tflm_tree.py failed (need numpy/Pillow in ${TFLM_VENV})")
@@ -158,6 +178,20 @@ file(GLOB_RECURSE TFLM_LIB_SOURCES CONFIGURE_DEPENDS
 list(FILTER TFLM_LIB_SOURCES EXCLUDE REGEX
      "(_test\\.cc|test_helpers\\.cc|test_helper_custom_ops\\.cc|mock_micro_graph\\.cc|fake_micro_context\\.cc)$")
 
+# CMSIS-NN library sources (C), copied into the tree by create_tflm_tree under
+# third_party/cmsis_nn/Source when OPTIMIZED_KERNEL_DIR=cmsis_nn.  The optimized
+# kernel wrappers (tensorflow/lite/micro/kernels/cmsis_nn/*.cc) are already caught
+# by the glob above -- create_tflm_tree lists them INSTEAD of the reference ones,
+# so there is no duplicate registration.  Drop the f16/f32 sources: we build with
+# ARM_NN_ENABLE_F16=0 / F32=0 (matches the Makefile default), and _f16.c needs
+# hardware/flags this SP-FPU core lacks.
+if(NN_TFLM_CMSIS_NN)
+    file(GLOB_RECURSE TFLM_CMSIS_NN_SOURCES CONFIGURE_DEPENDS
+         "${TFLM_ROOT}/third_party/cmsis_nn/Source/*.c")
+    list(FILTER TFLM_CMSIS_NN_SOURCES EXCLUDE REGEX "(_f16|_f32|arm_nntables_flt)\\.c$")
+    list(APPEND TFLM_LIB_SOURCES ${TFLM_CMSIS_NN_SOURCES})
+endif()
+
 add_library(tflm STATIC
     ${TFLM_LIB_SOURCES}
     "${TFLM_MODEL_CC}"                                  # generated BlazeFace model bytes
@@ -181,15 +215,36 @@ target_compile_definitions(tflm
     PUBLIC  TF_LITE_STATIC_MEMORY
     PRIVATE TF_LITE_STRIP_ERROR_STRINGS NDEBUG)
 
+# CMSIS-NN: add the downloaded CMSIS_6 core + CMSIS-NN include roots (mirrors the
+# tflm Makefile's INCLUDES for cmsis_nn.inc) and the F16/F32 gates.  NN_TFLM_CMSIS_NN
+# lets nn_tflm.cc assert __ARM_FEATURE_DSP at compile time.  These are PRIVATE to the
+# tflm lib (no HAL/repo-CMSIS TU here), so the matched CMSIS_6 + CMSIS-NN headers win.
+if(NN_TFLM_CMSIS_NN)
+    target_include_directories(tflm PRIVATE
+        "${TFLM_ROOT}/third_party/cmsis"
+        "${TFLM_ROOT}/third_party/cmsis/CMSIS/Core/Include"
+        "${TFLM_ROOT}/third_party/cmsis_nn"
+        "${TFLM_ROOT}/third_party/cmsis_nn/Include")
+    # -DCMSIS_NN is what OPTIMIZED_KERNEL_DIR=cmsis_nn adds in the tflm Makefile
+    # (uppercased dir name): it switches the kernel headers (pooling.h, conv.h, ...)
+    # from inline reference registrations to extern declarations, so the cmsis_nn
+    # *.cc supply the definitions.  Without it every optimized kernel TU redefines
+    # the reference inline version.  PRIVATE = visible to the whole tflm lib.
+    target_compile_definitions(tflm PRIVATE
+        CMSIS_NN ARM_NN_ENABLE_F16=0 ARM_NN_ENABLE_F32=0 NN_TFLM_CMSIS_NN=1)
+endif()
+
 set_target_properties(tflm PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS OFF)
 
 # Bare-metal C++: no exceptions/RTTI, single-threaded static-init (no __cxa_guard_*),
 # no cxa_atexit registration, no unwind tables.  -O2 to match the rest of the build.
+# The C++-only flags are scoped to CXX so the CMSIS-NN C sources (cmsis_nn build)
+# don't warn "valid for C++ but not for C".
 target_compile_options(tflm PRIVATE
-    -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit
     -fno-unwind-tables -fno-asynchronous-unwind-tables -O2
-    -Wno-unused-parameter -Wno-sign-compare -Wno-maybe-uninitialized)
+    -Wno-unused-parameter -Wno-sign-compare -Wno-maybe-uninitialized
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti;-fno-threadsafe-statics;-fno-use-cxa-atexit>)
 
 # Provide the nano C++ runtime archives + libm to whatever links `tflm`, ordered
 # AFTER tflm's own objects.  cxx_runtime.cc defines our own operator new/delete, so

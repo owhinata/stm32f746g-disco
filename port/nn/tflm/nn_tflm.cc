@@ -40,6 +40,14 @@
 #include <cstddef>
 #include <cstdint>
 
+/* Canary (codex review): when built with CMSIS-NN, the SIMD int8 kernels are only
+ * selected if the compiler advertises the DSP extension.  Cortex-M7 is armv7e-m so
+ * GCC defines __ARM_FEATURE_DSP; if a flag change ever drops it, fail the build loud
+ * rather than silently falling back to CMSIS-NN's plain-C path. */
+#if defined(NN_TFLM_CMSIS_NN) && !defined(__ARM_FEATURE_DSP)
+#error "CMSIS-NN build without __ARM_FEATURE_DSP -- DSP int8 path not selected (check -mcpu)"
+#endif
+
 namespace {
 
 /* Activation arena in .sdram.ai (bank3).  BlazeFace's activations measured
