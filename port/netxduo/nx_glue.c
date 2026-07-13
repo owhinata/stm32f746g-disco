@@ -46,6 +46,16 @@ static bool static_mode;
 
 extern VOID nx_eth_driver(NX_IP_DRIVER *driver_req_ptr);
 
+/* Diagnostic (issue #96): trace the DHCP state machine so an intermittent
+   "link up but no lease" boot is visible in `dmesg` (the ring persists across
+   reset).  States: 2=INIT 3=SELECTING(discover sent) 4=REQUESTING(offer got)
+   5=BOUND(ack got).  Stall at SELECTING = no OFFER, at REQUESTING = no ACK. */
+static void nx_dhcp_state_cb(NX_DHCP *dhcp, UCHAR new_state)
+{
+	(void)dhcp;
+	LOG_INF("dhcp state -> %u", (unsigned)new_state);
+}
+
 /* NetX link-status callback (IP helper thread context, under nx_ip_protection):
    update the interface link flag and kick DHCP on the first link-up. */
 static void nx_link_status_cb(NX_IP *ip, UINT iface_index, UINT link_up)
@@ -53,8 +63,15 @@ static void nx_link_status_cb(NX_IP *ip, UINT iface_index, UINT link_up)
 	ip->nx_ip_interface[iface_index].nx_interface_link_up = (UCHAR)link_up;
 
 	if (link_up && dhcp_created && !static_mode && !dhcp_started) {
-		if (nx_dhcp_start(&eth_dhcp) == NX_SUCCESS)
+		UINT s = nx_dhcp_start(&eth_dhcp);          /* #96 diag */
+		LOG_INF("link-cb up=%u -> dhcp_start=0x%02x", (unsigned)link_up,
+		        (unsigned)s);
+		if (s == NX_SUCCESS)
 			dhcp_started = true;
+	} else {
+		LOG_INF("link-cb up=%u created=%u static=%u started=%u (no start)",
+		        (unsigned)link_up, (unsigned)dhcp_created,
+		        (unsigned)static_mode, (unsigned)dhcp_started);
 	}
 }
 
@@ -93,6 +110,7 @@ int nx_net_init(void)
 	   link-up callback; reuse the shared non-cacheable pool. */
 	if (nx_dhcp_create(&eth_dhcp, &eth_ip, "eth") == NX_SUCCESS) {
 		nx_dhcp_packet_pool_set(&eth_dhcp, &eth_pool);
+		nx_dhcp_state_change_notify(&eth_dhcp, nx_dhcp_state_cb);  /* #96 diag */
 		dhcp_created = true;
 	} else {
 		LOG_WRN("dhcp create failed; use 'net ip' for a static address");
