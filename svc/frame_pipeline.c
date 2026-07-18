@@ -316,6 +316,21 @@ int frame_pipeline_read_latest(struct frame_pipeline *p, uint32_t off,
 	return rc;
 }
 
+const struct frame_desc *frame_pipeline_pin_latest(struct frame_pipeline *p)
+{
+	const struct frame_desc *r = NULL;
+
+	pl_lock(p);
+	if (p->latest >= 0) {
+		struct frame_slot *slot = &p->slots[p->latest];
+
+		slot->refcount++;               /* keep it out of acquire() until put() */
+		r = &slot->desc;
+	}
+	pl_unlock(p);
+	return r;                           /* release with frame_pipeline_put(p, NULL, r) */
+}
+
 /* ---- statistics ---------------------------------------------------------- */
 
 void frame_pipeline_stats(struct frame_pipeline *p, struct frame_stats *out)

@@ -7,19 +7,19 @@ Copyright (c) 2026 ThreadX Shell Project
 
 カメラフレームを **1 プロデューサ（DCMI 取り込み）→ マルチシンク（file / LTDC / Ethernet / VCP）** で分配するアーキテクチャ設計（issue #47）。`fs_device`（[ファイルシステム](../rtos/filesystem.md)、#34）が媒体を、`ym_source`（[xfer](../rtos/shell-xfer.md)、#50）がバイトソースを抽象化したのと同型の「薄い vtable + 複数バックエンド」を、フレーム配信に適用する。
 
-!!! note "本ページは設計（IF 提案）"
-    この設計の実体（リング/ディスパッチエンジン、DMA ダブルバッファ、各シンク）は後続 issue で実装する。本ページは抽象 IF と所有権・バックプレッシャ・スレッド・フォーマット・レイヤ配置の決定を確定するもの。ヘッダ案は `svc/frame.h` と `svc/frame_pipeline.h`（宣言のみ）。
+!!! note "実装済み（#46）— 本ページは設計と実装の両方を記述"
+    本ページは元々 #47 の IF 提案だったが、リング/ディスパッチエンジン・DMA ダブルバッファ・各シンクは **#46 で実装済み**（`svc/frame_pipeline.c`）。base capture + subscriber cascade（内部 stat sink + GUI preview / nncam / MJPEG の最大 3 subscriber の同時 attach）は **#100/#101 で稼働中**（[所有権モデル](ownership.md)）。以下は確定した抽象 IF（`svc/frame.h`・`svc/frame_pipeline.h`）と、その実装の設計根拠である。
 
 ## 背景
 
-現状のカメラ（[カメラ](../hardware/camera.md)、Epic #22）は `.sdram` の **1 枚の静的バッファ** `cam_frame[]` に QVGA RGB565 を単発 snapshot し、`cam_frame_gen`（世代カウンタ）と `cam_done`（DCMI FRAME 完了セマフォ）で読み出しを直列化する。今後 **LTDC ライブ表示（#48）** と **Ethernet 配信（#49）** が予定され、フレームの「ソース」と「出力先」が多対多になる。シンク直結のまま streaming（#46）を実装すると、出力先を増やすたびにフレーム分配を作り直すことになる。
+単発 snapshot のカメラ（[カメラ](../hardware/camera.md)、Epic #22）は `.sdram` の **1 枚の静的バッファ** `cam_frame[]` に QVGA RGB565 を撮り、`cam_frame_gen`（世代カウンタ）と `cam_done`（DCMI FRAME 完了セマフォ）で読み出しを直列化していた。その後 **LTDC ライブ表示（#48）** と **Ethernet 配信（#49）** が加わり、フレームの「ソース」と「出力先」が多対多になった。シンク直結のまま streaming を実装すると出力先を増やすたびにフレーム分配を作り直すことになる — それを避けるのが本パイプライン（#46 で実装）。
 
 | シンク | 帯域目安 | QVGA RGB565 ライブ |
 |---|---|---|
 | VCP（USART1 115200） | ~0.09 Mbps | ✗ プレビュー専用 |
 | File（SD / QSPI） | 数 MB/s | △ バースト / タイムラプス |
-| LTDC（#48 予定） | 内部 | ◎ ローカル表示 |
-| Ethernet（#49 予定） | 100 Mbps | ◎ ネットワーク配信（MJPEG/HTTP・RTP） |
+| LTDC（#48） | 内部 | ◎ ローカル表示（GUIX preview #56） |
+| Ethernet（#49） | 100 Mbps | ◎ ネットワーク配信（MJPEG/HTTP #49 P5） |
 
 ## レイヤ配置（#43 整合）
 
@@ -56,7 +56,7 @@ ThreadX（producer/各 sink のスレッド、ISR→スレッド通知、`frame_
 
 ### snapshot は pipeline の縮退形
 
-単発 `camera capture` は **N=1 リングへ 1 フレーム publish、push シンク無し、pull で読み出す**特殊例にすぎない。したがって既存の `camera capture` / `camera_frame_read` / `camera save`（#42）/ `camera send`（#50）は **shell コマンドの意味論も公開 API も不変**のまま残り、`camera.c` 内部だけが #46 で `cam_frame[]` → リングへ置き換わる。これが移行リスクを下げる中心。
+単発 `camera capture` は **N=1 リングへ 1 フレーム publish、push シンク無し、pull で読み出す**特殊例にすぎない。実装上、`camera capture` は `cam_frame[]` に直接撮り、streaming（#46）は別に多スロットのリングを持つ。`camera save`（#42）/ `camera send`（#50）は #102 で **base ON 中はリングの最新公開フレームを `frame_pipeline_pin_latest` で 1 回 pin コピー**して読み（base OFF は従来の `cam_frame[]` snapshot）、shell コマンドの意味論も公開 API も不変のまま「常に最新フレーム」を得る。
 
 ## データ契約: `frame_desc`
 

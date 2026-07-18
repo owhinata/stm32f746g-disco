@@ -146,7 +146,11 @@ static volatile int cam_xfer_active;   /* 1 between DMA issue and completion */
 
 static int cam_ready;                  /* camera_init() done           */
 static int cam_colorbar = -1;          /* last pattern mode; -1 unknown */
-static uint32_t cam_frame_gen;         /* bumped per successful capture */
+static uint32_t cam_frame_gen;         /* #102: bumped whenever the stable cam_frame
+                                          buffer is refreshed -- by `camera capture`
+                                          or by camera_snapshot_latest() (base ON).
+                                          save/send compare it across chunks to detect
+                                          a frame replaced mid-read. */
 static struct camera_info info;
 
 /* Quality settings (issue #44): RAM cache, neutral by default EXCEPT flip, which
@@ -347,17 +351,6 @@ static struct cam_sub cam_subs[CAM_MAX_SUBS];
 static void cam_subs_release_oneshot(void);
 
 static volatile int      cam_stream_active;  /* streaming mode gate             */
-static volatile int      cam_stream_mirror;   /* #82: JPEG stream mirrors each frame
-                                                 into cam_frame for save/send (plain
-                                                 stream only).  A session latch fixed for
-                                                 the stream's lifetime: set (= no external
-                                                 subscriber attached) by the start caller
-                                                 before the producer wakeup, read and
-                                                 cleared only by the producer.  An async
-                                                 subscriber detach happens on another
-                                                 thread, so re-deriving the decision from
-                                                 the registry lock-free could flip it
-                                                 mid-pass -- this latch cannot. */
 static volatile int      cam_stop_req;       /* stop requested (producer drains)*/
 static volatile int      cam_stream_err;     /* DCMI OVR -> terminal stop       */
 static volatile uint32_t cam_stream_ovr;     /* DCMI overrun count              */
@@ -1355,6 +1348,43 @@ void camera_frame_invalidate(void)
 	op_unlock();
 }
 
+int camera_snapshot_latest(void)
+{
+	int rc = op_lock();
+
+	if (rc != 0)
+		return rc;
+	/* #102: base ON -> refresh the stable cam_frame buffer from the latest published
+	   ring frame so save/send always get the newest frame (any format, and even while
+	   MJPEG/GUI subscribers are attached).  The pin keeps the slot out of the
+	   producer's acquire() while we copy OUTSIDE the pipeline lock (pin held only across
+	   a brief refcount++/--), so the producer's publish/DMA-repoint is never stalled.
+	   base OFF -> keep the last `camera capture` frame (non-destructive, #102 decision);
+	   no captured frame at all -> CAM_ERR_NO_FRAME. */
+	if (cam_stream_active) {
+		const struct frame_desc *f = frame_pipeline_pin_latest(&cam_pipe);
+
+		if (f == NULL) {
+			op_unlock();
+			return CAM_ERR_NO_FRAME;   /* stream up but no frame published yet */
+		}
+		if (f->bytes <= CAM_FRAME_MAX_BYTES) {
+			memcpy(cam_frame, f->data, f->bytes);   /* pin-protected, lock-free */
+			info.frame_bytes = f->bytes;
+			info.frame_valid = 1;
+			cam_frame_gen++;
+			rc = 0;
+		} else {
+			rc = CAM_ERR_PARAM;        /* cannot happen: budget < cam_frame */
+		}
+		frame_pipeline_put(&cam_pipe, NULL, f);     /* release the pin */
+	} else {
+		rc = info.frame_valid ? 0 : CAM_ERR_NO_FRAME;
+	}
+	op_unlock();
+	return rc;
+}
+
 int camera_streaming(void)
 {
 	return cam_stream_active;   /* volatile; a destructive .sdram op must refuse */
@@ -1812,7 +1842,6 @@ static void cam_stream_teardown(void)
 		   stop or a --frames/--secs target completion (#100 contract 6). */
 		cam_recover_pending = cam_stream_err && !cam_stop_req;
 		cam_stream_active = 0;
-		cam_stream_mirror = 0;                /* #82: producer clears the mirror latch */
 		cam_elapsed_ms = HAL_GetTick() - cam_start_tick;
 		(void)HAL_DCMI_Stop(&hdcmi);          /* aborts the DMA internally */
 		/* The JPEG snapshot-loop arms DCMI_IT_FRAME, but HAL_DCMI_Stop does NOT
@@ -1944,23 +1973,6 @@ static HAL_StatusTypeDef cam_jpeg_arm(struct frame_desc *slot)
 	return HAL_OK;
 }
 
-/* Copy the just-finalised JPEG frame into the (idle during streaming) snapshot
-   buffer so `camera save` / `camera send` -- which read cam_frame via
-   camera_frame_read -- can pull a live or last streamed frame.  Brief cam_lock
-   (the teardown pattern) keeps camera_frame_read from seeing a torn frame; called
-   AFTER publish so the lock order stays cam_lock -> cam_pipe_lock (never nested). */
-static void mirror_to_cam_frame(const struct frame_desc *slot, uint32_t valid)
-{
-	if (valid > CAM_FRAME_MAX_BYTES)
-		return;                          /* cannot happen (budget < cam_frame) */
-	(void)tx_mutex_get(&cam_lock, TX_WAIT_FOREVER);
-	memcpy(cam_frame, slot->data, valid);
-	info.frame_bytes = valid;
-	info.frame_valid = 1;
-	cam_frame_gen++;
-	(void)tx_mutex_put(&cam_lock);
-}
-
 /* Stop conditions shared by both stream services. */
 static int cam_stream_should_stop(void)
 {
@@ -1971,8 +1983,9 @@ static int cam_stream_should_stop(void)
 }
 
 /* Service one JPEG frame: finalise the current slot (Stop -> NDTR -> EOI trim),
-   publish it at its real length, mirror it for save/send (plain stream only, #82),
-   then re-arm into a free slot.  Every HAL failure (Stop / re-arm) is terminal ->
+   publish it at its real length, then re-arm into a free slot.  save/send pull the
+   latest published frame on demand (camera_snapshot_latest, #102), so this hot path
+   does no cam_frame mirror.  Every HAL failure (Stop / re-arm) is terminal ->
    teardown, so the stream never sticks "active" with no frame coming.
    Producer-thread only. */
 static void cam_stream_service_jpeg(int had_sem)
@@ -2001,16 +2014,10 @@ static void cam_stream_service_jpeg(int had_sem)
 		if (freed != NULL) {
 			frame_pipeline_publish(&cam_pipe, cam_jpeg_slot, valid,
 			                       FRAME_FMT_JPEG, mode.width, mode.height, 0u);
-			/* #82: only a plain `camera stream` (no subscriber) keeps cam_frame
-			   live for camera save/send.  While a subscriber is attached (MJPEG
-			   #78) skip the per-frame ~19.5KB non-cacheable SDRAM mirror -- matching
-			   the raster preview path, which never mirrors.  save/send then return
-			   the last subscriber-less frame (or CAM_ERR_NO_FRAME).  Gate on the
-			   session latch cam_stream_mirror (fixed at base start), NOT the live
-			   registry: an async subscriber detach on another thread could otherwise
-			   flip the decision mid-pass. */
-			if (cam_stream_mirror)
-				mirror_to_cam_frame(cam_jpeg_slot, valid);
+			/* #102: the producer no longer mirrors into cam_frame.  camera
+			   save/send pull the latest published frame on demand via
+			   camera_snapshot_latest() (frame_pipeline_pin_latest), so this hot
+			   path stays copy-free for every format -- raster and JPEG alike. */
 			cam_jpeg_slot = freed;       /* fill a fresh slot next */
 		} else {
 			cam_ring_ovr++;              /* no free slot: drop, reuse this slot */
@@ -2177,11 +2184,7 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs)
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		return CAM_ERR_STATE;
 	}
-	/* #82: mirror JPEG frames into cam_frame for save/send only for a plain,
-	   subscriber-less stream (nx==0); a JPEG base with a subscriber (MJPEG) skips
-	   the ~19.5 KB non-cacheable copy.  Unused on the raster path.  Latched here
-	   before the producer wakeup, cleared only by the producer at teardown. */
-	cam_stream_mirror = (nx == 0);
+	(void)nx;                         /* #102: no longer used for a mirror latch */
 	cam_stream_ovr    = 0;
 	cam_ring_ovr      = 0;
 	cam_stream_fe     = 0;
@@ -2498,12 +2501,57 @@ int camera_stream_stats(struct camera_stream_info *out)
 	   under cam_pipe_lock).  Lock order is always cam_lock -> cam_pipe_lock
 	   (matching start / teardown), so this nesting cannot deadlock. */
 	(void)tx_mutex_get(&cam_pipe_lock, TX_WAIT_FOREVER);
-	out->frames    = cam_pipe.stats.published;
-	out->delivered = cam_stat_sink.delivered;
-	out->dropped   = cam_stat_sink.dropped;
+	out->captured    = cam_pipe.stats.captured;    /* producer */
+	out->frames      = cam_pipe.stats.published;    /* producer */
+	out->delivered   = cam_stat_sink.delivered;     /* stat sink */
+	out->dropped     = cam_stat_sink.dropped;       /* stat sink */
+	out->stat_errors = cam_stat_sink.errors;        /* stat sink (#102) */
 	(void)tx_mutex_put(&cam_pipe_lock);
 	op_unlock();
 	return 0;
+}
+
+int camera_subscribers_snapshot(struct camera_sub_stat *out, int max)
+{
+	int n = 0;
+
+	if (out == NULL || max <= 0)
+		return 0;
+	if (op_lock() != 0)
+		return 0;
+	/* Consistent read of the per-sink counters (producer writes them under
+	   cam_pipe_lock).  Lock order cam_lock -> cam_pipe_lock (as elsewhere). */
+	(void)tx_mutex_get(&cam_pipe_lock, TX_WAIT_FOREVER);
+	/* The internal stats sink is attached for the whole base lifetime (#46). */
+	if (cam_stream_active && n < max) {
+		out[n].name      = cam_stat_sink.name;
+		out[n].fmt       = mode.format;
+		out[n].enabled   = 1;
+		out[n].attached  = 1;
+		out[n].oneshot   = 0;
+		out[n].delivered = cam_stat_sink.delivered;
+		out[n].dropped   = cam_stat_sink.dropped;
+		out[n].errors    = cam_stat_sink.errors;
+		n++;
+	}
+	for (int i = 0; i < CAM_MAX_SUBS && n < max; i++) {
+		const struct cam_sub *sub = &cam_subs[i];
+
+		if (sub->sink == NULL)
+			continue;
+		out[n].name      = sub->sink->name;
+		out[n].fmt       = sub->fmt;
+		out[n].enabled   = sub->enabled;
+		out[n].attached  = sub->attached;
+		out[n].oneshot   = sub->oneshot;
+		out[n].delivered = sub->sink->delivered;
+		out[n].dropped   = sub->sink->dropped;
+		out[n].errors    = sub->sink->errors;
+		n++;
+	}
+	(void)tx_mutex_put(&cam_pipe_lock);
+	op_unlock();
+	return n;
 }
 
 int camera_init(void)

@@ -242,13 +242,26 @@ int camera_capture(int colorbar);
  * mutex.  Fails with CAM_ERR_NO_FRAME until a capture succeeded.
  *
  * @p gen (optional, may be NULL) receives the frame's generation counter,
- * bumped by every successful capture.  A multi-call reader (stats, save)
- * must compare generations across its reads: a concurrent capture between
+ * bumped whenever the stable buffer is refreshed -- a successful capture OR a
+ * camera_snapshot_latest() (#102).  A multi-call reader (stats, save) must
+ * compare generations across its reads: a concurrent capture/snapshot between
  * two reads re-validates the buffer with NEW pixels -- frame_valid alone
  * cannot detect that, only the generation change does.
  */
 int camera_frame_read(uint32_t offset, void *dst, uint32_t len,
                       uint32_t *gen);
+
+/**
+ * Refresh the stable snapshot buffer that camera_frame_read() serves, so `camera
+ * save`/`send` capture the freshest frame, then return 0 (#102).  While the base
+ * is streaming this copies the latest published ring frame (any format, even with
+ * MJPEG/GUI subscribers attached) via a pinned, lock-free copy that never stalls
+ * the producer.  While the base is off it keeps the last `camera capture` frame
+ * (non-destructive).  Returns CAM_ERR_NO_FRAME when no frame is available (base
+ * streaming but nothing published yet, or base off with no prior capture).  Call
+ * it once before a save/send, before creating the file / starting the transfer.
+ */
+int camera_snapshot_latest(void);
 
 /**
  * Drop the captured-frame flag (the buffer contents are about to be clobbered
@@ -266,9 +279,11 @@ int camera_streaming(void);
 struct camera_stream_info {
 	int      active;     /* a stream is in progress                          */
 	int      err;        /* stopped by a DCMI overrun (terminal)             */
-	uint32_t frames;     /* frames published since start                     */
-	uint32_t delivered;  /* frames delivered to the stats sink               */
-	uint32_t dropped;    /* frames the sink dropped (busy)                   */
+	uint32_t captured;   /* PRODUCER: frames the producer acquired/filled    */
+	uint32_t frames;     /* PRODUCER: frames published since start           */
+	uint32_t delivered;  /* STAT SINK: frames delivered to the stats sink    */
+	uint32_t dropped;    /* STAT SINK: frames the sink dropped (busy)        */
+	uint32_t stat_errors;/* STAT SINK: consume() error returns (#102)        */
 	uint32_t dcmi_ovr;   /* DCMI FIFO overruns                               */
 	uint32_t ring_ovr;   /* ring exhaustion / lost completions               */
 	uint32_t dma_fe;     /* DMA FIFO/DME errors tolerated (non-fatal, #56)   */
@@ -352,6 +367,32 @@ int camera_subscribed(struct frame_sink *s);
  * concurrent manual attach after the call is a benign user race).
  */
 int camera_other_subscribers_attached(struct frame_sink *self);
+
+/** Upper bound for camera_subscribers_snapshot(): internal stats sink + the three
+ *  external subscribers (gui / nncam / mjpeg).  Size a caller's array with this. */
+#define CAMERA_MAX_SUB_STATS 4
+
+/** One subscriber's identity + live per-sink pipeline statistics (#102). */
+struct camera_sub_stat {
+	const char *name;      /* sink name: "stats" / "gui" / "nncam" / "mjpeg"   */
+	uint8_t     fmt;       /* enum camera_format the sink consumes             */
+	uint8_t     enabled;   /* registered intent                               */
+	uint8_t     attached;  /* currently linked in the pipeline                */
+	uint8_t     oneshot;   /* non-persistent (MJPEG) vs persistent (gui/nncam) */
+	uint32_t    delivered; /* frames the pipeline delivered to this sink       */
+	uint32_t    dropped;   /* frames dropped for this sink (busy)              */
+	uint32_t    errors;    /* consume() error returns for this sink            */
+};
+
+/**
+ * Snapshot the base capture's sinks into @p out (up to @p max entries) and return
+ * the count (#102).  Includes the internal stats sink (while the base is on) plus
+ * every registered external subscriber (gui / nncam / mjpeg), with each sink's live
+ * delivered/dropped/errors.  Taken under cam_lock -> cam_pipe_lock for a consistent
+ * read; the @ref camera_sub_stat.name pointers are static strings, valid after the
+ * call returns.  Used by `camera info`.
+ */
+int camera_subscribers_snapshot(struct camera_sub_stat *out, int max);
 
 /**
  * Release one pre-pinned slot on behalf of subscriber sink @p s -- the sink's

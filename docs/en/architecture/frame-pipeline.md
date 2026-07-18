@@ -12,12 +12,15 @@ the same "thin vtable + multiple backends" pattern that `fs_device`
 ([xfer](../rtos/shell-xfer.md), #50) uses for a byte source, this time to frame
 distribution.
 
-!!! note "This page is the design (an interface proposal)"
-    The implementation of this design (the ring/dispatch engine, the DMA
-    double-buffer, the individual sinks) lands in later issues.  This page fixes
-    the abstract interface and the ownership / back-pressure / threading /
-    format / layering decisions.  The header proposals are `svc/frame.h` and
-    `svc/frame_pipeline.h` (declarations only).
+!!! note "Implemented (#46) — this page describes both the design and the implementation"
+    This page was originally the #47 interface proposal, but the
+    ring/dispatch engine, the DMA double-buffer and the individual sinks are
+    **implemented in #46** (`svc/frame_pipeline.c`). The base capture +
+    subscriber cascade (an internal stat sink plus up to three subscribers — GUI
+    preview / nncam / MJPEG — attached at the same time) has been **live since
+    #100/#101** (see [Ownership model](ownership.md)). What follows is the
+    finalized abstract interface (`svc/frame.h` / `svc/frame_pipeline.h`) and its
+    implementation's design rationale.
 
 ## Background
 
@@ -25,16 +28,17 @@ The camera today ([Camera](../hardware/camera.md), Epic #22) captures a single
 QVGA RGB565 snapshot into **one static buffer** `cam_frame[]` in `.sdram`, and
 serialises reads with `cam_frame_gen` (a generation counter) and `cam_done`
 (the DCMI frame-complete semaphore).  **LTDC live display (#48)** and **Ethernet
-streaming (#49)** are planned, so a frame's "source" and "destination" become
-many-to-many.  Wiring sinks directly while implementing streaming (#46) would
-mean rebuilding frame distribution every time a destination is added.
+streaming (#49)** were then added, so a frame's "source" and "destination"
+became many-to-many.  Wiring sinks directly while implementing streaming (#46)
+would mean rebuilding frame distribution every time a destination is added — this
+pipeline (implemented in #46) is what avoids that.
 
 | Sink | Rough bandwidth | QVGA RGB565 live |
 |---|---|---|
 | VCP (USART1 115200) | ~0.09 Mbps | x preview only |
 | File (SD / QSPI) | a few MB/s | ~ burst / time-lapse |
-| LTDC (#48 planned) | internal | best, local display |
-| Ethernet (#49 planned) | 100 Mbps | best, network (MJPEG/HTTP, RTP) |
+| LTDC (#48) | internal | best, local display (GUIX preview #56) |
+| Ethernet (#49) | 100 Mbps | best, network (MJPEG-over-HTTP #49 P5) |
 
 ## Layering (consistent with #43)
 
@@ -84,11 +88,13 @@ touches the ring; it just posts `cam_done` (the existing discipline).
 ### Snapshot is the degenerate pipeline
 
 A single `camera capture` is just the special case: an **N=1 ring, no push
-sinks, one publish, read back by pull**.  So the existing `camera capture` /
-`camera_frame_read` / `camera save` (#42) / `camera send` (#50) keep both their
-**shell-command semantics and their public API unchanged**; only `camera.c`'s
-internals swap `cam_frame[]` for the ring in #46.  This is what de-risks the
-migration.
+sinks, one publish, read back by pull**.  In practice `camera capture` writes
+`cam_frame[]` directly, and streaming (#46) keeps its own separate multi-slot
+ring.  Since #102, `camera save` (#42) / `camera send` (#50) read **the latest
+published ring frame, pin-copied once via `frame_pipeline_pin_latest` while the
+base is ON** (a base-OFF read falls back to the `cam_frame[]` snapshot), so they
+now always get the latest frame while keeping both their **shell-command
+semantics and their public API unchanged**.
 
 ## Data contract: `frame_desc`
 

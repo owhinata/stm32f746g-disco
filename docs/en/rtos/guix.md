@@ -90,11 +90,13 @@ Stopping is **cooperative**: the thread checks an `active` flag and parks itself
 
 ## Lifecycle (`gui` command)
 
-!!! warning "#100 made the preview a subscriber of the base capture (this section's ownership/overlay text is rewritten in Phase 3, #102)"
-    Epic #99 Phase 1 (#100) means the GUI preview no longer **owns** the DCMI.
+!!! note "The preview is a subscriber of the base capture (Epic #99 #100/#101/#102)"
+    Epic #99 means the GUI preview no longer **owns** the DCMI.
     `camera_preview_start()` is gone; the preview attaches via
     `camera_subscribe(&guix_cam_sink, CAM_FMT_RGB565)` as a **subscriber of the base
-    capture (`camera stream`)** (detached with `camera_unsubscribe`). Key points:
+    capture (`camera stream`)** (detached with `camera_unsubscribe`). The full
+    ownership picture is in [Ownership & state model](../architecture/ownership.md).
+    Key points:
 
     - `gui start` opens the window and subscribes the preview but does **not** start
       the base. It attaches immediately if the base is streaming (RGB565), else stays
@@ -119,8 +121,7 @@ Stopping is **cooperative**: the thread checks an `active` flag and parks itself
       so a preview-only action never cascades `net mjpeg` / `ai stream` down; it only stops /
       re-`camera res` / restarts the base when the preview is the sole subscriber.
 
-    See [Ownership & state model](../architecture/ownership.md) for the new model
-    (this section gets a full rewrite in #102).
+    See [Ownership & state model](../architecture/ownership.md) for the full new model.
 
 GUIX itself is brought up in `port/guix/guix_glue.c`; the camera UI app (widget tree + sink + preview control) is `ui/guix_camera_ui.c`. `gx_system_initialize()` + display/canvas/widget creation + `gx_system_start()` happen **exactly once** (the GUIX system thread and its global objects are never torn down).
 
@@ -148,20 +149,20 @@ The UI (`ui/guix_camera_ui.c`) is hand-coded (no GUIX Studio). The colour/font/p
 
 Data flow:
 
-1. A **push sink** (`guix_cam_sink`, `FRAME_POLICY_DROP`) is attached to the pipeline by `camera_preview_start()`; its `consume()` runs on the producer thread (prio 10).
+1. A **push sink** (`guix_cam_sink`, `FRAME_POLICY_DROP`) is attached to the base capture by `camera_subscribe(&guix_cam_sink, CAM_FMT_RGB565)`; its `consume()` runs on the producer thread (prio 10).
 2. `consume()` copies the ring slot into a **private view buffer `cam_view_buf` (max QVGA 320×240, non-cacheable `.sdram`; the live copy is the selected resolution, #69/#84) by DMA2D M2M** (`guix_display_copy_rgb565`, under ltdc_lock), then immediately `put`s the slot (synchronous — it never holds a pin across threads). Only on a successful copy does it set a coalesce flag and post `GX_EVENT_CAMERA_FRAME` to the root (`gx_system_event_send`, thread-safe). A failed send leaves the flag clear so the next frame retries (no freeze).
 3. The GUIX system thread (prio 14) **root event handler** receives `GX_EVENT_CAMERA_FRAME` and calls `gx_system_dirty_mark(cam_icon)` (dirty marking is GUIX-thread-only — other threads only send events).
 4. Redrawing `cam_icon` (a `GX_ICON` on the sole screen at (80,16)) calls `guix_pixelmap_draw`, which **blits the view buffer into the back buffer by DMA2D M2M at native scale**; `guix_buffer_toggle` then presents it tear-free via SRCR.VBR.
 
 The **single view buffer** decouples GUIX redraws (touch, screen change, first show) from the ring slot lifetime. The slot→view and view→back blits are both **serialized DMA2D under ltdc_lock**, so even though the producer (prio 10) can preempt GUIX (prio 14) there is no intra-frame tear (ltdc_lock is TX_INHERIT, which also prevents priority inversion).
 
-**Ownership model** (same shape as `ltdc_gui_take`): while the preview runs, `cam_ext_sink` is set and the public `camera stream start/stop` are refused (`CAM_ERR_STATE`), and `camera res/format/set` return `CAM_ERR_BUSY`. The **async teardown** (DCMI overrun etc.) also detaches and releases `cam_ext_sink`, so a later `frame_pipeline_init` never memsets a still-attached sink. **Escape hatch**: to run those shell commands, `gui stop` tears the UI down (releasing ownership) → run the command → `gui start` resumes (#61).
+**Ownership model (#100/#101: subscriber cascade)**: the preview does NOT **own** the DCMI — it attaches via `camera_subscribe(&guix_cam_sink, CAM_FMT_RGB565)` as an **RGB565 subscriber of the base capture (`camera stream`)** (detached with `camera_unsubscribe`). `gui start` does not start the base; it attaches immediately if the base is streaming (RGB565), otherwise stays enabled + idle until the next `camera stream start`, and while the base is off the last frame **freezes**. `gui stop` only unsubscribes (it stops **neither the base nor the AI**). While the base is ON, `camera res/format/fps/probe/off` return `CAM_ERR_BUSY` on the base side (configure after `camera stream stop`). The **async teardown (cascade)** — a DCMI overrun etc. — calls every subscriber's `close()`, but the preview stays enabled and auto-re-attaches.
 
-**Autostart and start/stop race (#61)**: the preview probe/configure is blocking I2C, so `camera_ui_start()` posts `GX_EVENT_CAMERA_AUTOSTART` and the **GUIX thread** runs `camera_preview_start()` in that handler (shared by boot and `gui start`). A volatile-flag protocol guards the GUIX-thread start against a shell-thread `gui stop`:
+**Autostart and start/stop race (#61)**: the preview subscribe (a geometry sync that includes a probe) can involve blocking I2C, so `camera_ui_start()` posts `GX_EVENT_CAMERA_AUTOSTART` and the **GUIX thread** runs `preview_subscribe()` (which calls `camera_subscribe` internally) in that handler (shared by boot and `gui start`). A volatile-flag protocol guards the GUIX-thread start against a shell-thread `gui stop`:
 
-- the AUTOSTART handler no-ops on `stop_requested || !guix_is_up() || start_in_progress || preview_running` (`stop_requested` is cleared only in `camera_ui_start` before the post; the handler never clears it).
-- `camera_ui_stop()` sets `stop_requested=1` then **always** calls `camera_preview_stop()` (which serialises on `cam_lock`, waiting out a probe in progress, and stops only if we own the stream) + a bounded drain.
-- if a stop races a start mid-probe, the handler re-checks `stop_requested` after a successful start and rolls back immediately (without latching `preview_running`).
+- the AUTOSTART handler no-ops on `stop_requested || !guix_is_up()` (`stop_requested` is cleared only in `camera_ui_start` before the post; the handler never clears it).
+- `camera_ui_stop()` sets `stop_requested=1`, then **always** calls `camera_unsubscribe(&guix_cam_sink)` + a bounded drain (the base keeps running).
+- boot subscribes the preview and then starts the base once (`base_autostarted`, a live preview out of the box).
 
 During the probe (~150-250 ms with a camera, ~1 s without) GUIX dispatch stalls, but the LTDC frame buffer was blanked black at boot so it reads as black→live; the iwdg (prio 5) and touch (prio 13) threads run independently, so the watchdog is unaffected.
 
@@ -193,12 +194,12 @@ Putting the settings on their own page (rather than an overlay on top of the liv
 
 ## Face-detect overlay (#83, Epic #80 P4)
 
-`gui overlay on` **draws green face-detection bounding boxes onto the live preview** (`gui overlay off` clears them, default OFF; bare `gui overlay` prints the state + inference stats). The preview frames are fed into BlazeFace-128 (the same inference stack as the `ai` command, see [AI inference](../ai/inference.md)) and the returned face boxes are composited onto the image. Inference runs at ~1.5 fps / priority-18 best-effort while the preview stays at ~15 fps (boxes refresh as each inference completes). The worker's near-continuous bank3 (activation) SDRAM traffic (~93 % CPU) can in principle starve the DCMI DMA and overrun it, but QVGA (the largest preview since #84) has enough bandwidth headroom not to overrun; the overrun auto-recovery below remains as a safety net.
+**While `ai stream` is running, green face-detection bounding boxes are always drawn onto the live preview** (#100 removed the dedicated `gui overlay` command; gated on `nn_camera_running()`). The AI (nncam) is an **independent subscriber** of the same base capture as the GUI preview: it consumes RGB565 frames and feeds them into BlazeFace-128 (see [AI inference](../ai/inference.md)). Inference runs at ~1.5 fps / priority-18 best-effort while the preview stays at ~15 fps (boxes refresh as each inference completes). The worker's near-continuous bank3 (activation) SDRAM traffic (~93 % CPU) can in principle starve the DCMI DMA and overrun it ([#90](../ai/inference.md)).
 
-- **Infers while keeping single camera ownership (Approach A)**: `ai stream` owns the camera itself, so it is exclusive with the GUIX preview; the overlay instead **keeps GUIX as the camera owner** and feeds frames from the frame-consume path into inference (`nn_camera`'s external-feed mode `nn_camera_feed_start/feed/feed_abort`). The worker / staging (`.sdram.ai`) / BlazeFace decode / dets are shared with `ai stream` and gated by the single NN session guard: while the overlay runs, `ai bench` / `ai stream start` are refused and `ai stream stop` reports "use `gui overlay off`" (`nn_camera`'s CAMERA / FEED mode split).
-- **The box is drawn as part of the frame, on the GUIX thread**: the #59 B2 copy-forward re-stamps the camera rect from `cam_view_buf` on every flip, so a widget composited on top would be overwritten. The box is therefore burned **directly into `cam_view_buf` (under `ltdc_lock`) by `guix_display_cam_overlay_box()`**, from the GUIX thread's `GX_EVENT_CAMERA_FRAME` handler — NOT the camera producer: taking `ltdc_lock` per box on the producer (prio 10) delayed the DCMI DMA re-arm and caused overruns. It then propagates to both LTDC buffers via the same store / pixelmap-draw / corrective-refresh paths as the frame. Coordinates are normalized [0,1] (preprocessing squashes the full frame to 128×128 independently in x/y) and clamped; the next store overwrites the old box (so it clears on overlay-off or when a detection is lost). `cam_view_buf` is bank0 non-cacheable SDRAM, so the CPU writes are coherent with the DMA2D reads — no cache maintenance.
+- **GUI and AI are coupled by data only**: the GUI does not start or stop the AI — it reads `nn_camera_dets_get()` (the face boxes) read-only and draws them only while `nn_camera_running()`. Enabling/disabling the AI is the job of `ai stream start`/`stop` (the two are independent subscribers, #100/#101).
+- **The box is drawn as part of the frame, on the GUIX thread**: the #59 B2 copy-forward re-stamps the camera rect from `cam_view_buf` on every flip, so a widget composited on top would be overwritten. The box is therefore burned **directly into `cam_view_buf` (under `ltdc_lock`) by `guix_display_cam_overlay_box()`**, from the GUIX thread's `GX_EVENT_CAMERA_FRAME` handler — NOT the camera producer: taking `ltdc_lock` per box on the producer (prio 10) delayed the DCMI DMA re-arm and caused overruns. It then propagates to both LTDC buffers via the same store / pixelmap-draw / corrective-refresh paths as the frame. Coordinates are normalized [0,1] (preprocessing squashes the full frame to 128×128 independently in x/y) and clamped; the next store overwrites the old box (so it clears on `ai stream stop` or when a detection is lost). `cam_view_buf` is bank0 non-cacheable SDRAM, so the CPU writes are coherent with the DMA2D reads — no cache maintenance.
 - **Not frame-perfect**: the overlay draws the last completed inference, so a box lags the displayed frame by a few frames (acceptable for a live overlay).
-- **Lifecycle + overrun auto-recovery**: overlay on/off and the feed start/abort are serialized on `overlay_lock` (intent `overlay_wanted` vs active `overlay_on`) so concurrent shells and the async camera teardown cannot diverge them. A resolution change (#69) keeps the feed across the stop/restart (BlazeFace input is always 128×128; `preview_reformatting` distinguishes the deliberate teardown). **On a DCMI overrun the preview is auto-restarted** (GUIX-thread `GX_EVENT_CAMERA_RESTART`) and the overlay restored once the NN session frees; an escalating backoff drops the overlay after repeated rapid overruns and finally stops auto-restarting (`gui start` to recover).
+- **Overrun auto-recovery lives in the base capture (producer)** (#100): if a DCMI overrun takes down the base, the producer's `cam_stream_recover` re-arms in the same mode and the preview/AI subscribers auto-re-attach on seeing the close()/open() pair. Repeated overruns get an escalating backoff (after a set count it stops auto-recovering; `camera stream start` recovers). The GUI-specific backoff / `GX_EVENT_CAMERA_RESTART` are gone.
 - **480×272 was removed (#84)**: the full-panel 480×272 preview both stretched the image (the OV5640 non-uniformly scales its 4:3 sensor field to 16:9, so it came out horizontally stretched) and was bandwidth-heavy — its store (DMA2D bank1→bank0, 261 KB/frame) + DCMI (bank1) + inference (bank3) overran the DCMI, and the F746 bus matrix is round-robin with no per-master SDRAM QoS (RM0385 §2), so priority cannot help. QVGA (320×240) is correctly proportioned (4:3, no stretch) and has ~41 % less bank1 traffic, so the two remaining preview modes (QQVGA/QVGA) neither stretch nor overrun.
 
 ## Usage
@@ -214,7 +215,7 @@ sh> gui stop          # stop the UI + preview and hand the LCD back to `lcd`
 sh> lcd info          # after gui stop the lcd/touch/camera test commands work
 sh> camera capture    # ditto
 sh> gui start         # resume the camera UI (preview comes back)
-sh> gui overlay on    # draw face bboxes on the live preview (#83); off clears, bare shows state
+sh> ai stream start   # enable AI face detection -> face bbox drawn on the preview (#83; gui overlay removed)
 ```
 
 ## Implementation notes

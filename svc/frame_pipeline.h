@@ -4,11 +4,13 @@
  */
 /**
  * @file    frame_pipeline.h
- * @brief   Camera frame ring + sink dispatch (svc/ layer, issue #47 -- DESIGN
- *          PROPOSAL, no implementation yet).
+ * @brief   Camera frame ring + sink dispatch (svc/ layer, #47 design / #46
+ *          implementation; multi-sink cascade live since #100/#101).
  *
  * One producer (DCMI capture) publishes frames into an N-slot SDRAM ring; many
- * sinks consume them.  This is the @ref frame_desc data contract (frame.h) plus
+ * sinks consume them.  The base capture attaches an internal stats sink plus up
+ * to three external subscribers (GUIX preview / nncam / MJPEG) that attach and
+ * detach at runtime -- the "subscriber cascade" (Epic #99).  This is the @ref frame_desc data contract (frame.h) plus
  * the ownership/back-pressure mechanics, applied to frame distribution the same
  * way @ref fs_device (#34) abstracts media and @ref ym_source (#50) abstracts a
  * byte source.
@@ -28,7 +30,9 @@
  *   - push sinks (streaming: LTDC / Ethernet / VCP preview) register via
  *     frame_pipeline_attach() and get consume() called on each publish;
  *   - pull access (snapshot: save / send / stats) reads the latest published
- *     slot via frame_pipeline_read_latest() -- the generalised camera_frame_read.
+ *     slot via frame_pipeline_read_latest() (the generalised camera_frame_read),
+ *     or pins it with frame_pipeline_pin_latest() to copy a whole frame out of the
+ *     lock (camera save/send, #102).
  * A single on-demand `camera capture` is just the degenerate case: an N=1 ring,
  * no push sinks, one publish, pulled by read_latest -- so the existing
  * camera capture/frame_read/save/send keep their semantics unchanged.
@@ -247,6 +251,19 @@ void frame_pipeline_put(struct frame_pipeline *p, struct frame_sink *s,
  */
 int frame_pipeline_read_latest(struct frame_pipeline *p, uint32_t off,
                                void *dst, uint32_t len, uint32_t *gen);
+
+/**
+ * Pin the latest published slot (refcount++) and return its descriptor, or NULL
+ * when no frame has been published yet.  Unlike frame_pipeline_read_latest(), the
+ * whole-frame copy happens OUTSIDE the lock: the returned @ref frame_desc (its
+ * data/bytes/gen) stays valid until the caller releases the pin with exactly one
+ * frame_pipeline_put(p, NULL, desc) -- while pinned the slot is never re-acquired
+ * (refcount != 0) even after a newer publish moves `latest` off it, so the copy is
+ * tear-free without holding the pipeline lock across it.  Use for a one-shot
+ * snapshot of a live streamed frame (camera save/send) without stalling the
+ * producer's publish/DMA-repoint (#102).
+ */
+const struct frame_desc *frame_pipeline_pin_latest(struct frame_pipeline *p);
 
 /* ---- statistics (struct frame_stats defined above frame_pipeline) -------- */
 

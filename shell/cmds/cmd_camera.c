@@ -201,6 +201,31 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		cli_print(sh, "\r\n");
 	}
 
+	/* #102: attached subscribers + per-sink pipeline stats.  The base capture is a
+	   cascade of the internal stats sink plus the enabled gui/nncam/mjpeg
+	   subscribers; each attaches only while the base runs and its format matches. */
+	{
+		struct camera_sub_stat subs[CAMERA_MAX_SUB_STATS];
+		int nsub = camera_subscribers_snapshot(subs, CAMERA_MAX_SUB_STATS);
+
+		if (nsub == 0) {
+			cli_print(sh, "subscribers: none (base off)\r\n");
+		} else {
+			cli_print(sh, "subscribers:\r\n");
+			for (int i = 0; i < nsub; i++) {
+				cli_print(sh, "  %-6s %-6s %-8s "
+				          "delivered=%lu dropped=%lu errors=%lu\r\n",
+				          subs[i].name,
+				          cam_name_of(format_names, subs[i].fmt),
+				          subs[i].attached ? "attached"
+				                           : (subs[i].enabled ? "idle" : "-"),
+				          (unsigned long)subs[i].delivered,
+				          (unsigned long)subs[i].dropped,
+				          (unsigned long)subs[i].errors);
+			}
+		}
+	}
+
 	if (camera_get_settings(&cs) == 0) {
 		cli_print(sh, "-- settings (camera set) --\r\n");
 		print_settings(sh, &cs);
@@ -517,7 +542,6 @@ static int save_body(const struct fs_device *dev, struct cli_instance *sh,
 static int cmd_camera_save(struct cli_instance *sh, int argc, char **argv)
 {
 	const struct fs_device *dev;
-	struct camera_info ci;
 	UINT status;
 	int rc;
 
@@ -533,10 +557,13 @@ static int cmd_camera_save(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	}
 
-	/* Early no-frame check so we do not create an empty file; the per-row
-	   reads still fail cleanly if the frame is invalidated mid-save. */
-	if (camera_get_info(&ci) != 0 || !ci.frame_valid) {
-		cli_error(sh, "camera: %s\r\n", cam_strerror(CAM_ERR_NO_FRAME));
+	/* #102: refresh the stable buffer BEFORE opening the medium / creating the
+	   file, so we save the freshest frame (base ON: the latest streamed frame of
+	   any format, even with MJPEG/GUI subscribers; base OFF: the last `camera
+	   capture`) and never create an empty file when no frame is available. */
+	rc = camera_snapshot_latest();
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
 		return 1;
 	}
 
@@ -595,7 +622,16 @@ static int cmd_camera_send(struct cli_instance *sh, int argc, char **argv)
 	struct camera_info ci;
 	struct cam_send_ctx cc = { 0, 0, 0, 0 };
 	struct ym_source src;
+	int rc;
 
+	/* #102: refresh the stable buffer before sizing / starting the transfer (base
+	   ON: latest streamed frame; base OFF: last capture), and fail before the
+	   ymodem handshake when no frame is available. */
+	rc = camera_snapshot_latest();
+	if (rc != 0) {
+		cli_error(sh, "camera: %s\r\n", cam_strerror(rc));
+		return 1;
+	}
 	if (camera_get_info(&ci) != 0 || !ci.frame_valid) {
 		cli_error(sh, "camera: %s\r\n", cam_strerror(CAM_ERR_NO_FRAME));
 		return 1;
@@ -973,8 +1009,12 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "state:     %s\r\n",
 	          si.active ? "streaming"
 	                    : (si.err ? "stopped (overrun)" : "stopped"));
-	cli_print(sh, "frames:    %lu\r\n", (unsigned long)si.frames);
 	cli_print(sh, "elapsed:   %lu ms\r\n", (unsigned long)si.elapsed_ms);
+	/* #102: split the producer counters (frames the DCMI/DMA acquired + published)
+	   from the internal stats sink's per-sink delivery counters. */
+	cli_print(sh, "-- producer --\r\n");
+	cli_print(sh, "captured:  %lu\r\n", (unsigned long)si.captured);
+	cli_print(sh, "published: %lu\r\n", (unsigned long)si.frames);
 	if (si.elapsed_ms != 0) {
 		/* frames-per-second x10 (one decimal), no floating point */
 		uint32_t f10 = (uint32_t)((uint64_t)si.frames * 10000u /
@@ -983,8 +1023,6 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 		cli_print(sh, "fps:       %lu.%lu\r\n",
 		          (unsigned long)(f10 / 10u), (unsigned long)(f10 % 10u));
 	}
-	cli_print(sh, "delivered: %lu\r\n", (unsigned long)si.delivered);
-	cli_print(sh, "dropped:   %lu\r\n", (unsigned long)si.dropped);
 	cli_print(sh, "ovr dcmi:  %lu\r\n", (unsigned long)si.dcmi_ovr);
 	cli_print(sh, "ovr ring:  %lu\r\n", (unsigned long)si.ring_ovr);
 	cli_print(sh, "dma fe:    %lu\r\n", (unsigned long)si.dma_fe);
@@ -1000,6 +1038,10 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 	if (si.slots != 0)
 		cli_print(sh, "ring:      %lu slots x %lu B (arena #65)\r\n",
 		          (unsigned long)si.slots, (unsigned long)si.slot_bytes);
+	cli_print(sh, "-- stat sink (shell) --\r\n");
+	cli_print(sh, "delivered: %lu\r\n", (unsigned long)si.delivered);
+	cli_print(sh, "dropped:   %lu\r\n", (unsigned long)si.dropped);
+	cli_print(sh, "errors:    %lu\r\n", (unsigned long)si.stat_errors);
 	return 0;
 }
 
