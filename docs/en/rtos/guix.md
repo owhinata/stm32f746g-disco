@@ -110,6 +110,14 @@ Stopping is **cooperative**: the thread checks an `active` flag and parks itself
     - **DCMI overrun auto-recovery moved into the base capture (producer)**; the GUI
       backoff / `GX_EVENT_CAMERA_RESTART` are gone.
     - boot subscribes the preview and starts the base once (a live preview out of the box).
+    - **#101 (Phase 2)**: `gui start` reports the **base capture state**, not the deferred
+      attach result (base off = "preview idle; no camera capture" / JPEG = "preview
+      unavailable … is JPEG" / RGB565 = "live camera preview"), fixing the #97 case where
+      it claimed "live preview" while nothing rendered.
+    - **#101 (Phase 2)**: the settings-page resolution button (#69) is **refused while any
+      subscriber other than the preview is attached** (`camera_other_subscribers_attached()`),
+      so a preview-only action never cascades `net mjpeg` / `ai stream` down; it only stops /
+      re-`camera res` / restarts the base when the preview is the sole subscriber.
 
     See [Ownership & state model](../architecture/ownership.md) for the new model
     (this section gets a full rewrite in #102).

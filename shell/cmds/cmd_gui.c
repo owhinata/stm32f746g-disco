@@ -27,6 +27,7 @@
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
+#include "camera.h"          /* camera_streaming / camera_get_mode (#97 preview state) */
 #include "guix_glue.h"
 #include "guix_camera_ui.h"
 
@@ -48,7 +49,26 @@ static int cmd_gui_start(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "gui: failed to start GUIX\r\n");
 		return 1;
 	}
-	cli_print(sh, "gui: running -- live camera preview (gui stop to exit)\r\n");
+	/* #97/#101: the preview attach is deferred to the GUIX thread, so report the
+	   preview state from the base capture the window will follow -- never claim
+	   "live preview" when the base is off (frozen) or JPEG (no raster to render).
+	   The preview goes live the moment an RGB565 `camera stream` runs. */
+	{
+		struct camera_mode m;
+
+		if (!camera_streaming())
+			cli_print(sh, "gui: running -- preview idle; no camera capture "
+			          "(run `camera stream start`)\r\n");
+		else if (camera_get_mode(&m) == 0 && m.is_jpeg)
+			cli_print(sh, "gui: running -- preview unavailable; camera stream "
+			          "is JPEG (needs RGB565)\r\n");
+		else if (camera_get_mode(&m) == 0 && m.format != CAM_FMT_RGB565)
+			cli_print(sh, "gui: running -- preview unavailable; camera stream "
+			          "is not RGB565\r\n");
+		else
+			cli_print(sh, "gui: running -- live camera preview "
+			          "(gui stop to exit)\r\n");
+	}
 	return 0;
 }
 

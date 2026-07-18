@@ -116,15 +116,16 @@ state/frame only.
   `cam_stream_active` or `cam_ext_sink` is set. A GUIX preview is itself a
   stream, so it sets `cam_stream_active`. Read-only paths (`info`, `save`,
   `send`, `stream stats`) only take the camera lock and are always allowed.
-- **NET-MJPEG** (#49 P5) — `net mjpeg start` is another `cam_ext_sink` owner
-  (owning the DCMI in JPEG), behaving like the CAM-STREAM column.
-  `camera_mjpeg_start` goes through the same ownership gate (via
-  `stream_start_locked`), so it returns `CAM_ERR_BUSY` if a GUIX preview /
-  `camera stream` owns the DCMI, and while MJPEG runs `gui start` / `camera
-  stream start` / `camera set` are BUSY. Exclusion falls out of the single-owner
-  model with no extra state (the `port/netxduo/nx_mjpeg.c` eth_sink is a
-  synchronous copy sink -- in-flight 0 -- so the producer's async teardown stays
-  safe).
+- **NET-MJPEG** (#49 P5, **made a subscriber in #101 Phase 2**) — `net mjpeg start`
+  does NOT own the base; it is a **JPEG-class subscriber that attaches to a running
+  JPEG base** (`camera_subscribe_oneshot(&eth_sink, CAM_FMT_JPEG)`). With the base
+  off or on an RGB565 base it returns an explicit reason (#97 fixed). A `camera
+  stream stop` / `camera off` (non-recover stop) cascades it fully released =
+  auto-stopped; a transient overrun pauses then resumes it (`camera_subscribed()` is
+  the single source of truth). `net mjpeg stop` only detaches its own sink (the base
+  keeps running). The `port/netxduo/nx_mjpeg.c` eth_sink is a synchronous copy sink
+  (in-flight 0) so the producer's async teardown stays safe. (The old
+  `camera_mjpeg_start` base-owning gate is gone; full rewrite in #102.)
 - **Touch** — there is no touch ownership flag (`guix_is_up()` is the proxy).
   Two things protect the shell: (1) `touch_read()` (`port/touch/touch.c`) drops
   the FT5336 all-ones "not touched" sentinel — an out-of-panel `0xFFF/0xFFF`

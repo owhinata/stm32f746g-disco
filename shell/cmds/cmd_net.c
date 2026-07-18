@@ -22,8 +22,8 @@
 #include "nx_glue.h"
 #include "nx_mjpeg.h"
 
+#include <stddef.h>   /* size_t / NULL */
 #include <stdint.h>
-#include <string.h>   /* strcmp for the mjpeg-resolution name lookup */
 
 static const char *speed_name(enum eth_speed s)
 {
@@ -324,52 +324,39 @@ static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 
 /* ---- MJPEG-over-HTTP camera streaming (#49 P5) --------------------------- */
 
-static const struct {
-	const char     *name;
-	enum camera_res res;
-} mjpeg_res_names[] = {
-	{ "qqvga", CAM_RES_QQVGA }, { "qvga", CAM_RES_QVGA },
-	{ "vga", CAM_RES_VGA },
-};
-
 static int cmd_net_mjpeg_start(struct cli_instance *sh, int argc, char **argv)
 {
-	enum camera_res res = CAM_RES_QVGA;     /* default */
 	int rc;
 
+	(void)argc;
+	(void)argv;
 	if (!net_ip_ready(sh))
 		return 1;
-	if (argc >= 2) {
-		size_t i;
-
-		for (i = 0; i < sizeof mjpeg_res_names / sizeof mjpeg_res_names[0]; i++) {
-			if (strcmp(argv[1], mjpeg_res_names[i].name) == 0) {
-				res = mjpeg_res_names[i].res;
-				break;
-			}
-		}
-		if (i == sizeof mjpeg_res_names / sizeof mjpeg_res_names[0]) {
-			cli_error(sh, "net: bad resolution '%s' "
-			          "(qqvga|qvga|vga)\r\n", argv[1]);
-			return 1;
-		}
-	}
-	rc = nx_mjpeg_start(res);
+	/* #101: MJPEG is a JPEG-class subscriber -- it attaches to the running base
+	   (resolution follows the base), it no longer owns/starts the DCMI.  Report the
+	   precise reason on a format/state clash instead of silently opening a dead port
+	   (the #97 class of bug). */
+	rc = nx_mjpeg_start();
 	if (rc == -2) {
 		cli_error(sh, "net: mjpeg already running\r\n");
 		return 1;
 	}
-	if (rc == CAM_ERR_BUSY) {
-		cli_error(sh, "net: camera busy (owned by gui preview or stream); "
-		          "stop it first\r\n");
+	if (rc == NX_MJPEG_NO_CAPTURE) {
+		cli_error(sh, "net: no camera capture; run `camera format jpeg` then "
+		          "`camera stream start` first\r\n");
+		return 1;
+	}
+	if (rc == NX_MJPEG_FMT_CLASH) {
+		cli_error(sh, "net: camera stream is raster (not JPEG); mjpeg needs JPEG "
+		          "-- `camera stream stop`, `camera format jpeg`, restart\r\n");
 		return 1;
 	}
 	if (rc != 0) {
 		cli_error(sh, "net: mjpeg start failed (%d)\r\n", rc);
 		return 1;
 	}
-	cli_print(sh, "net: mjpeg streaming at http://<board-ip>:80/ (%s)\r\n",
-	          argc >= 2 ? argv[1] : "qvga");
+	cli_print(sh, "net: mjpeg streaming at http://<board-ip>:80/ "
+	          "(follows camera stream)\r\n");
 	return 0;
 }
 
@@ -390,7 +377,7 @@ static int cmd_net_mjpeg_stop(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "net: mjpeg stop timed out\r\n");
 		return 1;
 	}
-	cli_print(sh, "net: mjpeg stopped\r\n");
+	cli_print(sh, "net: mjpeg detached (camera stream continues)\r\n");
 	return 0;
 }
 
@@ -418,10 +405,10 @@ static int cmd_net_mjpeg_stats(struct cli_instance *sh, int argc, char **argv)
 }
 
 CLI_SUBCMD_SET_CREATE(net_mjpeg_subcmds,
-	CLI_CMD_ARG(start, NULL,
-	            "start MJPEG-over-HTTP on :80 [res] (qqvga|qvga|vga, "
-	            "default qvga)", cmd_net_mjpeg_start, 1, 1),
-	CLI_CMD(stop, NULL, "stop MJPEG streaming and release the camera",
+	CLI_CMD(start, NULL,
+	        "attach MJPEG-over-HTTP on :80 to the running JPEG camera stream",
+	        cmd_net_mjpeg_start),
+	CLI_CMD(stop, NULL, "detach MJPEG (the camera stream keeps running)",
 	        cmd_net_mjpeg_stop),
 	CLI_CMD(stats, NULL, "MJPEG client / frame / drop counters",
 	        cmd_net_mjpeg_stats),

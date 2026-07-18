@@ -582,15 +582,24 @@ static void camera_ui_autostart(void)
 }
 
 /* settings: cycle to the next preview resolution.  The base owns the resolution
-   now (#100), so change it by stopping the base (cascade -- other subscribers pause
-   and re-attach), setting the new res while off, then restarting.  Runs on the GUIX
-   thread.  camera_stream_stop() is async, so wait until the producer is idle before
-   set_format (else CAM_ERR_BUSY, #69). */
+   now (#100), so change it by stopping the base (cascade), setting the new res while
+   off, then restarting.  Runs on the GUIX thread.  camera_stream_stop() is async, so
+   wait until the producer is idle before set_format (else CAM_ERR_BUSY, #69).
+   #101: refuse while any OTHER subscriber is attached -- a cascade stop would tear
+   net mjpeg / ai down as a side effect of a preview-only action.  Best-effort
+   (a concurrent manual attach after the check is a benign user race). */
 static void cycle_resolution(void)
 {
 	int next = (cur_res_idx + 1) % N_RES;
-	bool was_streaming = camera_streaming() != 0;
+	bool was_streaming;
 	int i;
+
+	if (camera_other_subscribers_attached(&guix_cam_sink)) {
+		LOG_WRN("resolution change blocked: other subscribers attached "
+		        "(stop net mjpeg / ai stream first)");
+		return;
+	}
+	was_streaming = camera_streaming() != 0;
 
 	if (was_streaming) {
 		camera_stream_stop();                 /* cascade */

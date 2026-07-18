@@ -149,18 +149,28 @@ camera frame pipeline's (#46/#47) **eth_sink** -- the real network consumer of
 the 30 fps JPEG path.
 
 ```
-net mjpeg start [res]   # own the camera in JPEG + listen on :80 (res default qvga; qqvga|qvga|vga)
-net mjpeg stop          # stop streaming, release the camera
-net mjpeg stats         # client / sent frames+bytes / drops / errors
+# Bring the base up in JPEG first: camera format jpeg -> camera stream start
+net mjpeg start   # attach to the running JPEG base + listen on :80 (res follows the base)
+net mjpeg stop    # detach this sink (the base keeps running)
+net mjpeg stats   # client / sent frames+bytes / drops / errors
 ```
 
 Open `http://<board-ip>/` in a browser for the live stream. One client at a time (N=1).
 
-- **Explicit command**: `net mjpeg start` keeps the camera owned in JPEG (whether
-  or not a client is connected) and listens on :80. Refused with `CAM_ERR_BUSY`
-  while a GUIX preview / `camera stream` owns the DCMI (stop it first). Ownership
-  is the existing single-owner model (`cam_ext_sink`), auto-exclusive with the
-  camera stream / GUI (#73).
+- **JPEG-class subscriber (Epic #99 Phase 2, #101)**: `net mjpeg start` does NOT own
+  or start the base. It attaches via `camera_subscribe_oneshot(&eth_sink,
+  CAM_FMT_JPEG)` and listens on :80 only while the base is already streaming JPEG
+  (`camera format jpeg` -> `camera stream start`). With the base off it returns
+  `net: no camera capture …`; with an RGB565 (raster) base it returns `net: camera
+  stream is raster (not JPEG) …` -- an explicit reason, not the old silently-swallowed
+  `CAM_ERR_BUSY` (#97).
+- **Follows cascade / overrun**: `camera stream stop` / `camera off` (a non-recover
+  stop) cascades the sink detach and auto-stops mjpeg (the HTTP client disconnects);
+  the base fully releases this oneshot subscriber, so re-streaming needs another
+  `net mjpeg start`. A transient DCMI overrun (the base auto-recovers) pauses and
+  resumes mjpeg (`camera_subscribed()` is the single source of truth that tells the
+  two apart, avoiding a stale-close race). `net mjpeg stop` only detaches its own
+  sink; the base keeps running.
 - **eth_sink = synchronous copy sink**: the pipeline consume() (producer-thread
   context) does no heavy HTTP send -- it memcpy's the JPEG into a private buffer
   (`.sdram.eth`, JPEG budget = 256 KB) and puts the pin immediately (in-flight is

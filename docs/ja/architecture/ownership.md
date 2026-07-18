@@ -105,13 +105,8 @@ Copyright (c) 2026 ThreadX Shell Project
   active)` と表示）を返す。GUIX preview 自体が stream なので `cam_stream_active` を
   立てる。read-only 経路（`info`/`save`/`send`/`stream stats`）はカメラロックのみ取り
   常に許可。
-- **NET-MJPEG**（#49 P5）— `net mjpeg start` はもう一人の `cam_ext_sink` 所有者
-  （JPEG モードの DCMI 所有）として CAM-STREAM 列と同等に振る舞う。`camera_mjpeg_start`
-  は `stream_start_locked` 経由で同じ所有権ゲートを通るので、GUIX preview / `camera
-  stream` が DCMI を握っていれば `CAM_ERR_BUSY`。逆に MJPEG 稼働中は `gui start` /
-  `camera stream start` / `camera set` 等が BUSY になる。単一所有モデルを 1 ビットも
-  変えずに排他が成立する（`port/netxduo/nx_mjpeg.c` の eth_sink は同期 copy sink ゆえ
-  in-flight 0、producer の async teardown もそのまま安全）。
+- **NET-MJPEG**（#49 P5、**#101 Phase 2 で subscriber 化**）— `net mjpeg start` は base を
+  所有せず、**稼働中の JPEG base に attach する JPEG-class subscriber**（`camera_subscribe_oneshot(&eth_sink, CAM_FMT_JPEG)`）。base off / RGB565 base なら明示エラー（#97 解消）。`camera stream stop`/`camera off`（非 recover 停止）の cascade で完全リリース＝自動停止、一過性 overrun では pause→再開（`camera_subscribed()` を単一真実源に判別）。`net mjpeg stop` は自分の sink を detach するだけ（base 継続）。eth_sink は同期 copy sink ゆえ in-flight 0、producer の async teardown もそのまま安全。（旧 `camera_mjpeg_start` の base 所有ゲートは撤去。全面改訂は #102。）
 - **Touch** — タッチの所有権フラグは無い（`guix_is_up()` が代理）。shell は 2 段で守る:
   (1) `touch_read()`（`port/touch/touch.c`）が FT5336 の全 1「タッチ無し」センチネル
   — idle や直後リリースのコントローラが *非ゼロ* の status count とともに報告する

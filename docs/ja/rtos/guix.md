@@ -98,6 +98,8 @@ DMA2D は単一エンジンで、`lcd` コマンド（`ltdc_display.c`）と GUI
     - **`gui overlay` コマンドは廃止**: `ai stream` 稼働中は preview に常時 bbox を描画（`nn_camera_running()` で判定、下記「顔検出 overlay」節の FEED モードは撤去）。
     - **DCMI overrun 自動復帰は base capture(producer)側**へ移設。GUI 側の backoff / `GX_EVENT_CAMERA_RESTART` は撤去。
     - boot は preview を subscribe した上で base を 1 回自動起動（out-of-box で live preview）。
+    - **#101（Phase 2）**: `gui start` は deferred な attach 結果ではなく **base capture の状態**を報告する（base off=「preview idle; no camera capture」/ JPEG=「preview unavailable … is JPEG」/ RGB565=「live camera preview」）。「live preview」と表示して実際は映らない #97 の握り潰しを解消。
+    - **#101（Phase 2）**: 設定ページの解像度ボタン（#69）は **gui 以外の subscriber が attach 中は拒否**（`camera_other_subscribers_attached()` で判定、`net mjpeg` / `ai stream` を巻き込む cascade stop を防ぐ）。単独 subscriber のときだけ base stop→`camera res`→restart。
 
     詳細な新モデルは [所有権・状態モデル](../architecture/ownership.md) を参照（#102 で本節も全面改訂）。
 

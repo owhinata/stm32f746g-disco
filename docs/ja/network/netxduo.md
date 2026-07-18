@@ -127,17 +127,18 @@ OV5640 のハードウェア JPEG フレームを **`multipart/x-mixed-replace`*
 （#46/#47）の **eth_sink**（30fps JPEG パスの本命ネット消費先）。
 
 ```
-net mjpeg start [res]   # camera を JPEG で所有 + :80 listen（res 既定 qvga、qqvga|qvga|vga）
-net mjpeg stop          # 配信停止・camera 解放
-net mjpeg stats         # client 接続 / 配信 frames・bytes / drop / error
+# 事前に base を JPEG で起動: camera format jpeg → camera stream start
+net mjpeg start   # 稼働中の JPEG base に attach + :80 listen（解像度は base に追従）
+net mjpeg stop    # 自分の sink を detach（base は継続）
+net mjpeg stats   # client 接続 / 配信 frames・bytes / drop / error
 ```
 
 ブラウザで `http://<board-ip>/` を開くとライブ映像が見える。N=1 単一クライアント。
 
-- **明示コマンド方式**: `net mjpeg start` が camera を JPEG モードで所有し続け（client の有無に
-  関わらず）、:80 で listen。GUIX preview / `camera stream` が DCMI を所有中は `CAM_ERR_BUSY` で
-  拒否（`gui stop` 等が必要）。所有権は既存の単一所有モデル（`cam_ext_sink`）で、camera stream /
-  GUI と自動的に排他（#73）。
+- **JPEG-class subscriber（Epic #99 Phase 2, #101）**: `net mjpeg start` は base を**所有/起動しない**。
+  base が JPEG で稼働中（`camera format jpeg` → `camera stream start`）のときだけ `camera_subscribe_oneshot(&eth_sink, CAM_FMT_JPEG)` で attach し :80 で listen する。
+  base off なら **`net: no camera capture …`**、RGB565（raster）base なら **`net: camera stream is raster (not JPEG) …`** と**明示エラー**（旧 `CAM_ERR_BUSY` の握り潰しを構造解消、#97）。
+- **cascade / overrun への追従**: `camera stream stop` / `camera off`（非 recover 停止）は cascade で eth_sink を detach し **mjpeg を自動停止**（HTTP 切断）。この oneshot subscriber は base 側で完全リリースされるので、再配信には `net mjpeg start` の再実行が要る。一過性の DCMI overrun（base 自動復帰）では mjpeg は**一時停止して再開**する（`camera_subscribed()` を単一真実源に stop/pause を判別、stale-close race 回避）。`net mjpeg stop` は自分の sink を detach するだけで base は継続。
 - **eth_sink = 同期 copy sink**: frame pipeline の consume（producer スレッド文脈）は重い HTTP 送信を
   せず、JPEG フレームを private バッファ（`.sdram.eth`、JPEG budget=256KB）へ memcpy して**即 put**
   （in-flight 常に 0＝GUIX sink と同じ同期型）。これで camera の async teardown（DCMI overrun）が

@@ -24,7 +24,7 @@
 
 #include "nx_mjpeg.h"
 #include "nx_glue.h"         /* nx_net_ip / nx_net_pool / nx_net_is_up */
-#include "camera.h"          /* camera_mjpeg_start / camera_mjpeg_stop / camera_frame_put */
+#include "camera.h"          /* camera_subscribe_oneshot / camera_subscribed / camera_frame_put */
 #include "frame_pipeline.h"  /* struct frame_sink / frame_desc / FRAME_POLICY_* */
 
 #define LOG_TAG "mjpeg"
@@ -307,35 +307,58 @@ static void mjpeg_entry(ULONG arg)
 		if (ip == NULL || mjpeg_socket_setup(ip) != 0) {
 			mjpeg_run = 0;
 			mjpeg_active = 0;
-			continue;              /* camera_mjpeg_stop is done by nx_mjpeg_*      */
+			continue;              /* start's !listening path unsubscribes (#101) */
 		}
 		mjpeg_listening = 1;       /* nx_mjpeg_start() waits for this              */
 		LOG_INF("listening on :%u (http mjpeg)", (unsigned)NX_MJPEG_PORT);
 
-		/* Also exit if the camera producer died (DCMI overrun -> eth_close): its
-		   async teardown already released camera ownership, so self-stop cleanly
-		   rather than listen with no frames. */
-		while (mjpeg_run && !producer_dead) {
-			if (nx_tcp_server_socket_accept(&sock, MJPEG_ACCEPT_TICKS)
-			    != NX_SUCCESS)
-				continue;          /* timeout -> re-accept (re-checks run)        */
-			mstats.conns++;
-			LOG_INF("client connected");
-			mjpeg_serve();
-			LOG_INF("client disconnected (%lu frames)",
-			        (unsigned long)mstats.sent_frames);
-			nx_tcp_socket_disconnect(&sock, NX_IP_PERIODIC_RATE);
-			nx_tcp_server_socket_unaccept(&sock);
-			if (nx_tcp_server_socket_relisten(ip, NX_MJPEG_PORT, &sock)
-			    != NX_SUCCESS) {
-				LOG_ERR("relisten failed");
+		/* Serve until an explicit `net mjpeg stop` (mjpeg_run=0) or a non-recover
+		   base teardown.  A transient DCMI overrun (base auto-recovering, #100)
+		   pauses serving and resumes without dropping the listen socket;
+		   camera_subscribed() is the single source of truth that tells "released
+		   for good" from "paused for recovery" (#101, avoids the stale-close race).
+		   A relisten failure breaks out to a full socket re-setup. */
+		while (mjpeg_run) {
+			/* Accept + serve while the base is delivering (producer_dead=0). */
+			while (mjpeg_run && !producer_dead) {
+				if (nx_tcp_server_socket_accept(&sock, MJPEG_ACCEPT_TICKS)
+				    != NX_SUCCESS)
+					continue;      /* timeout -> re-accept (re-checks run)    */
+				mstats.conns++;
+				LOG_INF("client connected");
+				mjpeg_serve();
+				LOG_INF("client disconnected (%lu frames)",
+				        (unsigned long)mstats.sent_frames);
+				nx_tcp_socket_disconnect(&sock, NX_IP_PERIODIC_RATE);
+				nx_tcp_server_socket_unaccept(&sock);
+				if (nx_tcp_server_socket_relisten(ip, NX_MJPEG_PORT, &sock)
+				    != NX_SUCCESS) {
+					LOG_ERR("relisten failed");
+					break;     /* -> re-setup the socket (below)         */
+				}
+			}
+			if (!mjpeg_run)
+				break;             /* explicit stop                          */
+			if (!producer_dead)
+				break;             /* relisten failed -> full socket re-setup */
+
+			/* producer_dead: the base tore this sink down.  Released (a
+			   non-recover base stop) -> fully stop; still enabled (an overrun
+			   recovery is in flight) -> pause for the re-open (eth_open clears
+			   producer_dead) or a recovery giveup (camera_subscribed -> 0). */
+			if (!camera_subscribed(&eth_sink)) {
+				LOG_WRN("camera base stopped -- auto-stopping mjpeg");
+				mjpeg_run = 0;
 				break;
 			}
-		}
-		if (producer_dead) {
-			/* camera ownership is already gone; just stop the server cleanly */
-			LOG_WRN("camera producer stopped -- auto-stopping mjpeg");
-			mjpeg_run = 0;
+			LOG_INF("camera base overrun -- mjpeg paused for recovery");
+			while (mjpeg_run && producer_dead
+			       && camera_subscribed(&eth_sink))
+				tx_thread_sleep(20);
+			if (mjpeg_run && !producer_dead)
+				LOG_INF("camera base recovered -- mjpeg resumed");
+			/* else: stop (mjpeg_run=0) or giveup (camera_subscribed=0,
+			   producer_dead still 1) -> the outer while re-checks and stops. */
 		}
 
 		/* Stopped: tear the socket down and park. */
@@ -350,8 +373,9 @@ static void mjpeg_entry(ULONG arg)
 
 /* ---- public API ----------------------------------------------------------- */
 
-int nx_mjpeg_start(enum camera_res res)
+int nx_mjpeg_start(void)
 {
+	struct camera_mode m;
 	int rc;
 
 	if (!nx_net_is_up())
@@ -359,10 +383,18 @@ int nx_mjpeg_start(enum camera_res res)
 	if (mjpeg_run || mjpeg_active)
 		return -2;                  /* running, or still tearing down a stop       */
 
+	/* #101: MJPEG is a JPEG-class subscriber -- it no longer owns/starts the base.
+	   The base must already be streaming JPEG (`camera format jpeg` + `camera stream
+	   start`).  Report the precise reason so `net mjpeg start` never silently opens a
+	   port that serves no frames (the #97 class of bug). */
+	if (!camera_streaming())
+		return NX_MJPEG_NO_CAPTURE;
+	if (camera_get_mode(&m) != 0 || !m.is_jpeg)
+		return NX_MJPEG_FMT_CLASH;  /* base is raster: mjpeg needs JPEG            */
+
 	/* Create the ThreadX objects exactly once (idempotent across start/stop).  The
-	   thread parks on !mjpeg_run, so creating it before the camera is taken is
-	   harmless and keeps a failed start (camera busy) from re-creating the same
-	   semaphore control block. */
+	   thread parks on !mjpeg_run, so creating it before the sink is attached is
+	   harmless and keeps a failed start from re-creating the same semaphore. */
 	if (!mjpeg_created) {
 		if (tx_semaphore_create(&frame_sem, "mjpeg", 0) != TX_SUCCESS)
 			return -3;
@@ -376,26 +408,39 @@ int nx_mjpeg_start(enum camera_res res)
 		mjpeg_created = 1;
 	}
 
-	/* Take the camera in JPEG + attach the sink: refused (CAM_ERR_BUSY) when a
-	   GUIX preview / plain stream owns the DCMI.  The attach calls eth_open(),
-	   which resets the session state + stats.  Only after this succeeds do we claim
-	   the lifecycle (mjpeg_run wakes the parked thread). */
-	rc = camera_mjpeg_start(&eth_sink, res);
+	/* Attach as a non-persistent JPEG subscriber to the running base.  The pre-check
+	   above is just for a precise error message: camera_subscribe_oneshot() is STRICT
+	   (attaches to a live JPEG base under one cam_lock, or fails), so if the base
+	   stopped since the pre-check this returns an error rather than a ghost idle
+	   registration (#101).  A successful attach calls eth_open(), which resets the
+	   session state + stats and clears producer_dead.  Only then do we claim the
+	   lifecycle (mjpeg_run wakes the parked thread). */
+	rc = camera_subscribe_oneshot(&eth_sink, CAM_FMT_JPEG);
 	if (rc != 0)
 		return rc;
 
-	cur_res = (uint8_t)res;
+	cur_res = m.res;
 	mjpeg_listening = 0;
 	mjpeg_active = 1;
 	mjpeg_run = 1;
 
 	/* Wait (bounded ~1 s) for the thread to actually listen, so success means the
-	   port is open and the camera is owned. */
+	   port is open and the sink is attached. */
 	for (int i = 0; i < 100 && mjpeg_active && !mjpeg_listening; i++)
 		tx_thread_sleep(10);
 	if (!mjpeg_listening) {
 		mjpeg_run = 0;
-		camera_mjpeg_stop(&eth_sink);
+		camera_unsubscribe(&eth_sink);
+		return -3;
+	}
+	/* #101: the base could have been torn down (cascade released this oneshot sink)
+	   while the thread was coming up -- don't report success for a stream that has
+	   already stopped.  camera_subscribed() is the single source of truth. */
+	if (!camera_subscribed(&eth_sink)) {
+		mjpeg_run = 0;
+		for (int i = 0; i < 30 && mjpeg_active; i++)
+			tx_thread_sleep(10);
+		camera_unsubscribe(&eth_sink);
 		return -3;
 	}
 	return 0;
@@ -405,11 +450,14 @@ int nx_mjpeg_stop(void)
 {
 	if (!mjpeg_run && !mjpeg_active)
 		return -1;
-	/* Order (D3a): stop output gating, then stop, then release the camera. */
+	/* Order (D3a): stop output gating, then stop, then detach the sink.  #101:
+	   unsubscribe DETACHES ONLY (the base keeps running for other subscribers); a
+	   base cascade stop is a separate `camera stream stop`.  Idempotent if the base
+	   already released this oneshot sink (in-flight is always 0). */
 	client_connected = 0;
 	mjpeg_run = 0;
 	(void)tx_semaphore_put(&frame_sem);   /* wake the serve loop if waiting        */
-	camera_mjpeg_stop(&eth_sink);       /* detach + stop camera (in-flight = 0)  */
+	camera_unsubscribe(&eth_sink);        /* detach the sink; base keeps running   */
 
 	/* Wait (bounded) for the thread to tear the socket down and park. */
 	for (int i = 0; i < 30 && mjpeg_active; i++)

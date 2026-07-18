@@ -335,8 +335,16 @@ struct cam_sub {
 	uint8_t            fmt;      /* enum camera_format consumed             */
 	uint8_t            enabled;  /* subscriber intent (registered)          */
 	uint8_t            attached; /* linked in cam_pipe.sinks (cam_lock)     */
+	uint8_t            oneshot;  /* #101: non-persistent (MJPEG) -- a non-recover
+	                               stop fully releases it (see
+	                               cam_subs_release_oneshot); persistent subs
+	                               (gui/nncam) stay enabled and re-attach. */
 };
 static struct cam_sub cam_subs[CAM_MAX_SUBS];
+
+/* #101: release oneshot subs on a non-recover base stop -- forward-declared here
+   because camera_power_off() (above the registry helpers) calls it. */
+static void cam_subs_release_oneshot(void);
 
 static volatile int      cam_stream_active;  /* streaming mode gate             */
 static volatile int      cam_stream_mirror;   /* #82: JPEG stream mirrors each frame
@@ -1376,6 +1384,7 @@ int camera_power_off(void)
 		return CAM_ERR_BUSY;
 	}
 	cam_recover_pending = 0;          /* do not auto-recover into a powered-off sensor */
+	cam_subs_release_oneshot();       /* #101: power off cancels recovery -> release oneshot */
 	power_off_locked();
 	op_unlock();
 	return 0;
@@ -1700,10 +1709,14 @@ static struct cam_sub *cam_sub_find(struct frame_sink *s)
 }
 
 /* Claim/find the registry slot for @p s and mark it enabled for pixel format
-   @p fmt (no attach).  Returns the slot, or NULL if the table is full.  cam_lock
-   held.  A subscriber's own module owns only this `enabled` intent; membership
-   (`attached`) is set later by the attach path. */
-static struct cam_sub *cam_sub_register(struct frame_sink *s, enum camera_format fmt)
+   @p fmt (no attach).  @p oneshot selects the persistence policy (0 = persistent
+   gui/nncam, 1 = non-persistent MJPEG, #101).  Returns the slot, or NULL if the
+   table is full.  cam_lock held.  A subscriber's own module owns only this
+   `enabled` intent; membership (`attached`) is set later by the attach path.
+   `oneshot` is set on EVERY register so a reused slot never inherits a stale
+   policy from a previous subscriber. */
+static struct cam_sub *cam_sub_register(struct frame_sink *s, enum camera_format fmt,
+                                        int oneshot)
 {
 	struct cam_sub *sub = cam_sub_find(s);
 
@@ -1714,6 +1727,7 @@ static struct cam_sub *cam_sub_register(struct frame_sink *s, enum camera_format
 	sub->sink    = s;
 	sub->fmt     = (uint8_t)fmt;
 	sub->enabled = 1;
+	sub->oneshot = oneshot ? 1u : 0u;
 	return sub;
 }
 
@@ -1765,6 +1779,27 @@ static void cam_subs_detach_all(void)
 	}
 }
 
+/* #101: fully release non-persistent (oneshot, e.g. MJPEG) subscribers -- clear
+   the registration so a later base start's cam_subs_attach_all() cannot ghost
+   re-attach a subscriber whose owning feature has no consumer anymore.  Called
+   under cam_lock on a NON-recover base stop (explicit stop / --frames|--secs
+   target done / overrun recover giveup): base off for good, so a oneshot sub must
+   go idle in the registry too.  Persistent subs (gui/nncam, oneshot=0) are
+   untouched -- they keep their enabled intent and re-attach at the next base start
+   (contract #100.1).  The oneshot sub is already detached (attached=0) by
+   cam_subs_detach_all before this runs; a MJPEG thread observing this via
+   camera_subscribed() then fully stops rather than pausing for a re-open. */
+static void cam_subs_release_oneshot(void)
+{
+	for (int i = 0; i < CAM_MAX_SUBS; i++) {
+		if (cam_subs[i].sink != NULL && cam_subs[i].oneshot) {
+			cam_subs[i].enabled = 0;
+			cam_subs[i].sink    = NULL;
+			cam_subs[i].oneshot = 0;
+		}
+	}
+}
+
 /* Stop the stream and restore a clean snapshot-ready DCMI/DMA.  Producer-thread
    only (single owner): start / stop / auto-stop / OVR all converge here, so the
    HW teardown never races the producer's repoint.  Short cam_lock for the state
@@ -1796,6 +1831,12 @@ static void cam_stream_teardown(void)
 		   safe here.  This is the master-switch teardown for both an explicit
 		   stop and an async OVR/auto-stop (contract #100.2). */
 		cam_subs_detach_all();
+		/* #101: a non-recover stop (explicit / target done) leaves the base off
+		   for good -> fully release oneshot (MJPEG) subscribers so a later start
+		   cannot ghost re-attach them.  An overrun (cam_recover_pending) keeps them
+		   enabled: cam_stream_recover() re-attaches them at the same mode. */
+		if (!cam_recover_pending)
+			cam_subs_release_oneshot();
 		drain_stream_sem();
 		/* HAL_DCMI_Stop leaves CR.DBM set on the stream; re-init the DMA so the
 		   next snapshot's HAL_DCMI_Start_DMA runs a plain single transfer. */
@@ -2005,6 +2046,11 @@ static void cam_stream_recover(void)
 	(void)tx_mutex_get(&cam_lock, TX_WAIT_FOREVER);
 	if (!cam_recover_pending || cam_stream_active) {
 		cam_recover_pending = 0;
+		/* #101: recovery cancelled (explicit stop/start raced in) and the base is
+		   off -> release oneshot subs so they cannot ghost re-attach.  Defensive:
+		   the cancelling entry point already released them; idempotent here. */
+		if (!cam_stream_active)
+			cam_subs_release_oneshot();
 		(void)tx_mutex_put(&cam_lock);
 		return;                       /* explicit stop/start raced in: give up */
 	}
@@ -2017,6 +2063,10 @@ static void cam_stream_recover(void)
 	cam_recover_last = now;
 
 	if (cam_recover_rapid >= CAM_RECOVER_GIVEUP) {
+		/* #101: auto-recovery abandoned -> base stays off, so oneshot (MJPEG)
+		   subscribers must go idle too (a paused MJPEG thread sees this via
+		   camera_subscribed() and fully stops instead of waiting forever). */
+		cam_subs_release_oneshot();
 		(void)tx_mutex_put(&cam_lock);
 		LOG_WRN("base overruns persist; auto-recovery stopped -- use "
 		        "'camera stream start'");
@@ -2026,6 +2076,8 @@ static void cam_stream_recover(void)
 	/* Re-arm at the same mode; cam_subs_attach_all() re-attaches every enabled
 	   subscriber (each sees a close()/open() pair). */
 	rc = stream_start_locked(cam_start_colorbar, cam_target_frames, cam_target_secs);
+	if (rc != 0)
+		cam_subs_release_oneshot();    /* #101: re-arm failed, base off -> release */
 	(void)tx_mutex_put(&cam_lock);
 	if (rc != 0)
 		LOG_WRN("base auto-recovery failed (%d) -- use 'camera stream start'", rc);
@@ -2234,6 +2286,13 @@ int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 	   An explicit start resets the overrun-recovery backoff. */
 	cam_recover_pending = 0;
 	cam_recover_rapid   = 0;
+	/* #101: a fresh explicit start supersedes any aborted overrun-recovery window --
+	   drop orphaned oneshot (MJPEG) subs left enabled+detached so they cannot ghost
+	   re-attach to this new base (possibly a different format).  Only when the base
+	   is off: an active base keeps its attached oneshot and the start below
+	   BUSY-fails without touching state. */
+	if (!cam_stream_active)
+		cam_subs_release_oneshot();
 	rc = stream_start_locked(colorbar, frames, secs);
 	op_unlock();
 	return rc;
@@ -2249,7 +2308,7 @@ int camera_subscribe(struct frame_sink *s, enum camera_format fmt)
 	rc = op_lock();
 	if (rc != 0)
 		return rc;
-	sub = cam_sub_register(s, fmt);
+	sub = cam_sub_register(s, fmt, 0);        /* persistent (gui / nncam) */
 	if (sub == NULL) {
 		op_unlock();
 		return CAM_ERR_STATE;             /* registry full */
@@ -2265,11 +2324,59 @@ int camera_subscribe(struct frame_sink *s, enum camera_format fmt)
 		} else {
 			sub->sink = NULL;
 			sub->enabled = 0;
+			sub->oneshot = 0;
 			rc = CAM_ERR_BUSY;
 		}
 	}
 	op_unlock();
 	return rc;
+}
+
+int camera_subscribe_oneshot(struct frame_sink *s, enum camera_format fmt)
+{
+	struct cam_sub *sub;
+	int rc;
+
+	if (s == NULL)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != 0)
+		return rc;
+	/* #101: STRICT attach.  Unlike camera_subscribe() (which registers enabled+idle
+	   when the base is off / format-mismatched), a oneshot (MJPEG) subscriber must
+	   bind to a LIVE, format-matching base under THIS cam_lock -- there is no
+	   enabled-idle registration.  This makes the base-state check and the attach
+	   atomic, closing the check-then-subscribe race: a base that stops between a
+	   caller's pre-check and here cannot leave a ghost registration that a later
+	   start would re-attach.  A oneshot only ever becomes enabled+detached via an
+	   overrun teardown (which keeps it for auto-recovery), never via this path. */
+	if (!cam_stream_active) {
+		op_unlock();
+		return CAM_ERR_STATE;             /* base not streaming */
+	}
+	if (mode.format != fmt) {
+		op_unlock();
+		return CAM_ERR_PARAM;             /* base format class mismatch (raster vs JPEG) */
+	}
+	sub = cam_sub_register(s, fmt, 1);
+	if (sub == NULL) {
+		op_unlock();
+		return CAM_ERR_STATE;             /* registry full */
+	}
+	if (sub->attached) {                  /* idempotent re-subscribe */
+		op_unlock();
+		return 0;
+	}
+	if (frame_pipeline_attach(&cam_pipe, s) != 0) {
+		sub->sink = NULL;
+		sub->enabled = 0;
+		sub->oneshot = 0;
+		op_unlock();
+		return CAM_ERR_BUSY;              /* pipeline full / open() rejected */
+	}
+	sub->attached = 1;
+	op_unlock();
+	return 0;
 }
 
 int camera_unsubscribe(struct frame_sink *s)
@@ -2289,94 +2396,51 @@ int camera_unsubscribe(struct frame_sink *s)
 			sub->attached = 0;
 		}
 		sub->enabled = 0;
+		sub->oneshot = 0;
 		sub->sink    = NULL;              /* free the registry slot */
 	}
 	op_unlock();
 	return inflight;
 }
 
-int camera_mjpeg_start(struct frame_sink *s, enum camera_res res)
+int camera_subscribed(struct frame_sink *s)
 {
 	struct cam_sub *sub;
-	int rc;
+	int enabled = 0;
 
-	if (s == NULL)
-		return CAM_ERR_PARAM;
-	/* JPEG is the snapshot-loop format, gated to res <= VGA (#63/#69).  MJPEG
-	   (#49 P5) is a JPEG-class subscriber that also owns the base start in Phase 1:
-	   it sets JPEG then starts the base with itself attached.  If the base is
-	   already running (a raster `camera stream` / preview) it is refused BUSY --
-	   the two format classes are exclusive (one DCMI, one format at a time). */
-	if (res > CAM_RES_VGA)
-		return CAM_ERR_PARAM;
-	rc = op_lock();
-	if (rc != 0)
-		return rc;
-	if (cam_stream_active) {
-		op_unlock();
-		return CAM_ERR_BUSY;              /* base already streaming (format clash) */
-	}
-	sub = cam_sub_register(s, CAM_FMT_JPEG);
-	if (sub == NULL) {
-		op_unlock();
-		return CAM_ERR_STATE;
-	}
-	/* Set JPEG @res, then start the base -- cam_subs_attach_all() attaches the
-	   now enabled + compatible eth_sink (calls eth_open).  Roll the registration
-	   back on any failure so a failed start leaves no dangling subscriber. */
-	cam_recover_pending = 0;
-	cam_recover_rapid   = 0;
-	rc = camera_set_format_locked((uint8_t)res, CAM_FMT_JPEG);
-	if (rc == 0)
-		rc = stream_start_locked(0, 0, 0);
-	if (rc != 0) {
-		sub->attached = 0;
-		sub->enabled = 0;
-		sub->sink = NULL;
-	}
+	/* #101: single source of truth for "is @p s still a registered subscriber".
+	   A oneshot (MJPEG) sink polls this after a base teardown (its close() only set
+	   a flag): still enabled => an overrun recovery is in flight, keep the HTTP
+	   session paused for the re-open; not enabled => a non-recover stop released it
+	   (cam_subs_release_oneshot), so fully stop.  Snapshot under cam_lock so it
+	   never observes a half-updated registry. */
+	if (s == NULL || op_lock() != 0)
+		return 0;
+	sub = cam_sub_find(s);
+	enabled = (sub != NULL && sub->enabled);
 	op_unlock();
-	return rc;
+	return enabled;
 }
 
-int camera_mjpeg_stop(struct frame_sink *s)
+int camera_other_subscribers_attached(struct frame_sink *self)
 {
-	struct cam_sub *sub;
-	int inflight = 0;
-	int attached_here, jpeg_owner;
+	int other = 0;
 
-	if (s == NULL || op_lock() != 0)
-		return 0;                        /* cam_sub_find(NULL) would match a free slot */
-	sub = cam_sub_find(s);
-	/* Ownership of the CURRENT base = this sink is attached (in the live pipeline).
-	   Only that justifies tearing the base down: a registered-but-detached sink (an
-	   overrun async-detached it, or a different-format base has since started) does
-	   NOT own whatever base is live now.  Separately, a registered JPEG sink while
-	   the base format is JPEG owns a mid-recovery JPEG base (MJPEG is the sole JPEG
-	   subscriber and cannot register while a base runs); that is used only to cancel
-	   a pending re-arm, never to stop a live base.  mode is read under cam_lock. */
-	attached_here = (sub != NULL && sub->attached);
-	jpeg_owner    = (sub != NULL && sub->fmt == CAM_FMT_JPEG && mode.is_jpeg);
-	if (sub != NULL) {
-		if (sub->attached) {
-			/* Detach the MJPEG sink (close() fires) and report its in-flight pins
-			   so the caller drains it. */
-			inflight = frame_pipeline_detach(&cam_pipe, s);
-			sub->attached = 0;
+	/* #101: true if any attached external subscriber OTHER THAN @p self is live.
+	   The GUI resolution button uses this to only reconfigure the base (stop ->
+	   camera res -> restart, which cascades every subscriber) when it is the sole
+	   attached subscriber.  Best-effort snapshot under cam_lock: a concurrent
+	   attach after this returns is a benign user race (both are manual actions). */
+	if (op_lock() != 0)
+		return 0;
+	for (int i = 0; i < CAM_MAX_SUBS; i++) {
+		if (cam_subs[i].attached && cam_subs[i].sink != self) {
+			other = 1;
+			break;
 		}
-		sub->enabled = 0;
-		sub->sink = NULL;
-	}
-	if (attached_here && cam_stream_active) {
-		cam_recover_pending = 0;             /* explicit stop cancels any auto-recover */
-		cam_stop_req = 1;
-		(void)tx_semaphore_put(&cam_stream_sem);
-	} else if (jpeg_owner) {
-		/* Base already torn down by an overrun (mid-recovery): cancel the pending
-		   re-arm so MJPEG's JPEG base does not resurrect with no consumer. */
-		cam_recover_pending = 0;
 	}
 	op_unlock();
-	return inflight;
+	return other;
 }
 
 void camera_frame_put(struct frame_sink *s, const struct frame_desc *f)
@@ -2397,7 +2461,13 @@ int camera_stream_stop(void)
 	cam_recover_pending = 0;              /* explicit stop cancels any auto-recover */
 	if (cam_stream_active) {
 		cam_stop_req = 1;
-		(void)tx_semaphore_put(&cam_stream_sem);  /* producer tears down */
+		(void)tx_semaphore_put(&cam_stream_sem);  /* producer tears down (releases oneshot) */
+	} else {
+		/* #101: base already inactive -- an overrun tore it down and this stop
+		   cancels the pending auto-recovery.  The producer teardown that would
+		   normally release oneshot (MJPEG) subs will not run again, so release them
+		   here (idempotent if none registered). */
+		cam_subs_release_oneshot();
 	}
 	op_unlock();
 	return 0;

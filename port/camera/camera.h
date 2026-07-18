@@ -325,25 +325,33 @@ int camera_subscribe(struct frame_sink *s, enum camera_format cls_fmt);
 int camera_unsubscribe(struct frame_sink *s);
 
 /**
- * Start the base capture in JPEG at resolution @p res with @p s attached, for the
- * MJPEG-over-HTTP server (#49 P5).  A base-owning convenience entrypoint (Phase 1):
- * it registers @p s as a JPEG-class subscriber, sets JPEG (snapshot-loop,
- * res <= CAM_RES_VGA) and starts the base.  Refused (CAM_ERR_BUSY) if the base is
- * already streaming (the raster and JPEG format classes are exclusive -- one DCMI,
- * one format).  The sink then receives compressed frames from
- * frame_pipeline_publish(FRAME_FMT_JPEG).  Stop with camera_mjpeg_stop().  Returns
- * 0 or a negative CAM_ERR_*.
+ * Register @p s as a *non-persistent* (oneshot) subscriber (#101).  Like
+ * camera_subscribe() but, on a non-recover base stop (explicit `camera stream
+ * stop` / `camera off`, a --frames|--secs target completion, or overrun-recovery
+ * giveup), the subscriber is fully released instead of staying enabled to re-attach
+ * at the next base start.  Used by the MJPEG-over-HTTP server (#49 P5): a base stop
+ * means "stop the stream", not "pause it".  A transient overrun keeps the sink
+ * enabled so the auto-recovery re-attaches it.  Returns 0 or a negative CAM_ERR_*.
  */
-int camera_mjpeg_start(struct frame_sink *s, enum camera_res res);
+int camera_subscribe_oneshot(struct frame_sink *s, enum camera_format cls_fmt);
 
 /**
- * Stop the MJPEG base owned by @p s: detach @p s and cascade-stop the base (the
- * producer tears the DCMI down).  If an async teardown (DCMI overrun) already
- * stopped the base, this is a bare unregister.  Returns the pipeline's in-flight
- * pin count for @p s at detach time (0 when not attached): a nonzero value means a
- * consume() was pre-pinned, so the caller must drain @p s AFTER this returns.
+ * Nonzero while @p s is still a registered subscriber (enabled), whether or not it
+ * is currently attached (#101).  The single source of truth a oneshot subscriber
+ * (MJPEG) polls after a base teardown to tell an overrun recovery (still enabled ->
+ * pause for the re-open) from a non-recover stop (released -> fully stop).  0 when
+ * @p s is NULL or not registered.  Snapshot under cam_lock.
  */
-int camera_mjpeg_stop(struct frame_sink *s);
+int camera_subscribed(struct frame_sink *s);
+
+/**
+ * Nonzero if any attached external subscriber OTHER THAN @p self is currently live
+ * (#101).  The GUI resolution button uses this to reconfigure the base (stop ->
+ * `camera res` -> restart) only when it is the sole subscriber; other subscribers
+ * attached => the change is refused.  Best-effort snapshot under cam_lock (a
+ * concurrent manual attach after the call is a benign user race).
+ */
+int camera_other_subscribers_attached(struct frame_sink *self);
 
 /**
  * Release one pre-pinned slot on behalf of subscriber sink @p s -- the sink's
