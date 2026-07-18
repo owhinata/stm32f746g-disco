@@ -21,13 +21,19 @@
 
 ピン（全 AF12、pull-up）: PC3(SDCKE0) / PD0,1,8-10,14,15(D2,D3,D13-15,D0,D1) / PE0,1,7-15(NBL0/1, D4-D12) / PF0-5,11-15(A0-A5, SDNRAS, A6-A9) / PG0,1,4,5,8,15(A10,A11,BA0,BA1,SDCLK,SDNCAS) / PH3(SDNE0), PH5(SDNWE)。既存ペリフェラル（USART1 / QSPI / SDMMC1 / DCMI / I2C1 / LED）と競合しない。
 
-## MPU: Normal non-cacheable（DMA コヒーレンシ設計）
+## MPU: キャッシュ属性はマスタで決める（DMA コヒーレンシ設計）
 
-ARMv7-M のデフォルトメモリマップでは 0xC0000000 は **Device 属性（XN）**。`bsp_init()`（`src/bsp.c` の `mpu_config_sdram()`）が **D-cache 有効化より前に** MPU region 0 で 8MB を **Normal・non-cacheable・RW・XN** に再マップする:
+ARMv7-M のデフォルトメモリマップでは 0xC0000000 は **Device 属性（XN）**。`bsp_init()`（`src/bsp.c` の `mpu_config_sdram()`）が **D-cache 有効化より前に** 3 つの MPU リージョンを設定する。**キャッシュ可否は「その領域を触るマスタ」で決める** — DMA が書く領域は非キャッシュ（コヒーレント）、NN 演算の CPU 専用領域だけキャッシュ可。番号が大きい region が重なりで優先される（PMSAv7）。
+
+**region 0（全域の土台、8MB non-cacheable）** — 8MB を **Normal・non-cacheable・RW・XN** に再マップ。bank0/1/2 はこれで動く:
 
 - **Normal**: Device 属性のワード毎直列化を避け、通常データアクセスとして扱える
-- **non-cacheable**（TEX=1, C=0, B=0）: この領域は DMA 書込（DCMI）→ CPU 読出が主用途。キャッシュラインが一切立たないため **DMA/CPU コヒーレンシ問題が構造的に存在しない**（clean/invalidate 不要、dirty eviction レースなし）。代償は CPU アクセスの低速化 — 帯域が必要になったら WBWA + 明示 maintenance へ変更する余地を残す
+- **non-cacheable**（TEX=1, C=0, B=0）: DCMI / LTDC / DMA2D / ETH-MAC の DMA 書込 → CPU 読出が主用途。キャッシュラインが一切立たないため **DMA/CPU コヒーレンシ問題が構造的に存在しない**（clean/invalidate 不要、dirty eviction レースなし）。代償は CPU アクセスの低速化
 - **PRIVDEFENA**: 他アドレスはデフォルトマップ維持（flash/SRAM/ペリフェラル挙動は不変）
+
+**region 1（bank3 を cacheable へ上書き、#81）** — NN 推論アリーナ `.sdram.ai`（bank3、0xC0600000、2MB）だけを **Normal・cacheable WBWA（TEX=1, C=1, B=1）・XN** に上書きする。この領域は **CPU 専用（DMA が入らない）** ため cacheable でもコヒーレンシは崩れず、非キャッシュ比 **~20× 高速**（活性化バッファへの反復アクセスが D-cache に乗る）。DMA を bank3 に入れると保守が必要になり破綻するので、ETH/DCMI は非キャッシュ側（bank2/1）に置く。
+
+**region 2（reloc モデル XIP 窓、#92）** — bank3 上位 1MB（0xC0700000）を cacheable かつ **命令フェッチ許可**にする窓。SD からロードした relocatable NN モデルを XIP するため。SDRAM は既定で XN なので、コード実行はこの窓に限定される。**既定は `HAL_MPU_DisableRegion`**（`stedgeai_reloc` backend 選択時のみ有効化）。
 
 !!! note "SD bounce buffer（SRAM1）との方式の違い"
     SDMMC ドライバは**キャッシュされる SRAM1** の専用 32B 整列 bounce buffer + clean/invalidate で整合を取る（[microSD](sdmmc.md) 参照）。SDRAM 側は**領域ごと non-cacheable** にして maintenance 自体を消す。前者は小さく頻繁な転送＋キャッシュ恩恵が活きる用途、後者は大きな DMA ターゲット向き。
@@ -42,15 +48,16 @@ static uint16_t cam_view_buf[320*240] __attribute__((aligned(32), section(".sdra
 
 ## FMC 内部バンク配置（#65）
 
-SDRAM は **4 つの内部バンク**（各 2 MB、CPU アドレスの **offset bit[22:21]** がバンク選択、RM0385 §13.5.3）を持ち、各バンクは独立に 1 本の **open row** を保持できる。`.sdram` を 2 つのバンク整列サブ領域に分割し、リンカで配置を固定する:
+SDRAM は **4 つの内部バンク**（各 2 MB、CPU アドレスの **offset bit[22:21]** がバンク選択、RM0385 §13.5.3）を持ち、各バンクは独立に 1 本の **open row** を保持できる。`.sdram` を **4 つのバンク整列サブ領域**に分割し、リンカで配置を固定する（キャッシュ属性は上記 MPU region0/1 による）:
 
-| サブ領域 | バンク | アドレス | 内容 |
-|---|---|---|---|
-| `.sdram.fixed`（先頭 `.sdram.fixed.ltdc`） | **bank0** | 0xC0000000–0xC01FFFFF | 固定常駐: **`ltdc_fb`（LTDC スキャンアウト READ 面、先頭に address-pin）** / `cam_frame`（snapshot）/ `cam_view_buf` / `guix_demo_img` / `sdram_bench_buf`。計 ~1.45 MB（< 2 MB） |
-| `.sdram.cam` | **bank1** | 0xC0200000–0xC03FFFFF | `cam_arena`（**2 MB のカメラ DMA リングアリーナ**、DCMI WRITE 先） |
-| （空き） | bank2,3 | 0xC0400000–0xC07FFFFF | 4 MB 未使用（将来: #49 NetX 等） |
+| サブ領域 | バンク | アドレス | キャッシュ | 内容 |
+|---|---|---|---|---|
+| `.sdram.fixed`（先頭 `.sdram.fixed.ltdc`） | **bank0** | 0xC0000000–0xC01FFFFF | 非キャッシュ | 固定常駐: **`ltdc_fb`（LTDC スキャンアウト READ 面、先頭に address-pin）** / `cam_frame`（snapshot）/ `cam_view_buf` / `sdram_bench_buf` 等。計 ~1.45 MB（< 2 MB） |
+| `.sdram.cam` | **bank1** | 0xC0200000–0xC03FFFFF | 非キャッシュ | `cam_arena`（**2 MB のカメラ DMA リングアリーナ**、DCMI WRITE 先） |
+| `.sdram.eth`（#49） | **bank2** | 0xC0400000–0xC05FFFFF | 非キャッシュ | ETH MAC-DMA descriptors + RX/TX パケットバッファ（NetX Duo）/ `mjpeg_buf`（HTTP MJPEG 送信用 private JPEG copy、256 KB） |
+| `.sdram.ai` / `.sdram.ai.model`（#81/#92） | **bank3** | 0xC0600000–0xC07FFFFF | **キャッシュ WBWA** | NN activations / staging / RT-RAM（~320 KB、**CPU-only**）。上位 1 MB @0xC0700000 は reloc NN モデルの XIP 窓（**exec 許可**、既定 DISABLE） |
 
-- **狙い（FE 削減レバー）**: LTDC の READ 面（`ltdc_fb`, bank0）と DCMI リングの WRITE 先（`cam_arena`, bank1）を**別バンク**に置くと、両バンクが各自の row を open したまま維持でき、同一バンク内の row activate/precharge スラッシングを避けられる → DMA FIFO error (FE) の低減を狙う。リンカ `ASSERT` 4 本で「fixed が bank0 内（< 2 MB）/ cam が bank1 先頭 / cam が正確に 2 MB / 全体 ≤ 8 MB」を強制。
+- **狙い（FE 削減レバー）**: LTDC の READ 面（`ltdc_fb`, bank0）と DCMI リングの WRITE 先（`cam_arena`, bank1）を**別バンク**に置くと、両バンクが各自の row を open したまま維持でき、同一バンク内の row activate/precharge スラッシングを避けられる → DMA FIFO error (FE) の低減を狙う。**物理 SDRAM チップは 1 個**なので総帯域は 4 バンクで共有される（分離が効くのは row-open の並走のみ）。リンカ `ASSERT` で「fixed が bank0 内（< 2 MB）/ cam が bank1 先頭・正確に 2 MB / eth が bank2 内 / ai が bank3・全体 ≤ 8 MB」を強制。
 - **効果は実測依存**（後述）。効果が無くても配置自体は同一 MPU リージョン・アドレス差のみで害はない。
 - **カメラリングは動的パーティション**: 旧 `cam_ring[4][256KB]`（固定 1 MB）を廃し、ストリーム開始時に現モードの `frame_bytes` から slot stride = `align32(frame_bytes)`、スロット数 = `min(2MB/stride, 8)` を実行時算出（< 2 スロットは reject）。小モードほど深いリングになる。`camera stream stats` の `ring: N slots x M B` で確認可能。
 - `cam_frame`（snapshot）は bank0 で `ltdc_fb` と同居するが、snapshot は単発で FE 許容（#45 で FE/DME 割込み無効化済）。FE クリティカルな streaming 経路（bank1 vs bank0）は分離済み。
@@ -63,6 +70,30 @@ SDRAM は **4 つの内部バンク**（各 2 MB、CPU アドレスの **offset 
 | 480x272 RGB565 *(モードは #84 で削除)* | 2022.0 fe/s | **1489.5 fe/s** | **−26%** |
 
 いずれも `ovr dcmi`/`ovr ring` = 0、fps 14.8 不変。バンク分離で **FE が ~26–28% 減**（不確実とされた副次効果が実機で確認できた）。動的アリーナにより両モードとも `ring: 8 slots`（旧固定 4 slots より深い）。
+
+## バンク別データフロー
+
+SDRAM を通るデータが、どのバンク・キャッシュ属性・マスタを経由するか（`非$` = 非キャッシュ）:
+
+```
+① camera capture (単発, base OFF)
+   OV5640 → DCMI(DMA2 St1) → cam_frame(bank0,非$) → CPU read → save/send/stats
+
+② camera streaming (base + subscriber cascade, Epic #99)
+   OV5640 → DCMI(DMA2 St1) → cam_arena ring(bank1,非$) → frame_pipeline publish
+     ├ GUI preview : DMA2D M2M  slot(bank1)→cam_view_buf/ltdc_fb(bank0,非$) → LTDC scanout
+     ├ MJPEG       : CPU memcpy slot(bank1)→mjpeg_buf(bank2,非$) → ETH-MAC DMA → HTTP
+     ├ NN(nncam)   : CPU 前処理 slot(bank1)→NN 入力/activations(bank3,$) → 推論 → dets
+     └ save/send   : pin latest slot(bank1)→ CPU memcpy → cam_frame(bank0,非$) → SD/QSPI/YMODEM
+
+③ LTDC 表示   : GUIX+DMA2D compose → ltdc_fb[2](bank0,非$) → LTDC-DMA scanout (VBR tear-free toggle)
+④ Ethernet    : NetX Duo ⇄ ETH desc+pkt buf(bank2,非$) ⇄ ETH-MAC DMA (LAN8742 RMII)
+⑤ NN 推論     : activations/staging(bank3,$) + reloc model .bin(bank3 上位, XIP exec) → CPU 推論
+```
+
+- **DMA 対象（bank0/1/2）は非キャッシュ**なので、DCMI / LTDC / DMA2D / ETH-MAC のいずれも cache 保守なしでコヒーレント。**NN(bank3)は CPU-only** なので cacheable（保守不要かつ高速）。
+- **`camera save/send` が streaming 中に遅い**（#99/#102）のは②の分岐で、`cam_arena`(bank1) + `cam_frame`(bank0) + SD DMA + DCMI が単一 FMC を round-robin で共有するため。ライブ映像は全 fps 継続する（pin 方式が producer を止めない）が、低優先度の CLI save は後回しになる。速い保存は `camera stream stop` 後に。
+- **NN 推論中の DCMI overrun**（#90）も同じ帯域競合で、bank3 の連続 SDRAM トラフィックが bank1 の DCMI DMA と物理 SDRAM を奪い合うことで起きる（F746 の bus matrix は round-robin で per-master QoS を持たない、RM0385 §2）。
 
 ## 初期化フロー
 
