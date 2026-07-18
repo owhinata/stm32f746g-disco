@@ -30,7 +30,7 @@
 #include "nn.h"
 #include "nn_camera.h"
 #include "models/blazeface.h" /* BlazeFace decode (model-specific post-process) */
-#include "camera.h"          /* camera_preview_start / camera_preview_stop / camera_frame_put */
+#include "camera.h"          /* camera_subscribe / camera_unsubscribe / camera_frame_put */
 #include "frame_pipeline.h"  /* struct frame_sink / frame_desc / FRAME_POLICY_* */
 
 #include "stm32f7xx_hal.h"   /* HAL_GetTick, HAL_RCC_GetHCLKFreq */
@@ -79,32 +79,20 @@ static TX_SEMAPHORE nncam_sem;            /* consume posts a READY stage        
 static struct frame_sink nncam_sink;
 static struct nn_model  *nncam_model;
 
-static volatile int nncam_run;            /* requested running (start=1, stop=0)    */
+static volatile int nncam_run;            /* enabled intent (ai stream start=1, stop=0) */
 static volatile int nncam_active;         /* worker is in the run loop (set by worker) */
-static volatile int nncam_producer_dead;  /* camera producer torn down (close cb)   */
-static volatile int nncam_holds_session;  /* the stream currently holds the nn session */
+static volatile int nncam_producer_dead;  /* base detached (close cb): paused, not stopped */
+static volatile int nncam_holds_session;  /* the AI subscriber holds the nn session    */
 static int          nncam_created;        /* worker/objects created once            */
-static uint8_t      nncam_res;            /* enum camera_res of the active stream    */
+static uint8_t      nncam_res;            /* enum camera_res hint (display only, #100) */
 
-/* Session mode (issue #83): separates the camera-OWNING stream (`ai stream`/`ai run`,
- * which takes the DCMI itself) from the GUIX external feed (which pushes frames from a
- * preview it already owns).  A shell `ai stream stop` must not tear down a feed
- * session, and feed_abort must not tear down a camera session.  Updated under
- * nncam_lock alongside nncam_holds_session. */
-enum nncam_mode { NNCAM_MODE_NONE = 0, NNCAM_MODE_CAMERA, NNCAM_MODE_FEED };
-static volatile uint8_t nncam_mode;
-
-/* Session generation, bumped on every (re)start.  An in-flight ingest that spans a
- * session boundary reverts instead of injecting a stale frame into the new session. */
+/* Session generation, bumped on every (re)attach + on a base detach.  An in-flight
+ * ingest that spans a session boundary reverts instead of injecting a stale frame. */
 static volatile uint32_t nncam_epoch;
 
-/* External-feed ingests in progress on the producer thread; feed_start waits for this
- * to drain before it resets the session state. */
-static volatile int nncam_ingest_inflight;
-
-/* Release the nn session iff this stream still holds it (exactly once per stream;
- * called from nn_camera_stop(), nn_camera_feed_abort() and the worker's producer_dead
- * auto-stop).  Also clears the session mode on the real release. */
+/* Release the nn session iff the AI subscriber still holds it (exactly once per
+ * `ai stream` lifetime; called only from nn_camera_stop()).  A base detach (close)
+ * NEVER releases -- the session owner is the AI enabled intent (contract #100.4). */
 static void nncam_release_session(void)
 {
 	int held;
@@ -112,8 +100,6 @@ static void nncam_release_session(void)
 	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
 	held = nncam_holds_session;
 	nncam_holds_session = 0;
-	if (held)
-		nncam_mode = NNCAM_MODE_NONE;
 	tx_mutex_put(&nncam_lock);
 	if (held)
 		nn_session_release();
@@ -186,38 +172,50 @@ static void nncam_preprocess(const struct frame_desc *f, void *dst)
 
 /* ---- frame-pipeline sink (synchronous copy) ------------------------------- */
 
-/* Reset per-session state (both attach paths: nncam_open for the camera-owning sink,
- * nn_camera_feed_start for the external feed which never sees the sink open cb).
- * Bumps the epoch so an in-flight ingest from a prior session reverts. */
+/* Reset per-session state on attach (nncam_open, the sole attach path in the
+ * subscriber model).  Bumps the epoch so an in-flight ingest from a prior session
+ * reverts, and clears producer_dead so a stale base-detach flag does not instantly
+ * re-pause the fresh session.  Under nncam_lock and preserving any ST_RUNNING stage:
+ * an overrun auto-recovery re-attaches (this reset) while the AI stays enabled, so
+ * the prio-18 worker may be mid-copy out of a ST_RUNNING stage -- clobbering it to
+ * ST_FREE would let the producer reuse that buffer under the worker (contract
+ * #100.3, same discipline as nncam_close). */
 static void nncam_session_reset(void)
 {
+	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
 	nncam_producer_dead = 0;
 	nncam_ndet = 0;                     /* drop stale detections from a prior session */
 	for (int i = 0; i < NNCAM_STAGE_N; i++)
-		nncam_state[i] = ST_FREE;
+		if (nncam_state[i] != ST_RUNNING)
+			nncam_state[i] = ST_FREE;   /* leave a stage the worker is copying out of */
+	nncam_epoch++;
+	tx_mutex_put(&nncam_lock);
 	memset(&nnstat, 0, sizeof nnstat);
 	nnstat.start_tick = HAL_GetTick();
-	nncam_epoch++;
 	while (tx_semaphore_get(&nncam_sem, TX_NO_WAIT) == TX_SUCCESS)
 		;
 }
 
 static int nncam_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t h)
 {
-	(void)ctx; (void)w; (void)h;
+	(void)ctx;
 
 	if (fmt != FRAME_FMT_RGB565)
-		return -1;                          /* preview delivers RGB565 only        */
+		return -1;                          /* base raster is RGB565 only          */
 
-	nncam_session_reset();                  /* fresh session on attach (like eth_open) */
+	/* Record the actual base geometry for the stats display (the input adapts to
+	   whatever resolution the base publishes -- the model input is fixed 128x128). */
+	nncam_res = (w <= 160u) ? (uint8_t)CAM_RES_QQVGA
+	          : (w <= 320u) ? (uint8_t)CAM_RES_QVGA
+	                        : (uint8_t)CAM_RES_VGA;
+	nncam_session_reset();                  /* fresh session on (re)attach          */
 	return 0;
 }
 
-/* Shared ingest for both the camera-owning sink and the external feed: claim a FREE
- * stage, preprocess @p f into it, and (unless the session was torn down / rotated
- * during preprocess) publish it READY and wake the worker.  Reads f->data.  Does NOT
- * release the pipeline pin -- each caller owns pin release (the camera-owning consume
- * puts its own pin; the external feed's pin is owned by the GUIX preview). */
+/* Ingest one delivered frame: claim a FREE stage, preprocess @p f into it, and
+ * (unless the session was torn down / rotated during preprocess) publish it READY
+ * and wake the worker.  Reads f->data.  Does NOT release the pipeline pin -- the
+ * consume() caller owns pin release. */
 static void nncam_ingest(const struct frame_desc *f)
 {
 	uint32_t epoch0;
@@ -264,10 +262,25 @@ static int nncam_consume(void *ctx, const struct frame_desc *f)
 	return 0;
 }
 
+/* Base detached this subscriber (base capture stopped / DCMI overrun / cascade).
+ * A PAUSE, not a stop (contract #100.2/.4): keep the AI enabled (nncam_run) and
+ * the nn session held -- the session owner is the `ai stream` intent, released
+ * only by nn_camera_stop().  Bump the epoch so an in-flight ingest reverts, drop
+ * any pending (non-RUNNING) staged frame so a stale frame is not inferred after a
+ * later re-attach, and wake the worker to re-evaluate.  Non-blocking and no camera
+ * API re-entry, so it is safe under the camera lock. */
 static void nncam_close(void *ctx)
 {
 	(void)ctx;
-	nncam_producer_dead = 1;                /* async teardown (e.g. DCMI overrun)   */
+	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
+	nncam_producer_dead = 1;
+	nncam_epoch++;                          /* an in-flight FILLING ingest reverts   */
+	for (int i = 0; i < NNCAM_STAGE_N; i++)
+		if (nncam_state[i] == ST_READY)
+			nncam_state[i] = ST_FREE;       /* drop pending; ST_RUNNING/FILLING left */
+	nncam_ndet = 0;                         /* clear boxes: no live frames while paused */
+	tx_mutex_put(&nncam_lock);
+	(void)tx_semaphore_put(&nncam_sem);     /* wake worker (idles until re-attach)  */
 }
 
 /* ---- inference worker ----------------------------------------------------- */
@@ -343,17 +356,21 @@ static void nncam_entry(ULONG arg)
 		 * an active flag the worker will not clear (the BLOCKING stuck race). */
 		nncam_active = 1;
 		LOG_INF("inference running (prio %u)", (unsigned)NNCAM_WORKER_PRIORITY);
-		while (nncam_run && !nncam_producer_dead) {
+		/* Run while enabled.  A base detach (producer_dead) is a PAUSE, not a stop
+		 * (#100): no frames flow so the worker just idles on the poll timeout until
+		 * the base re-attaches (nncam_open re-arms the session).  Only nn_camera_stop
+		 * clears nncam_run, so the session release stays with the AI intent owner. */
+		while (nncam_run) {
 			if (tx_semaphore_get(&nncam_sem, NNCAM_POLL_TICKS) != TX_SUCCESS)
-				continue;                   /* timeout -> re-check run/dead         */
+				continue;                   /* timeout -> re-check run               */
 			(void)nncam_step();
 		}
-		if (nncam_producer_dead) {
-			LOG_WRN("camera producer stopped -- auto-stopping inference");
-			nncam_run = 0;
-			nncam_release_session();        /* async teardown owns the release      */
-		}
 		nncam_active = 0;                   /* parked; nn_camera_stop() waits on this */
+		/* The run loop exits only on nncam_run=0 (an `ai stream stop`) -- a base
+		 * detach is a pause that keeps run=1.  Release the session here so it is
+		 * freed even if nn_camera_stop() timed out mid-nn_run() (idempotent via the
+		 * holds flag with nn_camera_stop's own release). */
+		nncam_release_session();
 		LOG_INF("inference stopped (%lu infers)", (unsigned long)nnstat.infers);
 	}
 }
@@ -367,7 +384,7 @@ static int nncam_open_model(void)
 	if (nn_model_open(&nncam_model) != 0)
 		return -3;
 	/* No model loaded (e.g. the stedgeai_reloc backend before `ai model load`): the
-	 * single choke point that rejects `ai run`/`ai stream`/`gui overlay` cleanly. */
+	 * single choke point that rejects `ai run`/`ai stream` cleanly. */
 	if (nn_input_count(nncam_model) == 0)
 		return -3;
 	in = nn_input(nncam_model, 0);
@@ -445,6 +462,7 @@ int nn_camera_start(enum camera_res res)
 {
 	int rc;
 
+	(void)res;                              /* input adapts to the base geometry (#100) */
 	if (nncam_run || nncam_active)
 		return -2;                          /* running or still tearing down        */
 
@@ -454,26 +472,27 @@ int nn_camera_start(enum camera_res res)
 	if (nncam_create_objects() != 0)
 		return -5;
 
-	/* Claim the single inference session: refused (-6) if `ai bench` or another
-	 * stream/run is already using the non-reentrant singleton model. */
+	/* Claim the single inference session first: refused (-6) if `ai bench` or a
+	 * stream is using the non-reentrant singleton model.  The session owner is this
+	 * `ai stream` enable; it is released only by nn_camera_stop() / the worker's
+	 * run-loop exit, NEVER by a base detach (contract #100.4). */
 	if (nn_session_try_acquire() != 0)
 		return -6;
+	nncam_holds_session = 1;
 
-	/* Take the camera in RGB565 + attach the sink (calls nncam_open, which resets
-	 * the session).  Only after this succeeds do we claim the lifecycle; the worker
-	 * sets nncam_active itself once it enters the run loop. */
-	rc = camera_preview_start(&nncam_sink, res);
+	/* Enable the subscriber BEFORE subscribing so a frame delivered the instant we
+	 * attach is ingested.  camera_subscribe() attaches now iff the base is running
+	 * and RGB565 (calls nncam_open -> session reset); otherwise the subscriber stays
+	 * enabled + idle and attaches at the next `camera stream start`.  A non-zero rc
+	 * is a hard failure (registry full / immediate attach rejected) -> unwind. */
+	nncam_run = 1;
+	rc = camera_subscribe(&nncam_sink, CAM_FMT_RGB565);
 	if (rc != 0) {
+		nncam_run = 0;
+		nncam_holds_session = 0;
 		nn_session_release();
 		return rc;
 	}
-
-	nncam_res = (uint8_t)res;
-	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
-	nncam_mode = NNCAM_MODE_CAMERA;
-	nncam_holds_session = 1;
-	tx_mutex_put(&nncam_lock);
-	nncam_run = 1;
 	return 0;
 }
 
@@ -481,20 +500,18 @@ int nn_camera_stop(void)
 {
 	if (!nncam_run && !nncam_active)
 		return -1;
-	if (nncam_mode == NNCAM_MODE_FEED)
-		return -3;                          /* owned by the GUIX overlay feed (#83)  */
 
-	nncam_run = 0;
+	nncam_run = 0;                          /* disable: worker exits its run loop   */
 	(void)tx_semaphore_put(&nncam_sem);     /* wake the worker if waiting           */
-	camera_preview_stop(&nncam_sink);       /* detach + stop camera (in-flight = 0) */
+	(void)camera_unsubscribe(&nncam_sink);  /* detach (close); base keeps running   */
 
 	for (int i = 0; i < 30 && nncam_active; i++)
 		tx_thread_sleep(100);
 
-	/* If the worker is still mid-nn_run() after the wait, do NOT release the
-	 * session here -- that would let another activity acquire the model while the
-	 * worker still reads it.  camera_preview_stop()'s detach set producer_dead, so
-	 * the worker WILL release via its producer_dead path once nn_run() returns. */
+	/* If the worker is still mid-nn_run() after the wait, keep the session: releasing
+	 * now would let another activity acquire the model while the worker still reads
+	 * it.  The worker releases the session itself when it exits the run loop (run=0),
+	 * so report -2 (still tearing down) -- the release is not lost. */
 	if (nncam_active)
 		return -2;
 
@@ -502,77 +519,6 @@ int nn_camera_stop(void)
 	 * did not already (idempotent via the holds flag). */
 	nncam_release_session();
 	return 0;
-}
-
-/* ---- external-feed mode (GUIX overlay, issue #83) ------------------------- */
-
-int nn_camera_feed_start(void)
-{
-	int rc;
-
-	if (nncam_run || nncam_active)
-		return -2;                          /* running or still tearing down        */
-
-	rc = nncam_open_model();                /* model + input geometry (bounds-checked) */
-	if (rc != 0)
-		return rc;
-	if (nncam_create_objects() != 0)
-		return -5;
-
-	/* Claim the single inference session; refused (-6) if a bench/stream/run holds it. */
-	if (nn_session_try_acquire() != 0)
-		return -6;
-
-	/* Wait (bounded) for any in-flight producer ingest to drain before resetting the
-	 * session state (so nncam_session_reset() cannot fight a live ingest).  On
-	 * timeout, release the just-claimed session and report busy -- try_acquire ran
-	 * before nncam_holds_session is set, so a raw release balances it. */
-	for (int i = 0; i < 10 && nncam_ingest_inflight; i++)
-		tx_thread_sleep(1);
-	if (nncam_ingest_inflight) {
-		nn_session_release();
-		return -2;
-	}
-
-	nncam_session_reset();
-	tx_mutex_get(&nncam_lock, TX_WAIT_FOREVER);
-	nncam_mode = NNCAM_MODE_FEED;
-	nncam_holds_session = 1;
-	tx_mutex_put(&nncam_lock);
-	nncam_run = 1;                          /* publish last: worker + feed see it ready */
-	return 0;
-}
-
-void nn_camera_feed(const struct frame_desc *f)
-{
-	/* Count this producer in-flight BEFORE the run/mode gate: otherwise
-	 * nn_camera_feed_start()'s drain could observe inflight==0 while a producer sits
-	 * between the gate and the increment, and then session_reset() would race that
-	 * producer's live ingest. */
-	nncam_ingest_inflight++;
-	if (nncam_run && nncam_mode == NNCAM_MODE_FEED)
-		nncam_ingest(f);                    /* preprocess into staging (pin held by caller) */
-	nncam_ingest_inflight--;
-}
-
-void nn_camera_feed_abort(void)
-{
-	if (nncam_mode != NNCAM_MODE_FEED)
-		return;                             /* only tear down a feed session         */
-	if (!nncam_run && !nncam_active)
-		return;                             /* nothing to abort                      */
-
-	nncam_run = 0;
-	nncam_producer_dead = 1;                /* worker's producer_dead path releases   */
-	(void)tx_semaphore_put(&nncam_sem);     /* wake the worker if waiting             */
-
-	/* If the worker never entered its run loop (pre-active abort), it will not reach
-	 * the producer_dead release path -- release here.  nncam_release_session() is
-	 * idempotent via the holds flag, so this and any worker release resolve to
-	 * exactly one nn_session_release().  run=0/dead=1 are set first, so the worker
-	 * never runs a real inference after this, making an early release harmless. */
-	if (!nncam_active)
-		nncam_release_session();
 }
 
 bool nn_camera_running(void)

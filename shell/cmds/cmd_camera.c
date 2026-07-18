@@ -633,10 +633,24 @@ static int cmd_camera_on(struct cli_instance *sh, int argc, char **argv)
 
 static int cmd_camera_off(struct cli_instance *sh, int argc, char **argv)
 {
-	int rc;
+	int rc, i;
 
 	(void)argc;
 	(void)argv;
+
+	/* `camera off` cuts sensor power, which cannot happen mid-stream (it wrecks the
+	   DCMI HW).  Cascade the base capture down first (#100): stop it and wait for the
+	   producer to tear it down (every subscriber gets a close()), then power off. */
+	if (camera_streaming()) {
+		cli_print(sh, "camera: stopping stream before power off\r\n");
+		(void)camera_stream_stop();
+		for (i = 0; i < 200 && camera_streaming(); i++)
+			cli_sleep(sh, 1);
+		if (camera_streaming()) {
+			cli_error(sh, "camera: stream did not stop; retry 'camera off'\r\n");
+			return 1;
+		}
+	}
 
 	rc = camera_power_off();
 	if (rc != 0) {

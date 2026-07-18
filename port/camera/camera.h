@@ -294,52 +294,61 @@ int camera_stream_stop(void);
 /** Fill @p out with the current or last stream statistics (any time). */
 int camera_stream_stats(struct camera_stream_info *out);
 
-/* ---- GUIX live preview ownership (issue #56) ----------------------------- */
+/* ---- base capture + subscribers (Epic #99 Phase 1, #100) ----------------- */
 struct frame_sink;       /* svc/frame_pipeline.h */
 struct frame_desc;       /* svc/frame.h          */
 
 /**
- * Start streaming for a GUIX live preview at resolution @p res (RGB565, the
- * GUIX sink's only format) and attach @p s as an external push sink (in addition
- * to the internal stats sink).  @p res must be a streamable small mode
- * (CAM_RES_QQVGA / QVGA); larger modes return CAM_ERR_PARAM (#69).
- * Equivalent to camera_stream_start(colorbar=0, unbounded) but also takes
- * **preview ownership**: while it holds, the public `camera stream start/stop`
- * are refused (CAM_ERR_BUSY).  Changing resolution mid-preview is not possible
- * (set_format is BUSY while streaming) -- stop, then start again with the new
- * @p res.  Returns 0 on success or a negative CAM_ERR_* (e.g. a plain stream /
- * preview already running, no sensor, SDRAM down).  The producer's async
- * teardown (DCMI overrun) also releases ownership and detaches @p s, so the
- * slot/pin contract survives a later frame_pipeline_init().
+ * Register push sink @p s as a *subscriber* of the base capture (`camera
+ * stream`).  @p cls_fmt selects the sink's format class: CAM_FMT_JPEG for a JPEG
+ * (compressed) sink, any raster format (e.g. CAM_FMT_RGB565) for a raster sink.
+ * The subscriber's `enabled` intent is orthogonal to the base on/off: if the
+ * base is already running AND its format class matches, @p s is attached
+ * immediately (its open() negotiates the live geometry); otherwise it stays
+ * enabled + idle and is attached at the next base start.  Idempotent re-enable.
+ * Never starts the base (auto-start is intentionally absent).  Returns 0, or a
+ * negative CAM_ERR_* (CAM_ERR_STATE registry full, CAM_ERR_BUSY the immediate
+ * attach was rejected).  camera.c owns the sink's pipeline membership; the
+ * subscriber module must NOT track `attached` itself.
  */
-int camera_preview_start(struct frame_sink *s, enum camera_res res);
+int camera_subscribe(struct frame_sink *s, enum camera_format cls_fmt);
 
 /**
- * Start streaming in JPEG at resolution @p res and attach @p s as the external
- * push sink, for the MJPEG-over-HTTP server (#49 P5).  Like camera_preview_start
- * but JPEG (snapshot-loop, res <= CAM_RES_VGA) instead of RGB565: the sink then
- * receives compressed frames from frame_pipeline_publish(FRAME_FMT_JPEG).  Takes
- * the same single DCMI ownership -- refused (CAM_ERR_BUSY) if a GUIX preview or a
- * plain `camera stream` already owns the camera.  Stop with camera_preview_stop()
- * (sink-agnostic).  Returns 0 or a negative CAM_ERR_*.
+ * Unregister subscriber @p s: detach it from the base if attached (its close()
+ * fires) and clear its enabled intent.  Does NOT stop the base -- other
+ * subscribers and the producer keep running (a cascade stop is `camera stream
+ * stop`).  Returns the pipeline's in-flight pin count for @p s at detach time (0
+ * when not attached): a nonzero value means a consume() was pre-pinned and may
+ * not have started yet, so the caller must drain @p s AFTER this returns.  Safe
+ * when @p s is not registered (no-op, returns 0).
+ */
+int camera_unsubscribe(struct frame_sink *s);
+
+/**
+ * Start the base capture in JPEG at resolution @p res with @p s attached, for the
+ * MJPEG-over-HTTP server (#49 P5).  A base-owning convenience entrypoint (Phase 1):
+ * it registers @p s as a JPEG-class subscriber, sets JPEG (snapshot-loop,
+ * res <= CAM_RES_VGA) and starts the base.  Refused (CAM_ERR_BUSY) if the base is
+ * already streaming (the raster and JPEG format classes are exclusive -- one DCMI,
+ * one format).  The sink then receives compressed frames from
+ * frame_pipeline_publish(FRAME_FMT_JPEG).  Stop with camera_mjpeg_stop().  Returns
+ * 0 or a negative CAM_ERR_*.
  */
 int camera_mjpeg_start(struct frame_sink *s, enum camera_res res);
 
 /**
- * Release preview ownership taken by camera_preview_start(@p s): detach @p s and
- * stop the stream -- but ONLY while @p s is still the owner.  If an async
- * teardown already released ownership, this is a no-op (it must not stop a
- * different stream started since).  Returns the pipeline's in-flight pin count
- * for @p s at detach time (0 when not the owner): a nonzero value means a
- * consume() was pre-pinned and may not have started yet, so the caller must
- * drain @p s (wait for that consume() to finish) AFTER this returns.
+ * Stop the MJPEG base owned by @p s: detach @p s and cascade-stop the base (the
+ * producer tears the DCMI down).  If an async teardown (DCMI overrun) already
+ * stopped the base, this is a bare unregister.  Returns the pipeline's in-flight
+ * pin count for @p s at detach time (0 when not attached): a nonzero value means a
+ * consume() was pre-pinned, so the caller must drain @p s AFTER this returns.
  */
-int camera_preview_stop(struct frame_sink *s);
+int camera_mjpeg_stop(struct frame_sink *s);
 
 /**
- * Release one pre-pinned slot on behalf of preview sink @p s -- the sink's
+ * Release one pre-pinned slot on behalf of subscriber sink @p s -- the sink's
  * consume() calls this exactly once per delivered frame.  Wraps the pipeline
- * put() so the GUIX glue never holds the camera's internal pipeline handle,
+ * put() so a subscriber's glue never holds the camera's internal pipeline handle,
  * eliminating any race where the producer consumes against @p s before a
  * returned handle could be stored.
  */

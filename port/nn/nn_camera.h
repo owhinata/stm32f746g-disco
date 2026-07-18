@@ -10,9 +10,13 @@
  * (port/nn/nn.h): a synchronous copy push sink resizes + converts each RGB565
  * camera frame into the model's int8 input, and a low-priority (prio 18)
  * best-effort worker thread runs inference on it.  Follows the nx_mjpeg.c
- * eth_sink lifecycle (thread created once + parked, single-owner camera claim,
- * producer_dead auto-stop) and the codex-reviewed double-buffer ownership rule
- * (the buffer the worker feeds to nn_run() is never written by the sink).
+ * eth_sink lifecycle (thread created once + parked) and the codex-reviewed
+ * double-buffer ownership rule (the buffer the worker feeds to nn_run() is never
+ * written by the sink).  Since Epic #99 Phase 1 (#100) nncam is a plain camera
+ * *subscriber*: `ai stream start/stop` enable/disable it and it attaches to the
+ * base capture (`camera stream`) only while the base runs.  A base detach (stop /
+ * DCMI overrun / cascade) PAUSES it (frames stop) but keeps it enabled and holding
+ * the nn session; it re-attaches when the base restarts.
  *
  * Drives `ai stream start|stop` and `ai run`.  Model-specific detection decode
  * (BlazeFace anchors + NMS) is layered above in port/nn/models (issue #81 task
@@ -26,8 +30,6 @@
 
 #include "camera.h"            /* enum camera_res */
 #include "models/blazeface.h"  /* struct bf_det */
-
-struct frame_desc;             /* svc/frame_pipeline.h (external-feed push) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,51 +48,23 @@ struct nn_camera_stats {
 };
 
 /**
- * Start live camera inference at resolution @p res (RGB565; must be a small
- * streamable mode QQVGA/QVGA, per camera_preview_start()).  Takes single
- * camera ownership -- refused if a GUIX preview / plain stream / mjpeg already
- * owns the DCMI.  Non-blocking.  Returns 0 or <0.
+ * Enable live camera inference (`ai stream start`).  @p res is a display hint
+ * only -- the input adapts to whatever geometry the base capture publishes
+ * (#100).  Claims the single nn session (refused -6 if `ai bench`/another stream
+ * holds it) and registers nncam as an RGB565 subscriber of the base: it attaches
+ * immediately if the base is already running, otherwise it stays enabled + idle
+ * and attaches at the next `camera stream start`.  Non-blocking.  Returns 0 or <0
+ * (-2 already running, -3 model, -4 geometry, -5 objects, -6 nn session busy).
  */
 int  nn_camera_start(enum camera_res res);
 
-/** Stop live inference and release the camera (bounded wait for teardown).
- *  Only stops a camera-OWNING stream (`ai stream`/`ai run`); returns -3 if a GUIX
- *  overlay external feed owns the session (tear that down via `gui overlay off`). */
+/** Disable live inference (`ai stream stop`): unsubscribe from the base (which
+ *  keeps running for other subscribers) and release the nn session after the
+ *  worker parks.  Bounded wait; returns 0, -1 (not running), or -2 (worker still
+ *  mid-inference -- the session is released by the worker as it exits). */
 int  nn_camera_stop(void);
 
-/* ---- external-feed mode (GUIX face-detect overlay, issue #83) -------------
- * The camera-owning path above takes the DCMI itself; the external-feed path lets
- * an owner that ALREADY holds the camera (the GUIX live preview) push its frames
- * into the same inference worker/decode/dets pipeline.  The two modes are mutually
- * exclusive (single camera owner) and share the single nn session guard. */
-
-/**
- * Start inference in external-feed mode: open the model, latch its input geometry,
- * claim the nn session and start the worker -- but do NOT take the camera.  The
- * caller (which owns the camera) then pushes frames with nn_camera_feed().  Bounded
- * (no worker-park wait), so it is safe to call under a short caller lock.  Returns 0
- * or <0 (-2 busy/tearing down, -3 model, -4 geometry, -5 objects, -6 nn session busy).
- */
-int  nn_camera_feed_start(void);
-
-/**
- * Push one RGB565 camera frame @p f into the external-feed pipeline (no-op unless a
- * feed is running).  Synchronous copy: preprocesses into a free staging buffer and
- * wakes the worker; drops if none free.  Must be called with @p f's data valid
- * (pinned by the caller, who releases the pin afterwards).
- */
-void nn_camera_feed(const struct frame_desc *f);
-
-/**
- * Non-blocking teardown of an external-feed session (idempotent; no-op unless a feed
- * is running).  Requests the worker to stop and release the nn session; safe to call
- * from any thread (incl. the camera producer during async teardown) since it never
- * waits on the worker.  The session is released asynchronously by the worker (or by
- * this caller if the worker never entered its run loop).
- */
-void nn_camera_feed_abort(void);
-
-/** True while a stream is running. */
+/** True while inference is enabled. */
 bool nn_camera_running(void);
 
 /** Snapshot current stats (any time). */

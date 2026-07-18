@@ -7,25 +7,28 @@
  * @brief   `gui` shell command: start/stop the GUIX camera UI (issues #55/#61).
  *
  *   gui start   start (or resume) the GUIX camera UI -- takes over the LCD +
- *               FT5336 touch and shows the live camera preview.
- *   gui stop    stop the UI + preview, blank the screen, hand the LCD back to
+ *               FT5336 touch and subscribes the live camera preview.
+ *   gui stop    stop the preview, blank the screen, hand the LCD back to
  *               `lcd` (so the `lcd`/`touch`/`camera` test commands can run).
  *   gui info    GUIX state / system-thread priority / display / canvas.
  *
- * Since #61 the UI is the camera UI (the demo screens and the `gui camera on|off`
- * sub-command are gone -- the preview now follows the UI lifecycle: `gui start` /
- * boot brings it up, `gui stop` tears it down); #68 added a settings page reached
- * by tapping the live image (image-quality controls + Back).  The UI
- * is started ON at boot (#60); while it runs the `lcd` drawing commands are
- * refused (the display is owned by GUIX) -- run `gui stop` first.  The camera UI
- * itself lives in ui/guix_camera_ui.c (presentation layer).
+ * Since Epic #99 Phase 1 (#100) the GUI preview is a *subscriber* of the base
+ * capture (`camera stream`), not its owner: `gui start` shows the window and
+ * subscribes the preview (it follows the base -- frozen while the base is off,
+ * live while it streams RGB565); `gui stop` unsubscribes without stopping the base
+ * or the AI.  Face-detect boxes are drawn whenever `ai stream` is running (the old
+ * `gui overlay` sub-command is gone).  #68 added a settings page reached by tapping
+ * the live image (image-quality controls + Back).  The UI is started ON at boot
+ * (#60), which also brings the base capture up once so the preview is live out of
+ * the box; while it runs the `lcd` drawing commands are refused (the display is
+ * owned by GUIX) -- run `gui stop` first.  The camera UI itself lives in
+ * ui/guix_camera_ui.c (presentation layer).
  *
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
 #include "guix_glue.h"
 #include "guix_camera_ui.h"
-#include "nn_camera.h"           /* nn_camera_stats_get (overlay status)          */
 
 #include <stdbool.h>
 #include <string.h>
@@ -58,48 +61,6 @@ static int cmd_gui_stop(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
-static int cmd_gui_overlay(struct cli_instance *sh, int argc, char **argv)
-{
-	int rc;
-
-	if (argc > 1) {
-		bool on;
-
-		if (!strcmp(argv[1], "on"))
-			on = true;
-		else if (!strcmp(argv[1], "off"))
-			on = false;
-		else {
-			cli_error(sh, "usage: gui overlay [on|off]\r\n");
-			return 1;
-		}
-		rc = camera_ui_overlay_set(on);
-		if (rc == -1) {
-			cli_error(sh, "overlay: start the preview first ('gui start')\r\n");
-			return 1;
-		}
-		if (rc != 0) {
-			cli_error(sh, "overlay: face-detect start failed (%d): model built? SDRAM up?\r\n",
-			          rc);
-			return 1;
-		}
-		cli_print(sh, "overlay: face detect %s\r\n", on ? "on" : "off");
-		return 0;
-	}
-
-	/* No arg: report the overlay state + latest inference stats. */
-	{
-		struct nn_camera_stats s;
-
-		nn_camera_stats_get(&s);
-		cli_print(sh, "overlay: %s\r\n", camera_ui_overlay_get() ? "on" : "off");
-		cli_print(sh, "  infers %lu  det %lu  last %lu us\r\n",
-		          (unsigned long)s.infers, (unsigned long)s.detections,
-		          (unsigned long)s.last_us);
-	}
-	return 0;
-}
-
 static int cmd_gui_info(struct cli_instance *sh, int argc, char **argv)
 {
 	struct guix_info gi;
@@ -120,12 +81,10 @@ static int cmd_gui_info(struct cli_instance *sh, int argc, char **argv)
 }
 
 CLI_SUBCMD_SET_CREATE(gui_subcmds,
-	CLI_CMD(start, NULL, "start/resume the GUIX camera UI (takes over LCD + touch)",
+	CLI_CMD(start, NULL, "subscribe the GUIX camera preview (takes over LCD + touch)",
 	        cmd_gui_start),
-	CLI_CMD(stop, NULL, "stop the UI + preview and hand the LCD back to 'lcd'",
+	CLI_CMD(stop, NULL, "stop the preview and hand the LCD back to 'lcd'",
 	        cmd_gui_stop),
-	CLI_CMD_ARG(overlay, NULL, "face-detect bbox overlay [on|off] (#83)",
-	            cmd_gui_overlay, 1, 1),
 	CLI_CMD(info, NULL, "GUIX state / thread / display / canvas", cmd_gui_info),
 	CLI_SUBCMD_SET_END);
 

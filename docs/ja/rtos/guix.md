@@ -90,6 +90,17 @@ DMA2D は単一エンジンで、`lcd` コマンド（`ltdc_display.c`）と GUI
 
 ## ライフサイクル（`gui` コマンド）
 
+!!! warning "#100 で preview は base capture の subscriber に（本節の所有権・overlay 記述は Phase 3 #102 で改訂）"
+    Epic #99 Phase 1（#100）で GUI preview は DCMI を**所有しなくなった**。`camera_preview_start()` は廃止され、preview は `camera_subscribe(&guix_cam_sink, CAM_FMT_RGB565)` で **base capture（`camera stream`）の subscriber** として attach する（`camera_unsubscribe` で detach）。要点:
+
+    - `gui start` は窓を開き preview を subscribe するだけで、**base は起動しない**。base 稼働中（RGB565）なら即 attach、そうでなければ enabled + idle で待機し、次の `camera stream start` で attach。`gui stop` は unsubscribe のみ（**base も AI も止めない**）。base 停止中は最後のフレームで**凍結**。
+    - `cam_sink_open` が base の delivered geometry（QQVGA/QVGA）に追従（`preview_begin` を arm、解像度差があれば `GX_EVENT_CAMERA_GEOM` で GUIX スレッドが pixmap/widget を再同期）。
+    - **`gui overlay` コマンドは廃止**: `ai stream` 稼働中は preview に常時 bbox を描画（`nn_camera_running()` で判定、下記「顔検出 overlay」節の FEED モードは撤去）。
+    - **DCMI overrun 自動復帰は base capture(producer)側**へ移設。GUI 側の backoff / `GX_EVENT_CAMERA_RESTART` は撤去。
+    - boot は preview を subscribe した上で base を 1 回自動起動（out-of-box で live preview）。
+
+    詳細な新モデルは [所有権・状態モデル](../architecture/ownership.md) を参照（#102 で本節も全面改訂）。
+
 GUIX 本体の bring-up は `port/guix/guix_glue.c`、カメラ UI アプリ（widget tree + sink + preview 制御）は `ui/guix_camera_ui.c`。`gx_system_initialize()` + display/canvas/widget 生成 + `gx_system_start()` は**初回 1 回だけ**（GUIX システムスレッドと global オブジェクトは tear-down しない）。
 
 **依存逆転（#61）**: `guix_first_start()` は display/canvas/root を作った後、widget tree の構築を `ui/` が登録した builder（`guix_register_app_builder()`、引数は `void*`）に委ねる。これで `port/guix/guix_glue` は `ui/` のヘッダを include せず、`port ← ui` の依存方向を保つ。

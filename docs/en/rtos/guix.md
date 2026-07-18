@@ -90,6 +90,30 @@ Stopping is **cooperative**: the thread checks an `active` flag and parks itself
 
 ## Lifecycle (`gui` command)
 
+!!! warning "#100 made the preview a subscriber of the base capture (this section's ownership/overlay text is rewritten in Phase 3, #102)"
+    Epic #99 Phase 1 (#100) means the GUI preview no longer **owns** the DCMI.
+    `camera_preview_start()` is gone; the preview attaches via
+    `camera_subscribe(&guix_cam_sink, CAM_FMT_RGB565)` as a **subscriber of the base
+    capture (`camera stream`)** (detached with `camera_unsubscribe`). Key points:
+
+    - `gui start` opens the window and subscribes the preview but does **not** start
+      the base. It attaches immediately if the base is streaming (RGB565), else stays
+      enabled + idle until the next `camera stream start`. `gui stop` only
+      unsubscribes (it stops **neither the base nor the AI**). While the base is off
+      the last frame is **frozen**.
+    - `cam_sink_open` adapts to the base's delivered geometry (QQVGA/QVGA): it arms
+      `preview_begin` and, if the resolution differs, posts `GX_EVENT_CAMERA_GEOM` so
+      the GUIX thread re-syncs the pixmap/widget.
+    - **the `gui overlay` command is gone**: the preview draws face bboxes whenever
+      `ai stream` is running (gated on `nn_camera_running()`; the FEED mode in the
+      "Face-detect overlay" section below is removed).
+    - **DCMI overrun auto-recovery moved into the base capture (producer)**; the GUI
+      backoff / `GX_EVENT_CAMERA_RESTART` are gone.
+    - boot subscribes the preview and starts the base once (a live preview out of the box).
+
+    See [Ownership & state model](../architecture/ownership.md) for the new model
+    (this section gets a full rewrite in #102).
+
 GUIX itself is brought up in `port/guix/guix_glue.c`; the camera UI app (widget tree + sink + preview control) is `ui/guix_camera_ui.c`. `gx_system_initialize()` + display/canvas/widget creation + `gx_system_start()` happen **exactly once** (the GUIX system thread and its global objects are never torn down).
 
 **Dependency inversion (#61)**: after creating the display/canvas/root, `guix_first_start()` delegates the widget-tree build to a builder the `ui/` layer registered (`guix_register_app_builder()`, arguments are `void*`). So `port/guix/guix_glue` never includes a `ui/` header, preserving the `port <- ui` direction.

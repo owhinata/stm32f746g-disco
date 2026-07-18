@@ -8,10 +8,12 @@ first use case is **camera face detection** (OV5640/DCMI → inference).
     **P1 complete** — null-backend foundation + X-CUBE-AI (`stedgeai`) backend +
     BlazeFace-128 face detection running on hardware (`ai run`/`ai stream` print
     face boxes, ~1.5 fps).  **P4 complete** — face bboxes drawn on the GUIX live
-    preview (`gui overlay on`, #83).  **P3 complete** — TFLM (tflite-micro) backend.
+    preview (#83).  **#100 removed the `gui overlay` command**: the preview now draws
+    bboxes whenever `ai stream` is running (the overlay FEED mode is gone; nncam is a
+    subscriber of the base capture).  **P3 complete** — TFLM (tflite-micro) backend.
     After the M1 spike (#86) proved C++ viability, **M2 (#88) ported BlazeFace-front
     128 int8 for real**: the same `.tflite` runs on both stedgeai and TFLM, and
-    `ai info`/`ai bench`/`ai stream`/`gui overlay` all go through the TFLM runtime.
+    `ai info`/`ai bench`/`ai stream` all go through the TFLM runtime.
     With **CMSIS-NN optimized kernels** it runs at ~622 ms/inference, edging out
     stedgeai (685 ms).  **P2 complete** — a `.tflite` on the microSD card is
     **loaded at runtime into `.sdram.ai`** and run (`ai model load <sd-path>`, #89);
@@ -353,7 +355,7 @@ as `CONFIG_NN_BACKEND=stedgeai_reloc`, the stedgeai-runtime counterpart to P2(tf
   weights) is derived from the verified header + ctx file image rather than `ai_rel_network_rt_get_info()`
   (which does a scaled-pointer OOB read pre-install).
 - **SD-only**: no built-in model.  Until `ai model load network_rel.bin`, there is no model
-  (`ai run`/`ai stream`/`gui overlay` reject with a clear error); `ai model builtin` unloads (`(none)`).
+  (`ai run`/`ai stream` reject with a clear error); `ai model builtin` unloads (`(none)`).
 
 **Performance (measured, with a caveat)**: `ai bench` measures **~592 ms/inference** (BlazeFace-front
 128, @216 MHz) **with the LTDC/camera stopped (`gui stop`/`lcd off`) — i.e. a quiet SDRAM bus**.

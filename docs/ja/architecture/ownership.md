@@ -11,6 +11,26 @@ Copyright (c) 2026 ThreadX Shell Project
 使いたがる。本ページは **どの状態で誰が何を所有し、どの shell コマンドが許可されるか** の
 単一リファレンス — `shell/cmds/cmd_*.c` のクロスサブシステムガードの背後にあるモデルである。
 
+!!! warning "DCMI/カメラの所有権モデルは #100 で刷新（本節は Phase 3 #102 で全面改訂予定）"
+    Epic #99 Phase 1（#100）で、カメラは「上位機能が下位を抱き込むモード所有（単一
+    `cam_ext_sink`）」から **「明示 base capture（`camera stream`）+ subscriber cascade」**
+    に変わった。要点:
+
+    - **base = `camera stream`**（`camera stream start [res]` で ON）が唯一の DCMI 取り込み。
+      `port/camera/camera.c` の subscriber registry `cam_subs[]`（`{sink, fmt, enabled,
+      attached}`、`cam_lock` 下）が membership を一元管理する（`cam_ext_sink` 単一ポインタは廃止）。
+    - **機能 = subscriber**: GUI preview / AI 推論(nncam) / MJPEG は各自 start/stop で「有効化」し、
+      base 稼働中かつ format 一致（gui/ai=RGB565, mjpeg=JPEG）のときだけ自分の sink を attach する。
+      subscriber の有効状態は base の on/off と **直交**。
+    - **`camera stream stop` / `camera off` = cascade**: 全 attached subscriber を `close()` で
+      detach して producer を停止（BUSY 拒否ではなく master switch）。**auto-stop は無い**
+      （subscriber を全部止めても base は明示 stop まで ON）。
+    - **`gui overlay` コマンドは廃止**: AI 稼働中（`ai stream start`）は preview に常時 bbox を描画。
+    - **DCMI overrun 自動復帰は base capture(producer)側**へ移設（旧 GUI overlay 専用 backoff は廃止）。
+    - boot は preview を subscribe した上で base を 1 回自動起動する（out-of-box で live preview）。
+
+    以下の「3 モード（SHELL / CAM-STREAM / GUI）」表は旧モデルの記述であり、#102 で置き換える。
+
 ## 共有リソースと所有者
 
 | リソース | 所有フラグ（場所） | 取得 | 解放 |

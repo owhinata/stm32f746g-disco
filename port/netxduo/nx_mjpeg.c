@@ -24,7 +24,7 @@
 
 #include "nx_mjpeg.h"
 #include "nx_glue.h"         /* nx_net_ip / nx_net_pool / nx_net_is_up */
-#include "camera.h"          /* camera_mjpeg_start / camera_preview_stop / camera_frame_put */
+#include "camera.h"          /* camera_mjpeg_start / camera_mjpeg_stop / camera_frame_put */
 #include "frame_pipeline.h"  /* struct frame_sink / frame_desc / FRAME_POLICY_* */
 
 #define LOG_TAG "mjpeg"
@@ -307,7 +307,7 @@ static void mjpeg_entry(ULONG arg)
 		if (ip == NULL || mjpeg_socket_setup(ip) != 0) {
 			mjpeg_run = 0;
 			mjpeg_active = 0;
-			continue;              /* camera_preview_stop is done by nx_mjpeg_*    */
+			continue;              /* camera_mjpeg_stop is done by nx_mjpeg_*      */
 		}
 		mjpeg_listening = 1;       /* nx_mjpeg_start() waits for this              */
 		LOG_INF("listening on :%u (http mjpeg)", (unsigned)NX_MJPEG_PORT);
@@ -395,7 +395,7 @@ int nx_mjpeg_start(enum camera_res res)
 		tx_thread_sleep(10);
 	if (!mjpeg_listening) {
 		mjpeg_run = 0;
-		camera_preview_stop(&eth_sink);
+		camera_mjpeg_stop(&eth_sink);
 		return -3;
 	}
 	return 0;
@@ -409,7 +409,7 @@ int nx_mjpeg_stop(void)
 	client_connected = 0;
 	mjpeg_run = 0;
 	(void)tx_semaphore_put(&frame_sem);   /* wake the serve loop if waiting        */
-	camera_preview_stop(&eth_sink);       /* detach + stop camera (in-flight = 0)  */
+	camera_mjpeg_stop(&eth_sink);       /* detach + stop camera (in-flight = 0)  */
 
 	/* Wait (bounded) for the thread to tear the socket down and park. */
 	for (int i = 0; i < 30 && mjpeg_active; i++)

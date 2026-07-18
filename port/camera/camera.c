@@ -309,21 +309,47 @@ static TX_SEMAPHORE cam_start_sem;        /* start -> producer idle wakeup      
 static TX_THREAD    cam_producer;
 static UCHAR        cam_producer_stack[CAM_PRODUCER_STACK];
 static struct frame_sink cam_stat_sink;   /* counting sink (FPS / OVR source)   */
-static struct frame_sink *cam_ext_sink;   /* GUIX live-preview sink (#56), owner;
-                                             NULL = no preview (cam_lock-guarded) */
+
+/* ---- subscriber registry (Epic #99 Phase 1, #100) ------------------------
+   External push sinks (GUIX preview #56 / nncam inference #81 / MJPEG #49 P5)
+   register here as *subscribers*.  camera.c owns their pipeline membership
+   under cam_lock: a subscriber is linked into cam_pipe only while the base
+   capture (`camera stream`) is active AND its format class matches the base
+   format.  The internal cam_stat_sink is attached directly (always
+   compatible), outside this table.  `attached == 1` iff the sink is currently
+   in cam_pipe.sinks (registry invariant); a detach clears it in the same
+   cam_lock section.  A subscriber's own module keeps only its `enabled` intent
+   and feature resources -- never `attached` (so a stale attach cannot diverge
+   from the pipeline).  This replaces the old single `cam_ext_sink` owner
+   pointer: the base is now a cascade of stat + N subscribers, not one owner.
+
+   `fmt` is the exact pixel format the subscriber consumes (enum camera_format):
+   a subscriber attaches only while the base publishes that format (RGB565 for
+   gui/nncam, JPEG for mjpeg).  The DCMI is one format at a time, so an
+   incompatible subscriber stays enabled + idle rather than failing the base. */
+#define CAM_MAX_SUBS 3   /* gui + nncam + mjpeg registrations; at most
+                            FRAME_PIPELINE_MAX_SINKS-1 attach at once (stat
+                            takes one of the 4 pipeline slots) */
+struct cam_sub {
+	struct frame_sink *sink;    /* NULL = empty slot                       */
+	uint8_t            fmt;      /* enum camera_format consumed             */
+	uint8_t            enabled;  /* subscriber intent (registered)          */
+	uint8_t            attached; /* linked in cam_pipe.sinks (cam_lock)     */
+};
+static struct cam_sub cam_subs[CAM_MAX_SUBS];
 
 static volatile int      cam_stream_active;  /* streaming mode gate             */
 static volatile int      cam_stream_mirror;   /* #82: JPEG stream mirrors each frame
                                                  into cam_frame for save/send (plain
                                                  stream only).  A session latch fixed for
-                                                 the stream's lifetime: set (= ext==NULL)
-                                                 by the start caller before the producer
-                                                 wakeup, read and cleared only by the
-                                                 producer.  The async preview/mjpeg stop
-                                                 NULLs cam_ext_sink on another thread, so
-                                                 reading that pointer lock-free could flip
-                                                 the mirror decision mid-pass -- this latch
-                                                 cannot. */
+                                                 the stream's lifetime: set (= no external
+                                                 subscriber attached) by the start caller
+                                                 before the producer wakeup, read and
+                                                 cleared only by the producer.  An async
+                                                 subscriber detach happens on another
+                                                 thread, so re-deriving the decision from
+                                                 the registry lock-free could flip it
+                                                 mid-pass -- this latch cannot. */
 static volatile int      cam_stop_req;       /* stop requested (producer drains)*/
 static volatile int      cam_stream_err;     /* DCMI OVR -> terminal stop       */
 static volatile uint32_t cam_stream_ovr;     /* DCMI overrun count              */
@@ -338,6 +364,21 @@ static uint32_t cam_last_ct;                 /* CT at last serviced completion  
 static struct frame_desc *cam_m0, *cam_m1;   /* slots currently in M0AR/M1AR    */
 static struct frame_desc *cam_jpeg_slot;     /* JPEG stream: the single DMA target (#63) */
 static volatile uint32_t cam_jpeg_trunc;     /* JPEG stream: frames with no SOI/EOI (#63) */
+
+/* ---- base capture overrun auto-recovery (#100, contract 6) ----------------
+   A DCMI overrun is a producer-general fault, not a subscriber concern: the base
+   tears down (cascade close() to every subscriber) and the producer re-arms
+   itself at the same mode; subscribers re-attach via cam_subs_attach_all() and
+   just saw a close()/open() pair.  An escalating rapid-overrun counter breaks a
+   persistent overrun loop -- after CAM_RECOVER_GIVEUP rapid recoveries the base
+   stays off so the user can remove the bandwidth culprit (e.g. `ai stream stop`)
+   and restart.  This replaces the old GUI-overlay-specific backoff (#83). */
+#define CAM_RECOVER_WINDOW  8000u   /* ms: window for "rapid" successive recovery */
+#define CAM_RECOVER_GIVEUP  6       /* rapid count -> stop auto-restarting        */
+static volatile int cam_recover_pending;   /* last teardown was an overrun (recover) */
+static int          cam_recover_rapid;     /* consecutive rapid recoveries           */
+static uint32_t     cam_recover_last;      /* HAL tick of the last recovery          */
+static int          cam_start_colorbar;    /* colorbar of the running base (recover) */
 
 /* ---- locking ------------------------------------------------------------ */
 /* Public API entries take the mutex here; all real work below lives in
@@ -974,8 +1015,8 @@ static int camera_set_format_locked(uint8_t res, uint8_t fmt)
 	int jpeg = (fmt == CAM_FMT_JPEG);
 	int rc;
 
-	if (cam_stream_active || cam_ext_sink != NULL)
-		return CAM_ERR_BUSY;           /* streaming/preview owns the DCMI/DMA */
+	if (cam_stream_active)
+		return CAM_ERR_BUSY;           /* base capture owns the DCMI/DMA (#100) */
 	if (!sdram_is_up())
 		return CAM_ERR_STATE;
 	if (res >= CAM_RES__COUNT || fmt >= CAM_FMT__COUNT)
@@ -1334,6 +1375,7 @@ int camera_power_off(void)
 		op_unlock();
 		return CAM_ERR_BUSY;
 	}
+	cam_recover_pending = 0;          /* do not auto-recover into a powered-off sensor */
 	power_off_locked();
 	op_unlock();
 	return 0;
@@ -1645,6 +1687,84 @@ static void drain_stream_sem(void)
 
 static uint32_t cam_elapsed_ms;   /* frozen at teardown for post-stop `stats` */
 
+/* ---- subscriber registry helpers (all under cam_lock) --------------------- */
+
+/* Find the registry slot for sink @p s, or NULL if not registered.  Passing NULL
+   returns the first free slot (used to claim one), or NULL when the table is full. */
+static struct cam_sub *cam_sub_find(struct frame_sink *s)
+{
+	for (int i = 0; i < CAM_MAX_SUBS; i++)
+		if (cam_subs[i].sink == s)
+			return &cam_subs[i];
+	return NULL;
+}
+
+/* Claim/find the registry slot for @p s and mark it enabled for pixel format
+   @p fmt (no attach).  Returns the slot, or NULL if the table is full.  cam_lock
+   held.  A subscriber's own module owns only this `enabled` intent; membership
+   (`attached`) is set later by the attach path. */
+static struct cam_sub *cam_sub_register(struct frame_sink *s, enum camera_format fmt)
+{
+	struct cam_sub *sub = cam_sub_find(s);
+
+	if (sub == NULL)
+		sub = cam_sub_find(NULL);      /* first free slot */
+	if (sub == NULL)
+		return NULL;
+	sub->sink    = s;
+	sub->fmt     = (uint8_t)fmt;
+	sub->enabled = 1;
+	return sub;
+}
+
+/* Attach every enabled subscriber whose format class matches the (freshly
+   inited) base to cam_pipe.  Rollback: on any attach failure detach the ones
+   done this pass and return <0, leaving no partial membership (contract
+   #100.8).  On success returns the count of external subscribers attached
+   (0 => a plain `camera stream` with no subscriber).  cam_lock held; the base
+   was off on entry, so every subscriber starts detached. */
+static int cam_subs_attach_all(void)
+{
+	int n = 0;
+
+	for (int i = 0; i < CAM_MAX_SUBS; i++) {
+		struct cam_sub *sub = &cam_subs[i];
+
+		if (sub->sink == NULL || !sub->enabled || sub->attached)
+			continue;
+		if (sub->fmt != mode.format)
+			continue;                     /* format mismatch: stay enabled + idle */
+		if (frame_pipeline_attach(&cam_pipe, sub->sink) != 0) {
+			/* out of pipeline slots / open() rejected: unwind this pass so the
+			   base start fails clean with no half-attached subscriber. */
+			for (int k = 0; k < CAM_MAX_SUBS; k++) {
+				if (cam_subs[k].attached) {
+					(void)frame_pipeline_detach(&cam_pipe, cam_subs[k].sink);
+					cam_subs[k].attached = 0;
+				}
+			}
+			return -1;
+		}
+		sub->attached = 1;
+		n++;
+	}
+	return n;
+}
+
+/* Detach every attached subscriber (cascade: each frame_pipeline_detach() calls
+   the sink's close()).  Producer-thread teardown and explicit stop both converge
+   here.  A subscriber's close() is non-blocking and must not re-enter the camera
+   API (contract #100.2), so this is safe with cam_lock held. */
+static void cam_subs_detach_all(void)
+{
+	for (int i = 0; i < CAM_MAX_SUBS; i++) {
+		if (cam_subs[i].attached) {
+			(void)frame_pipeline_detach(&cam_pipe, cam_subs[i].sink);
+			cam_subs[i].attached = 0;
+		}
+	}
+}
+
 /* Stop the stream and restore a clean snapshot-ready DCMI/DMA.  Producer-thread
    only (single owner): start / stop / auto-stop / OVR all converge here, so the
    HW teardown never races the producer's repoint.  Short cam_lock for the state
@@ -1653,6 +1773,9 @@ static void cam_stream_teardown(void)
 {
 	(void)tx_mutex_get(&cam_lock, TX_WAIT_FOREVER);
 	if (cam_stream_active) {
+		/* Auto-recover only an overrun/DMA-error stop that was NOT an explicit
+		   stop or a --frames/--secs target completion (#100 contract 6). */
+		cam_recover_pending = cam_stream_err && !cam_stop_req;
 		cam_stream_active = 0;
 		cam_stream_mirror = 0;                /* #82: producer clears the mirror latch */
 		cam_elapsed_ms = HAL_GetTick() - cam_start_tick;
@@ -1665,15 +1788,14 @@ static void cam_stream_teardown(void)
 		   a no-op for the raster path that never enabled it). */
 		__HAL_DCMI_DISABLE_IT(&hdcmi, DCMI_IT_FRAME);
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
-		/* Async stop (OVR/DMA error/auto-stop) while a GUIX preview owns the
-		   stream: detach its sink too and release ownership, so the next
-		   frame_pipeline_init() (a later start) cannot memset a still-linked
-		   sink.  The GUIX sink is synchronous (no cross-thread pin) and its
-		   close() is a no-op, so a producer-thread detach is safe here. */
-		if (cam_ext_sink != NULL) {
-			(void)frame_pipeline_detach(&cam_pipe, cam_ext_sink);
-			cam_ext_sink = NULL;
-		}
+		/* Cascade: detach every attached subscriber too (each detach fires the
+		   sink's close(), the "base detached" notification -- NOT feature stop),
+		   so the next frame_pipeline_init() (a later start) cannot memset a
+		   still-linked sink.  Subscriber sinks are synchronous (no cross-thread
+		   pin) and their close() is non-blocking, so a producer-thread detach is
+		   safe here.  This is the master-switch teardown for both an explicit
+		   stop and an async OVR/auto-stop (contract #100.2). */
+		cam_subs_detach_all();
 		drain_stream_sem();
 		/* HAL_DCMI_Stop leaves CR.DBM set on the stream; re-init the DMA so the
 		   next snapshot's HAL_DCMI_Start_DMA runs a plain single transfer. */
@@ -1838,14 +1960,14 @@ static void cam_stream_service_jpeg(int had_sem)
 		if (freed != NULL) {
 			frame_pipeline_publish(&cam_pipe, cam_jpeg_slot, valid,
 			                       FRAME_FMT_JPEG, mode.width, mode.height, 0u);
-			/* #82: only a plain `camera stream` (no external sink) keeps cam_frame
-			   live for camera save/send.  While an external sink is attached
-			   (MJPEG stream #78 / GUIX preview #56) skip the per-frame ~19.5KB
-			   non-cacheable SDRAM mirror -- matching the raster preview path, which
-			   never mirrors.  save/send then return the last non-external-sink frame
-			   (or CAM_ERR_NO_FRAME).  Gate on the session latch, NOT cam_ext_sink:
-			   an async preview/mjpeg stop NULLs that pointer from another thread and
-			   could otherwise flip the decision mid-pass. */
+			/* #82: only a plain `camera stream` (no subscriber) keeps cam_frame
+			   live for camera save/send.  While a subscriber is attached (MJPEG
+			   #78) skip the per-frame ~19.5KB non-cacheable SDRAM mirror -- matching
+			   the raster preview path, which never mirrors.  save/send then return
+			   the last subscriber-less frame (or CAM_ERR_NO_FRAME).  Gate on the
+			   session latch cam_stream_mirror (fixed at base start), NOT the live
+			   registry: an async subscriber detach on another thread could otherwise
+			   flip the decision mid-pass. */
 			if (cam_stream_mirror)
 				mirror_to_cam_frame(cam_jpeg_slot, valid);
 			cam_jpeg_slot = freed;       /* fill a fresh slot next */
@@ -1868,6 +1990,49 @@ static void cam_stream_service_jpeg(int had_sem)
 	}
 }
 
+static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs);
+
+/* Re-arm the base after an overrun teardown (producer thread; entered when
+   cam_recover_pending is set and no stream is active).  Escalating backoff breaks
+   a persistent overrun loop.  Re-takes cam_lock like a public start, and aborts
+   if an explicit stop/power-off cleared the pending flag (or a start re-armed the
+   base) while we were between the teardown and here. */
+static void cam_stream_recover(void)
+{
+	uint32_t now = HAL_GetTick();
+	int rc;
+
+	(void)tx_mutex_get(&cam_lock, TX_WAIT_FOREVER);
+	if (!cam_recover_pending || cam_stream_active) {
+		cam_recover_pending = 0;
+		(void)tx_mutex_put(&cam_lock);
+		return;                       /* explicit stop/start raced in: give up */
+	}
+	cam_recover_pending = 0;
+
+	if (now - cam_recover_last < CAM_RECOVER_WINDOW)
+		cam_recover_rapid++;
+	else
+		cam_recover_rapid = 0;
+	cam_recover_last = now;
+
+	if (cam_recover_rapid >= CAM_RECOVER_GIVEUP) {
+		(void)tx_mutex_put(&cam_lock);
+		LOG_WRN("base overruns persist; auto-recovery stopped -- use "
+		        "'camera stream start'");
+		return;
+	}
+
+	/* Re-arm at the same mode; cam_subs_attach_all() re-attaches every enabled
+	   subscriber (each sees a close()/open() pair). */
+	rc = stream_start_locked(cam_start_colorbar, cam_target_frames, cam_target_secs);
+	(void)tx_mutex_put(&cam_lock);
+	if (rc != 0)
+		LOG_WRN("base auto-recovery failed (%d) -- use 'camera stream start'", rc);
+	else
+		LOG_INF("base capture auto-recovered after overrun");
+}
+
 /* Dedicated producer (priority 10).  When no stream is running it sleeps
    indefinitely (0 CPU) on the start semaphore; while active it bounded-waits on
    the completion semaphore so --secs / stop / OVR fire even if frames stop
@@ -1879,6 +2044,10 @@ static void cam_producer_entry(ULONG arg)
 	(void)arg;
 	for (;;) {
 		if (!cam_stream_active) {
+			if (cam_recover_pending) {     /* overrun: re-arm the base (#100) */
+				cam_stream_recover();
+				continue;
+			}
 			(void)tx_semaphore_get(&cam_start_sem, TX_WAIT_FOREVER);
 			continue;
 		}
@@ -1891,15 +2060,14 @@ static void cam_producer_entry(ULONG arg)
 	}
 }
 
-/* Start streaming with the ring/pipeline built fresh, attaching the counting
-   sink plus an optional external sink @p ext (GUIX live preview, #56).  cam_lock
-   MUST be held; returns 0 or CAM_ERR_* and NEVER unlocks (the public wrappers
-   own the lock).  On success ownership of @p ext is recorded in cam_ext_sink
-   (NULL for a plain `camera stream`). */
-static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
-                               struct frame_sink *ext)
+/* Start the base capture with the ring/pipeline built fresh, attaching the
+   counting sink plus every enabled + format-compatible subscriber (cam_subs[]).
+   cam_lock MUST be held; returns 0 or CAM_ERR_* and NEVER unlocks (the public
+   wrappers own the lock).  A subscriber enabled *after* the base is running
+   attaches immediately in camera_subscribe(), not here. */
+static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs)
 {
-	int rc;
+	int rc, nx;
 	uint32_t slot_size, nslots;
 
 	if (cam_stream_active)
@@ -1952,10 +2120,16 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	                          mode.width, mode.height);
 	if (frame_pipeline_attach(&cam_pipe, &cam_stat_sink) != 0)
 		return CAM_ERR_STATE;
-	if (ext != NULL && frame_pipeline_attach(&cam_pipe, ext) != 0) {
+	nx = cam_subs_attach_all();       /* enabled + compatible subscribers */
+	if (nx < 0) {
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		return CAM_ERR_STATE;
 	}
+	/* #82: mirror JPEG frames into cam_frame for save/send only for a plain,
+	   subscriber-less stream (nx==0); a JPEG base with a subscriber (MJPEG) skips
+	   the ~19.5 KB non-cacheable copy.  Unused on the raster path.  Latched here
+	   before the producer wakeup, cleared only by the producer at teardown. */
+	cam_stream_mirror = (nx == 0);
 	cam_stream_ovr    = 0;
 	cam_ring_ovr      = 0;
 	cam_stream_fe     = 0;
@@ -1969,18 +2143,17 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	cam_start_tick    = HAL_GetTick();
 	cam_target_frames = frames;
 	cam_target_secs   = secs;
+	cam_start_colorbar = colorbar;    /* remembered for an overrun auto-recover */
 	drain_stream_sem();
 
 	if (mode.is_jpeg) {
 		/* JPEG snapshot-loop (#63): one ring slot is the live DMA target and the
-		   DCMI FRAME ISR delimits each variable-length frame (no DBM, no TC).  ext
-		   is the MJPEG eth_sink (#49 P5) when started via camera_mjpeg_start(), or
-		   NULL for a plain `camera stream` -- either way roll back any attached ext
-		   on a failure path (like the raster branch below). */
+		   DCMI FRAME ISR delimits each variable-length frame (no DBM, no TC).  On
+		   any failure path cascade-detach every subscriber attached above (the
+		   MJPEG eth_sink is the only JPEG-class subscriber, #49 P5). */
 		cam_jpeg_slot = frame_pipeline_acquire(&cam_pipe);
 		if (cam_jpeg_slot == NULL) {
-			if (ext != NULL)
-				frame_pipeline_detach(&cam_pipe, ext);
+			cam_subs_detach_all();
 			frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 			return CAM_ERR_STATE;
 		}
@@ -1995,26 +2168,22 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 			hdma_dcmi.Init.Mode = DMA_NORMAL;
 			(void)HAL_DMA_Init(&hdma_dcmi);
 			__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
-			if (ext != NULL)
-				frame_pipeline_detach(&cam_pipe, ext);
+			cam_subs_detach_all();
 			frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 			drain_stream_sem();
 			LOG_ERR("JPEG stream arm failed");
 			return CAM_ERR_HAL;
 		}
-		cam_ext_sink = ext;               /* #49 P5: record the MJPEG sink owner */
-		cam_stream_mirror = (ext == NULL); /* #82: plain stream mirrors; ext skips */
 		(void)tx_semaphore_put(&cam_start_sem);
-		LOG_INF("stream start jpeg (frames=%lu secs=%lu)",
-		        (unsigned long)frames, (unsigned long)secs);
+		LOG_INF("stream start jpeg (frames=%lu secs=%lu, subs=%d)",
+		        (unsigned long)frames, (unsigned long)secs, nx);
 		return 0;
 	}
 
 	cam_m0 = frame_pipeline_acquire(&cam_pipe);
 	cam_m1 = frame_pipeline_acquire(&cam_pipe);
 	if (cam_m0 == NULL || cam_m1 == NULL) {
-		if (ext != NULL)
-			frame_pipeline_detach(&cam_pipe, ext);
+		cam_subs_detach_all();
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		return CAM_ERR_STATE;
 	}
@@ -2035,8 +2204,7 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	        (uint32_t)cam_m0->data, (uint32_t)cam_m1->data,
 	        mode.frame_words) != HAL_OK) {
 		cam_stream_active = 0;
-		if (ext != NULL)
-			frame_pipeline_detach(&cam_pipe, ext);
+		cam_subs_detach_all();
 		frame_pipeline_detach(&cam_pipe, &cam_stat_sink);
 		LOG_ERR("stream DMA start failed");
 		return CAM_ERR_HAL;
@@ -2047,16 +2215,11 @@ static int stream_start_locked(int colorbar, uint32_t frames, uint32_t secs,
 	hdcmi.Instance->CR |= DCMI_CR_CAPTURE;
 	hdcmi.State = HAL_DCMI_STATE_BUSY;
 
-	cam_ext_sink = ext;               /* record preview ownership (NULL = plain) */
-	cam_stream_mirror = (ext == NULL); /* #82: unused on the raster path (no mirror),
-	                                      set for symmetry / a clean latch lifecycle */
-
 	/* Wake the producer out of its idle FOREVER wait on the dedicated start
 	   semaphore -- never the completion semaphore, so it cannot be miscounted. */
 	(void)tx_semaphore_put(&cam_start_sem);
-	LOG_INF("stream start (frames=%lu secs=%lu%s)",
-	        (unsigned long)frames, (unsigned long)secs,
-	        ext ? ", gui preview" : "");
+	LOG_INF("stream start (frames=%lu secs=%lu, subs=%d)",
+	        (unsigned long)frames, (unsigned long)secs, nx);
 	return 0;
 }
 
@@ -2066,94 +2229,152 @@ int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 
 	if (rc != 0)
 		return rc;
-	if (cam_ext_sink != NULL) {        /* owned by the GUIX live preview (#56) */
-		op_unlock();
-		return CAM_ERR_BUSY;
-	}
-	rc = stream_start_locked(colorbar, frames, secs, NULL);
+	/* Base capture start (#100): allowed unless already streaming.  Subscribers
+	   attach inside stream_start_locked(); there is no single owner to refuse.
+	   An explicit start resets the overrun-recovery backoff. */
+	cam_recover_pending = 0;
+	cam_recover_rapid   = 0;
+	rc = stream_start_locked(colorbar, frames, secs);
 	op_unlock();
 	return rc;
 }
 
-int camera_preview_start(struct frame_sink *s, enum camera_res res)
+int camera_subscribe(struct frame_sink *s, enum camera_format fmt)
 {
+	struct cam_sub *sub;
 	int rc;
 
 	if (s == NULL)
-		return CAM_ERR_PARAM;
-	/* Preview only accepts the streamable small modes (qqvga/qvga): the bigger
-	   raster modes are capture-only (frame_words > 65535) and would set the mode
-	   then fail at stream arm, leaving the mode changed (#69).  Format is fixed
-	   RGB565 (the #56 GUIX sink's only geometry); fps stays the LTDC-clamped
-	   15 fps while the panel scans out. */
-	if (res > CAM_RES_QVGA)
 		return CAM_ERR_PARAM;
 	rc = op_lock();
 	if (rc != 0)
 		return rc;
-	/* JPEG has no LCD decode path (#63): reject preview rather than silently
-	   switching the user's selected format to RGB565. */
-	if (mode.is_jpeg) {
+	sub = cam_sub_register(s, fmt);
+	if (sub == NULL) {
 		op_unlock();
-		return CAM_ERR_PARAM;
+		return CAM_ERR_STATE;             /* registry full */
 	}
-	/* Set the requested preview resolution (RGB565) regardless of the last
-	   `camera res/format`.  Same lock: call the locked helper, never the public
-	   camera_set_format (which would re-take cam_lock).  The set_format gate passes
-	   because no stream/preview owns the DCMI yet. */
-	rc = camera_set_format_locked((uint8_t)res, CAM_FMT_RGB565);
-	if (rc == 0)
-		rc = stream_start_locked(0, 0, 0, s);
+	rc = 0;
+	/* Attach now iff the base is already running and its format matches; otherwise
+	   stay enabled + idle and attach at the next base start (contract #100.1: the
+	   subscriber's enabled intent is orthogonal to base on/off).  A failed attach
+	   (pipeline full / open() reject) leaves no registration. */
+	if (cam_stream_active && !sub->attached && sub->fmt == mode.format) {
+		if (frame_pipeline_attach(&cam_pipe, s) == 0) {
+			sub->attached = 1;
+		} else {
+			sub->sink = NULL;
+			sub->enabled = 0;
+			rc = CAM_ERR_BUSY;
+		}
+	}
 	op_unlock();
 	return rc;
 }
 
+int camera_unsubscribe(struct frame_sink *s)
+{
+	struct cam_sub *sub;
+	int inflight = 0;
+
+	if (s == NULL || op_lock() != 0)
+		return 0;
+	sub = cam_sub_find(s);
+	if (sub != NULL) {
+		if (sub->attached) {
+			/* Detach (no more new consume; close() fires) and report the pins the
+			   sink still holds so the caller can drain its own thread.  The base
+			   keeps running: unsubscribing never stops it (contract #100.2). */
+			inflight = frame_pipeline_detach(&cam_pipe, s);
+			sub->attached = 0;
+		}
+		sub->enabled = 0;
+		sub->sink    = NULL;              /* free the registry slot */
+	}
+	op_unlock();
+	return inflight;
+}
+
 int camera_mjpeg_start(struct frame_sink *s, enum camera_res res)
 {
+	struct cam_sub *sub;
 	int rc;
 
 	if (s == NULL)
 		return CAM_ERR_PARAM;
-	/* JPEG is the snapshot-loop format and gated to res <= VGA (#63/#69): bigger
-	   modes are capture-only.  Unlike camera_preview_start (RGB565 for the LCD),
-	   MJPEG (#49 P5) owns the DCMI in JPEG so the eth_sink receives compressed
-	   frames straight from frame_pipeline_publish(FRAME_FMT_JPEG). */
+	/* JPEG is the snapshot-loop format, gated to res <= VGA (#63/#69).  MJPEG
+	   (#49 P5) is a JPEG-class subscriber that also owns the base start in Phase 1:
+	   it sets JPEG then starts the base with itself attached.  If the base is
+	   already running (a raster `camera stream` / preview) it is refused BUSY --
+	   the two format classes are exclusive (one DCMI, one format at a time). */
 	if (res > CAM_RES_VGA)
 		return CAM_ERR_PARAM;
 	rc = op_lock();
 	if (rc != 0)
 		return rc;
-	/* Set JPEG at the requested resolution, then arm the stream with @p s as the
-	   external sink owner.  Both helpers gate on DCMI ownership: if a GUIX preview
-	   or a plain `camera stream` already owns the camera they return CAM_ERR_BUSY,
-	   so MJPEG never steals the DCMI (#73 ownership model). */
+	if (cam_stream_active) {
+		op_unlock();
+		return CAM_ERR_BUSY;              /* base already streaming (format clash) */
+	}
+	sub = cam_sub_register(s, CAM_FMT_JPEG);
+	if (sub == NULL) {
+		op_unlock();
+		return CAM_ERR_STATE;
+	}
+	/* Set JPEG @res, then start the base -- cam_subs_attach_all() attaches the
+	   now enabled + compatible eth_sink (calls eth_open).  Roll the registration
+	   back on any failure so a failed start leaves no dangling subscriber. */
+	cam_recover_pending = 0;
+	cam_recover_rapid   = 0;
 	rc = camera_set_format_locked((uint8_t)res, CAM_FMT_JPEG);
 	if (rc == 0)
-		rc = stream_start_locked(0, 0, 0, s);
+		rc = stream_start_locked(0, 0, 0);
+	if (rc != 0) {
+		sub->attached = 0;
+		sub->enabled = 0;
+		sub->sink = NULL;
+	}
 	op_unlock();
 	return rc;
 }
 
-int camera_preview_stop(struct frame_sink *s)
+int camera_mjpeg_stop(struct frame_sink *s)
 {
+	struct cam_sub *sub;
 	int inflight = 0;
+	int attached_here, jpeg_owner;
 
-	if (op_lock() != 0)
-		return 0;
-	if (s != NULL && cam_ext_sink == s) {
-		/* Still the owner: unlink (no more new consume) -- detach reports the
-		   pins held for s (incl. a frame already pre-pinned by publish() but not
-		   yet consumed), so the caller can drain it -- release ownership, then
-		   ask the producer to tear the stream down. */
-		inflight = frame_pipeline_detach(&cam_pipe, s);
-		cam_ext_sink = NULL;
-		if (cam_stream_active) {
-			cam_stop_req = 1;
-			(void)tx_semaphore_put(&cam_stream_sem);
+	if (s == NULL || op_lock() != 0)
+		return 0;                        /* cam_sub_find(NULL) would match a free slot */
+	sub = cam_sub_find(s);
+	/* Ownership of the CURRENT base = this sink is attached (in the live pipeline).
+	   Only that justifies tearing the base down: a registered-but-detached sink (an
+	   overrun async-detached it, or a different-format base has since started) does
+	   NOT own whatever base is live now.  Separately, a registered JPEG sink while
+	   the base format is JPEG owns a mid-recovery JPEG base (MJPEG is the sole JPEG
+	   subscriber and cannot register while a base runs); that is used only to cancel
+	   a pending re-arm, never to stop a live base.  mode is read under cam_lock. */
+	attached_here = (sub != NULL && sub->attached);
+	jpeg_owner    = (sub != NULL && sub->fmt == CAM_FMT_JPEG && mode.is_jpeg);
+	if (sub != NULL) {
+		if (sub->attached) {
+			/* Detach the MJPEG sink (close() fires) and report its in-flight pins
+			   so the caller drains it. */
+			inflight = frame_pipeline_detach(&cam_pipe, s);
+			sub->attached = 0;
 		}
+		sub->enabled = 0;
+		sub->sink = NULL;
 	}
-	/* else: an async teardown (OVR) already released ownership -- do nothing, so
-	   a delayed `off` cannot stop a different stream started since. */
+	if (attached_here && cam_stream_active) {
+		cam_recover_pending = 0;             /* explicit stop cancels any auto-recover */
+		cam_stop_req = 1;
+		(void)tx_semaphore_put(&cam_stream_sem);
+	} else if (jpeg_owner) {
+		/* Base already torn down by an overrun (mid-recovery): cancel the pending
+		   re-arm so MJPEG's JPEG base does not resurrect with no consumer. */
+		cam_recover_pending = 0;
+	}
 	op_unlock();
 	return inflight;
 }
@@ -2169,10 +2390,11 @@ int camera_stream_stop(void)
 
 	if (rc != 0)
 		return rc;
-	if (cam_ext_sink != NULL) {        /* owned by the GUIX live preview (#56) */
-		op_unlock();
-		return CAM_ERR_BUSY;
-	}
+	/* Master switch (#100): `camera stream stop` cascades -- the producer teardown
+	   detaches every subscriber (each close()) and stops the DCMI.  Never refused
+	   for having subscribers; auto-stop is intentionally absent (an idle base with
+	   no subscribers stays ON until an explicit stop). */
+	cam_recover_pending = 0;              /* explicit stop cancels any auto-recover */
 	if (cam_stream_active) {
 		cam_stop_req = 1;
 		(void)tx_semaphore_put(&cam_stream_sem);  /* producer tears down */

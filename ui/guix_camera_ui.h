@@ -18,19 +18,21 @@
  *   camera_ui_init()   register the GUIX widget-tree builder with guix_glue
  *                      (boot-safe: no GUIX/camera I/O).  Call once from
  *                      tx_application_define().
- *   camera_ui_start()  bring GUIX up (or resume) and request the live preview.
+ *   camera_ui_start()  bring GUIX up (or resume) and subscribe the live preview.
  *                      Shared by the boot path (#60) and `gui start`.  Boot-safe:
  *                      it only starts GUIX and posts a one-shot autostart event;
- *                      the camera probe/configure (blocking I2C) runs LATER on the
- *                      GUIX system thread, never in tx_application_define().
- *   camera_ui_stop()   stop the preview, blank the screen and hand the display
- *                      back to `lcd` (`gui stop`).  Thread context only.
+ *                      the base-capture bring-up + camera probe (blocking I2C) runs
+ *                      LATER on the GUIX system thread, never in
+ *                      tx_application_define().
+ *   camera_ui_stop()   unsubscribe the preview (the base keeps running), blank the
+ *                      screen and hand the display back to `lcd` (`gui stop`).
+ *                      Thread context only.
  *
- * Why the deferral: camera_preview_start() probes the OV5640 over I2C (blocking),
- * which must not run before the scheduler.  camera_ui_start() therefore posts
- * GX_EVENT_CAMERA_AUTOSTART; the GUIX thread runs the actual start once scheduling
- * is live.  A small volatile flag protocol serialises that GUIX-thread start
- * against a shell-thread `gui stop`.
+ * Why the deferral: the boot base-capture bring-up (camera_stream_start()) probes
+ * the OV5640 over I2C (blocking), which must not run before the scheduler.
+ * camera_ui_start() therefore posts GX_EVENT_CAMERA_AUTOSTART; the GUIX thread
+ * subscribes the preview and (once, at boot) starts the base once scheduling is
+ * live.  A volatile flag protocol serialises that against a shell-thread `gui stop`.
  */
 #ifndef GUIX_CAMERA_UI_H
 #define GUIX_CAMERA_UI_H
@@ -51,20 +53,11 @@ void camera_ui_init(void);
  *  success, or a negative GUIX bring-up error (GUIX_ERR_STATE: display down). */
 int camera_ui_start(void);
 
-/** Stop the live preview, blank the screen and hand the display back to `lcd`
- *  (`gui stop`).  Thread context only.  Idempotent.  Returns 0. */
+/** Stop the live preview (unsubscribe from the base -- the base keeps running for
+ *  other subscribers), blank the screen and hand the display back to `lcd`
+ *  (`gui stop`).  Thread context only.  Idempotent.  Returns 0.  Since Epic #99
+ *  Phase 1 (#100) this no longer stops the base capture nor the AI subscriber. */
 int camera_ui_stop(void);
-
-/** Enable/disable the on-preview face-detect bbox overlay (issue #83, Epic #80 P4).
- *  Enabling feeds the live preview frames into the NN inference worker and draws the
- *  returned face boxes onto the image; it needs a running preview and claims the
- *  single NN session (mutually exclusive with `ai bench` / `ai stream`).  Serialized
- *  against the async camera teardown.  Returns 0 on success, -1 if no preview is
- *  running, or a negative feed-start error.  Idempotent. */
-int camera_ui_overlay_set(bool on);
-
-/** True while the face-detect overlay is enabled. */
-bool camera_ui_overlay_get(void);
 
 #ifdef __cplusplus
 }

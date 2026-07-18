@@ -253,9 +253,15 @@ static int cmd_ai_run(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "stream already running -- use 'ai stream stats'\r\n");
 		return 1;
 	}
+	/* The AI is a subscriber now (#100): it needs the base capture running to get a
+	   frame.  A single-shot `ai run` cannot pull a frame from an idle base. */
+	if (!camera_streaming()) {
+		cli_error(sh, "base capture is off -- run 'camera stream start' first\r\n");
+		return 1;
+	}
 	rc = nn_camera_start(CAM_RES_QVGA);
 	if (rc != 0) {
-		cli_error(sh, "start failed (%d): camera busy, no sensor, or no model "
+		cli_error(sh, "start failed (%d): NN busy, or no model "
 		              "('ai model load <bin>')?\r\n", rc);
 		return 1;
 	}
@@ -271,7 +277,7 @@ static int cmd_ai_run(struct cli_instance *sh, int argc, char **argv)
 	nn_camera_stop();
 
 	if (s.infers < 1) {
-		cli_warn(sh, "no inference completed (no frames? camera connected?)\r\n");
+		cli_warn(sh, "no inference completed (base streaming RGB565? camera connected?)\r\n");
 		return 0;
 	}
 	cli_print(sh, "inference: %lu us, %lu detections\r\n",
@@ -295,11 +301,17 @@ static int cmd_ai_stream_start(struct cli_instance *sh, int argc, char **argv)
 	}
 	rc = nn_camera_start(res);
 	if (rc != 0) {
-		cli_error(sh, "start failed (%d): camera busy / no sensor / SDRAM down / "
+		cli_error(sh, "start failed (%d): NN busy (bench/another stream) / SDRAM down / "
 		              "no model ('ai model load <bin>')?\r\n", rc);
 		return 1;
 	}
-	cli_print(sh, "inference stream started (worker prio 18, best-effort)\r\n");
+	/* Enabled; attaches to the base if it is streaming RGB565, else stays idle until
+	   `camera stream start` (the AI intent is independent of the base, #100). */
+	if (!camera_streaming())
+		cli_print(sh, "inference enabled -- start the base ('camera stream start') "
+		              "to run\r\n");
+	else
+		cli_print(sh, "inference stream started (worker prio 18, best-effort)\r\n");
 	return 0;
 }
 
@@ -312,10 +324,6 @@ static int cmd_ai_stream_stop(struct cli_instance *sh, int argc, char **argv)
 	if (rc == -1) {
 		cli_warn(sh, "not running\r\n");
 		return 0;
-	}
-	if (rc == -3) {
-		cli_error(sh, "owned by the GUI face-detect overlay; use 'gui overlay off'\r\n");
-		return 1;
 	}
 	if (rc != 0) {
 		cli_error(sh, "stop timed out (%d)\r\n", rc);
@@ -372,7 +380,7 @@ static int cmd_ai_model_load(struct cli_instance *sh, const char *path)
 
 	if (nn_camera_running()) {
 		cli_error(sh, "stop the inference stream first "
-		              "('ai stream stop' / 'gui overlay off')\r\n");
+		              "('ai stream stop')\r\n");
 		return 1;
 	}
 	if (!sdram_is_up()) {
@@ -449,7 +457,7 @@ static int cmd_ai_model(struct cli_instance *sh, int argc, char **argv)
 		int rc;
 		if (nn_camera_running()) {
 			cli_error(sh, "stop the inference stream first "
-			              "('ai stream stop' / 'gui overlay off')\r\n");
+			              "('ai stream stop')\r\n");
 			return 1;
 		}
 		if (nn_model_open(&m) != 0) {

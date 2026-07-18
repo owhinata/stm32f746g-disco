@@ -12,6 +12,32 @@ commands, and the GUIX camera UI all want them. This page is the single
 reference for **who owns what in each state, and which shell commands are
 allowed** — the model behind the cross-subsystem guards in `shell/cmds/cmd_*.c`.
 
+!!! warning "The DCMI/camera ownership model was reworked in #100 (this section gets a full rewrite in Phase 3, #102)"
+    Epic #99 Phase 1 (#100) moved the camera from "mode ownership" (a higher
+    feature swallows lower ones via a single `cam_ext_sink` pointer) to an
+    **explicit base capture (`camera stream`) + subscriber cascade** model. Key points:
+
+    - **base = `camera stream`** (ON via `camera stream start [res]`) is the sole DCMI
+      capture. A subscriber registry `cam_subs[]` in `port/camera/camera.c`
+      (`{sink, fmt, enabled, attached}` under `cam_lock`) owns pipeline membership
+      (the single `cam_ext_sink` owner pointer is gone).
+    - **features = subscribers**: GUI preview / AI inference (nncam) / MJPEG each
+      enable themselves via their own start/stop and attach their sink only while the
+      base is streaming AND the format matches (gui/ai = RGB565, mjpeg = JPEG). A
+      subscriber's enabled state is **orthogonal** to base on/off.
+    - **`camera stream stop` / `camera off` = cascade**: every attached subscriber is
+      detached via `close()` and the producer stops (a master switch, not a BUSY
+      refusal). There is **no auto-stop** (an idle base with no subscribers stays ON
+      until an explicit stop).
+    - **the `gui overlay` command is gone**: the preview draws face bboxes whenever
+      `ai stream` is running.
+    - **DCMI overrun auto-recovery moved into the base capture (producer)** (the old
+      GUI-overlay-specific backoff is gone).
+    - boot subscribes the preview and starts the base once (a live preview out of the box).
+
+    The "three modes (SHELL / CAM-STREAM / GUI)" tables below describe the OLD model
+    and are replaced in #102.
+
 ## Shared resources and their owners
 
 | Resource | Owner flag (where) | Taken by | Released by |

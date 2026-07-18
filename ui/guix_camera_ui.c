@@ -44,9 +44,9 @@
 #include "guix_display.h"        /* CAM_VIEW_*, guix_display_cam_* (B2/view)      */
 #include "ltdc_display.h"        /* LTDC_LCD_WIDTH / HEIGHT                       */
 
-#include "camera.h"              /* camera_set_x / camera_get_settings, ranges, enums */
+#include "camera.h"              /* camera_subscribe / camera_set_x / ranges, enums */
 #include "frame_pipeline.h"      /* struct frame_sink / frame_desc, FRAME_*      */
-#include "nn_camera.h"           /* face-detect overlay feed + dets (#83)         */
+#include "nn_camera.h"           /* nn_camera_running / nn_camera_dets_get (bbox, #83) */
 
 #include "gx_api.h"
 #include "tx_api.h"
@@ -59,8 +59,8 @@
 
 /* User events posted to the GUIX root (target = root). */
 #define GX_EVENT_CAMERA_FRAME      (GX_FIRST_USER_EVENT + 0)  /* new view frame   */
-#define GX_EVENT_CAMERA_AUTOSTART  (GX_FIRST_USER_EVENT + 1)  /* start preview    */
-#define GX_EVENT_CAMERA_RESTART    (GX_FIRST_USER_EVENT + 2)  /* auto-recover overrun */
+#define GX_EVENT_CAMERA_AUTOSTART  (GX_FIRST_USER_EVENT + 1)  /* subscribe preview */
+#define GX_EVENT_CAMERA_GEOM       (GX_FIRST_USER_EVENT + 2)  /* base res changed  */
 
 /* ---- Theme: colour + font + pixelmap tables (resource IDs = table indices). -- */
 #define RGB565(r, g, b) ((GX_COLOR)((((r) >> 3) << 11) | (((g) >> 2) << 5) | \
@@ -121,7 +121,7 @@ static GX_TEXT_BUTTON   btn_back;
 static bool settings_active;
 
 static void camera_ui_autostart(void);   /* forward: called by the root handler */
-static void camera_ui_auto_recover(void);/* forward: overrun auto-recovery (root)  */
+static void apply_view_geometry(int idx); /* forward: CAMERA_GEOM re-sync (root)   */
 static void controls_sync(void);         /* forward: re-read settings into caches */
 static void controls_update_display(void);
 static void enter_preview(void);         /* forward: Back / autostart -> preview  */
@@ -200,86 +200,67 @@ static bool        cam_view_inited;
 static volatile int cam_redraw_pending;
 static volatile int cam_sink_inflight;
 
-/* Preview lifecycle flags (GUIX + shell threads); see camera_ui_autostart(). */
+/* Preview lifecycle flags (GUIX + shell threads).  Since Epic #99 Phase 1 (#100)
+   the GUI preview is a *subscriber* of the base capture, not its owner.
+   preview_running is set by cam_sink_open when the sink attaches and cleared by
+   cam_sink_close (a base stop / DCMI overrun / cascade); a base stop freezes the
+   last frame (preview kept visible) and a base restart re-attaches so frames
+   resume.  The base owns the DCMI overrun auto-recovery now (camera.c #100), so
+   there is no GUI backoff.  stop_requested gates a `gui stop` racing the subscribe. */
 static volatile int preview_running;
-static volatile int start_in_progress;
 static volatile int stop_requested;
 
-/* Face-detect overlay (#83).  overlay_lock serializes the overlay lifecycle
-   {preview_running check, overlay_wanted, overlay_on, nn feed start/abort} so
-   concurrent shells and the async camera teardown cannot diverge them.
-   overlay_wanted is the user's intent (gui overlay on/off); overlay_on is the active
-   feed.  They differ only transiently: a DCMI overrun aborts the feed (overlay_on=0)
-   but keeps the intent, so the auto-recovery restores it.  preview_reformatting
-   suppresses the async-teardown handling during a resolution change (the feed is
-   preserved across it -- the model input is a fixed 128x128 regardless of preview
-   resolution). */
-static TX_MUTEX     overlay_lock;
-static bool         overlay_lock_ready;   /* overlay_lock created OK at init          */
-static volatile int overlay_wanted;       /* user intent (gui overlay on/off)         */
-static volatile int overlay_on;           /* feed active                              */
-static volatile int preview_reformatting;
-
-/* Auto-recovery backoff: a DCMI overrun (the overlay's continuous inference can
-   contend with the DCMI DMA for SDRAM bandwidth) tears the preview down; we
-   auto-restart it.  QVGA has bandwidth headroom so an overrun is now rare (#84
-   removed the 480x272 preview that reliably provoked it), but the recovery stays
-   as a safety net.  Track rapid successive recoveries so a persistent overrun loop
-   (overlay -> overrun -> restart -> overlay ...) is broken: after RAPID_DROP drop the
-   overlay, after RAPID_GIVEUP stop auto-restarting. */
-static ULONG recover_last_tick;
-static int   recover_rapid;
-#define OVERLAY_RECOVER_WINDOW  8000u      /* ticks (=ms): "rapid" successive recovery */
-#define OVERLAY_RECOVER_DROP    3          /* rapid count -> drop the overlay          */
-#define OVERLAY_RECOVER_GIVEUP  6          /* rapid count -> stop auto-restarting       */
+/* Latest base geometry delivered to the sink (res_tbl index), latched by
+   cam_sink_open off the GUIX thread; the CAMERA_GEOM handler re-syncs the GUIX
+   pixmap/widget geometry to it on the GUIX thread when the base res differs. */
+static volatile int cam_delivered_idx = -1;
 
 /* Box outline colour: bright green (RGB565), high contrast on a camera image. */
 #define OVERLAY_BOX_COLOR  0x07E0u
 
-/* Start / abort the inference feed under overlay_lock (the caller holds it).
-   overlay_on tracks the active feed; overlay_wanted (the user's intent) is owned by
-   the public setter and preserved across an overrun so the auto-recovery can restore
-   the feed.  Feeding needs a live preview; feed_start also claims the single NN
-   session (so it can return busy while a torn-down worker still holds it -- the
-   CAMERA_FRAME handler retries). */
-static int overlay_feed_start_locked(void)
+/* Map a delivered frame geometry to a res_tbl index, or -1 if unknown. */
+static int res_idx_from_w(uint16_t w)
 {
-	int rc;
-
-	if (overlay_on)
-		return 0;
-	if (!preview_running)
-		return -1;
-	rc = nn_camera_feed_start();
-	if (rc == 0)
-		overlay_on = 1;
-	return rc;
-}
-
-static void overlay_feed_abort_locked(void)
-{
-	if (overlay_on) {
-		overlay_on = 0;
-		nn_camera_feed_abort();             /* non-blocking; worker releases session */
-	}
+	for (int i = 0; i < N_RES; i++)
+		if (res_tbl[i].w == w)
+			return i;
+	return -1;
 }
 
 static struct frame_sink guix_cam_sink;
 
+/* Sink attach (any thread: base start on the producer/shell, or a live subscribe).
+   The GUI adapts to whatever streamable RGB565 geometry the base publishes (QQVGA
+   / QVGA): arm the display blit geometry (thread-safe, ltdc-locked) and latch the
+   delivered res index; if it differs from the current GUIX geometry, post
+   CAMERA_GEOM so the GUIX thread re-syncs the pixmap/icon.  Rejects a non-RGB565 or
+   unknown geometry (would not fit cam_view_buf). */
 static int cam_sink_open(void *ctx, enum frame_format fmt, uint16_t w, uint16_t h)
 {
+	int idx;
+
 	(void)ctx;
-	if (fmt != FRAME_FMT_RGB565 ||
-	    w != res_tbl[cur_res_idx].w || h != res_tbl[cur_res_idx].h)
+	if (fmt != FRAME_FMT_RGB565)
 		return -1;
+	idx = res_idx_from_w(w);
+	if (idx < 0 || res_tbl[idx].h != h)
+		return -1;                          /* not a preview geometry we can render */
+
+	if (guix_display_cam_preview_begin(cam_view_buf, w, h,
+	                                   RES_VIEW_X(idx), RES_VIEW_Y(idx)) != 0)
+		return -1;
+	cam_delivered_idx = idx;
+	preview_running = 1;
+	if (idx != cur_res_idx)
+		(void)guix_post_root_event(GX_EVENT_CAMERA_GEOM);
 	return 0;
 }
 
-/* Draw the latest face detections as bounding boxes into the view buffer (producer
+/* Draw the latest face detections as bounding boxes into the view buffer (GUIX
    thread, right after the frame store).  The dets are normalized [0,1] to the
-   (x/y-squashed) full preview frame, which maps 1:1 onto the view buffer, so they
-   scale directly.  Only called while overlay_on; boxes are overwritten by the next
-   store, so they vanish when the overlay is turned off or a detection is lost. */
+   full preview frame, which maps 1:1 onto the view buffer, so they scale directly.
+   nn_camera_dets_get() returns 0 when inference is not running or has no detection,
+   so the boxes clear when `ai stream stop` runs or a face is lost. */
 static void overlay_draw_boxes(void)
 {
 	struct bf_det d[BF_MAX_DET];
@@ -299,8 +280,6 @@ static int cam_sink_consume(void *ctx, const struct frame_desc *f)
 	cam_sink_inflight++;
 	if (!pending)
 		rc = guix_display_cam_view_store((const uint16_t *)f->data);
-	if (overlay_on)
-		nn_camera_feed(f);              /* preprocess into staging (reads f->data)   */
 	camera_frame_put(&guix_cam_sink, f);
 	if (rc == 0 && !pending) {
 		/* Box drawing is deferred to the GUIX thread's CAMERA_FRAME handler, off the
@@ -313,29 +292,17 @@ static int cam_sink_consume(void *ctx, const struct frame_desc *f)
 	return rc;
 }
 
-/* Called by frame_pipeline_detach() on a normal stop AND on the producer's async
-   teardown (DCMI overrun): clear preview_running so a restart re-arms.  On an async
-   overrun the overlay feed must be torn down (so it cannot hold the NN session with a
-   dead producer) and -- unless this is a deliberate gui stop -- the preview
-   auto-restarted (#83 auto-recovery).  A resolution change (preview_reformatting)
-   deliberately preserves the feed across the stop, so skip then.  The feed abort is
-   direct (not via the event queue) so the session cleanup is reliable; the restart is
-   a best-effort event.  This runs under the camera driver lock; the abort is
-   non-blocking and the lock order is one-way (cam driver lock -> overlay_lock -> nn
-   lock), so it cannot deadlock. */
+/* Base detached this subscriber: a normal `camera stream stop`, a DCMI overrun, or
+   a cascade.  A base *stop*, not a GUI stop (contract #100.2): just clear
+   preview_running so the last frame freezes on screen -- the preview stays visible
+   and resumes when the base re-attaches (cam_sink_open re-arms).  Non-blocking, no
+   camera API re-entry, so it is safe under the camera driver lock.  The base owns
+   the overrun auto-recovery now (camera.c #100), so there is nothing to restart or
+   tear down here (the AI subscriber's own close handles its bbox/session). */
 static void cam_sink_close(void *ctx)
 {
 	(void)ctx;
 	preview_running = 0;
-	if (preview_reformatting)
-		return;                             /* resolution change: keep the feed */
-	if (overlay_lock_ready) {
-		tx_mutex_get(&overlay_lock, TX_WAIT_FOREVER);
-		overlay_feed_abort_locked();        /* preserves overlay_wanted for recovery */
-		tx_mutex_put(&overlay_lock);
-	}
-	if (!stop_requested)
-		(void)guix_post_root_event(GX_EVENT_CAMERA_RESTART);
 }
 
 static struct frame_sink guix_cam_sink = {
@@ -483,22 +450,13 @@ static UINT camera_ui_root_event(GX_WIDGET *widget, GX_EVENT *event_ptr)
 		   posting; only skip the icon redraw while the settings screen covers it. */
 		cam_redraw_pending = 0;
 		if (!settings_active) {
-			/* Restore the overlay feed once the NN session (held briefly by a
-			   torn-down worker after an auto-recovered overrun) is free again.
-			   Re-check overlay_wanted INSIDE the lock: a `gui overlay off` could have
-			   cleared it between the lock-free test and here. */
-			if (overlay_wanted && !overlay_on && overlay_lock_ready) {
-				tx_mutex_get(&overlay_lock, TX_WAIT_FOREVER);
-				if (overlay_wanted && !overlay_on)
-					(void)overlay_feed_start_locked();
-				tx_mutex_put(&overlay_lock);
-			}
 			/* Draw the face boxes here (GUIX thread) rather than on the producer:
 			   the producer just stored this frame into cam_view_buf, so stamping the
 			   boxes on top now -- before the icon redraw reads it -- keeps the boxes
-			   off the DCMI-servicing critical path (#83).  overlay_draw_boxes() is a
-			   no-op with no detections, so the box clears when a face is lost. */
-			if (overlay_on)
+			   off the DCMI-servicing critical path (#83).  Drawn whenever inference is
+			   running; overlay_draw_boxes() is a no-op with no detections, so the box
+			   clears when `ai stream stop` runs or a face is lost. */
+			if (nn_camera_running())
 				overlay_draw_boxes();
 			gx_system_dirty_mark((GX_WIDGET *)&cam_icon);
 		}
@@ -506,8 +464,20 @@ static UINT camera_ui_root_event(GX_WIDGET *widget, GX_EVENT *event_ptr)
 	case GX_EVENT_CAMERA_AUTOSTART:
 		camera_ui_autostart();
 		return GX_SUCCESS;
-	case GX_EVENT_CAMERA_RESTART:
-		camera_ui_auto_recover();
+	case GX_EVENT_CAMERA_GEOM:
+		/* The base publishes a different resolution than the current GUIX geometry
+		   (a `camera res` + restart from the shell, say).  Re-sync the pixmap/icon
+		   on the GUIX thread to the delivered geometry. */
+		{
+			int idx = cam_delivered_idx;
+			if (idx >= 0 && idx != cur_res_idx) {
+				cur_res_idx = idx;
+				apply_view_geometry(idx);
+				gx_text_button_text_set(&btn_res, res_tbl[idx].name);
+				guix_display_cam_set_visible(!settings_active);
+				gx_system_dirty_mark((GX_WIDGET *)&preview_screen);
+			}
+		}
 		return GX_SUCCESS;
 	default:
 		return gx_window_root_event_process((GX_WINDOW_ROOT *)widget, event_ptr);
@@ -516,17 +486,20 @@ static UINT camera_ui_root_event(GX_WIDGET *widget, GX_EVENT *event_ptr)
 
 /* ---- preview start / stop -------------------------------------------------- */
 
+/* Unsubscribe the preview sink from the base (the base keeps running for other
+   subscribers) and blank the preview.  Used by `gui stop`. */
 static void preview_teardown(void)
 {
 	int pending, i;
 
-	pending = camera_preview_stop(&guix_cam_sink);
+	pending = camera_unsubscribe(&guix_cam_sink);
 	if (pending > 0)
 		tx_thread_sleep(1);
 	for (i = 0; i < 100 && cam_sink_inflight > 0; i++)
 		tx_thread_sleep(1);
 	if (cam_sink_inflight > 0)
 		LOG_WRN("camera preview drain timeout (inflight=%d)", cam_sink_inflight);
+	preview_running = 0;
 	guix_display_cam_set_visible(false);
 	guix_display_cam_preview_end();
 	cam_redraw_pending = 0;
@@ -553,141 +526,92 @@ static void apply_view_geometry(int idx)
 	gx_widget_resize(&cam_icon, &rc);
 }
 
-/* Shared GUIX-thread preview start: arm B2 with res_tbl[idx]'s geometry and start
-   the camera stream, honouring the start/stop race protocol.  @p visible is true
-   for a normal preview-screen start and false when restarting under the settings
-   screen (the camera rect stays hidden until Back).  Returns 0 on success. */
-static int preview_start_core(int idx, bool visible)
+/* Subscribe the preview sink to the base capture (GUIX thread).  The GUI is a
+   subscriber now (#100): this does NOT start the base -- it attaches iff the base
+   is already streaming RGB565 (cam_sink_open arms the blit geometry), otherwise it
+   stays enabled + idle and attaches at the next `camera stream start`.  @p visible
+   controls whether the camera rect is shown (false while under the settings screen).
+   Returns 0, or <0 on a hard subscribe failure. */
+static int preview_subscribe(bool visible)
 {
 	int rc;
 
-	if (stop_requested || !guix_is_up() || start_in_progress || preview_running)
+	if (stop_requested || !guix_is_up())
 		return -1;
-	start_in_progress = 1;
-	preview_running = 1;             /* set before attach; only ever cleared after */
-
 	guix_display_cam_set_visible(visible);
-	if (guix_display_cam_preview_begin(cam_view_buf, res_tbl[idx].w, res_tbl[idx].h,
-	                                   RES_VIEW_X(idx), RES_VIEW_Y(idx)) != 0) {
-		preview_running = 0;
-		guix_display_cam_set_visible(false);
-		start_in_progress = 0;
-		LOG_ERR("camera preview geometry invalid");
-		return -1;
-	}
 	cam_redraw_pending = 0;
-
-	rc = camera_preview_start(&guix_cam_sink, res_tbl[idx].res);
+	rc = camera_subscribe(&guix_cam_sink, CAM_FMT_RGB565);
 	if (rc != 0) {
-		preview_running = 0;
 		guix_display_cam_set_visible(false);
-		guix_display_cam_preview_end();
-		LOG_ERR("camera preview start failed (%d)", rc);
-		start_in_progress = 0;
+		LOG_ERR("camera preview subscribe failed (%d)", rc);
 		return rc;
 	}
-	if (stop_requested) {            /* gui stop raced the probe -> roll back */
-		preview_teardown();
-		preview_running = 0;
-		start_in_progress = 0;
-		LOG_INF("camera preview start raced gui stop; rolled back");
-		return -1;
-	}
-	start_in_progress = 0;
 	return 0;
 }
 
-/* GUIX-thread preview start (GX_EVENT_CAMERA_AUTOSTART).  Also forces the UI back
-   to the preview screen on every (re)start -- this runs on the GUIX thread after
-   guix_start's gx_widget_show(root) (which would otherwise leave BOTH screens
+/* Boot-only: bring the base capture up once so the board shows a live preview out
+   of the box.  Set to 1 after the first autostart; thereafter `gui start`/`stop`
+   only toggle the subscription -- the base runs until an explicit `camera stream
+   stop` (the user's #100 choice). */
+static int base_autostarted;
+
+/* GUIX-thread preview bring-up (GX_EVENT_CAMERA_AUTOSTART).  Also forces the UI
+   back to the preview screen on every (re)start -- this runs on the GUIX thread
+   after guix_start's gx_widget_show(root) (which would otherwise leave BOTH screens
    visible), so it is the right place to hide settings_screen that the show
-   re-exposed (a non-GUIX thread must not touch the widget tree).  Resumes at the
-   current resolution (boot default QVGA; a prior `gui stop` keeps the selection). */
+   re-exposed (a non-GUIX thread must not touch the widget tree). */
 static void camera_ui_autostart(void)
 {
 	enter_preview();                /* preview shown, settings hidden, B2 per state */
 	apply_view_geometry(cur_res_idx);
-	if (preview_start_core(cur_res_idx, true) == 0)
-		LOG_INF("camera preview on");
+	if (preview_subscribe(true) != 0)
+		return;
+	/* Start the base ONCE at boot.  The camera probe (blocking I2C) runs here on the
+	   GUIX thread, never before the scheduler.  A failure (no sensor) just leaves the
+	   preview subscribed + idle until `camera stream start`. */
+	if (!base_autostarted) {
+		base_autostarted = 1;
+		if (camera_stream_start(0, 0, 0) == 0)
+			LOG_INF("base capture on (boot); camera preview on");
+		else
+			LOG_INF("camera preview subscribed; base off "
+			        "(start with 'camera stream start')");
+	} else {
+		LOG_INF("camera preview subscribed");
+	}
 }
 
-/* Auto-recover the preview after a DCMI overrun (GUIX thread, GX_EVENT_CAMERA_RESTART,
-   posted by cam_sink_close).  Re-arm the stream at the current resolution -- keeping
-   the current screen (visible only on the preview screen) -- and let the CAMERA_FRAME
-   handler restore the overlay once the NN session frees.  An escalating backoff breaks
-   a persistent overrun loop (overlay -> overrun -> restart -> overlay ...): after
-   OVERLAY_RECOVER_DROP rapid recoveries drop the overlay (the bandwidth culprit) but
-   keep the bare preview; after OVERLAY_RECOVER_GIVEUP stop auto-restarting entirely. */
-static void camera_ui_auto_recover(void)
-{
-	ULONG now = tx_time_get();
-
-	if (stop_requested || preview_running || preview_reformatting)
-		return;                             /* a deliberate stop/restart intervened */
-
-	if (now - recover_last_tick < OVERLAY_RECOVER_WINDOW)
-		recover_rapid++;
-	else
-		recover_rapid = 0;
-	recover_last_tick = now;
-
-	if (recover_rapid >= OVERLAY_RECOVER_DROP && overlay_wanted && overlay_lock_ready) {
-		tx_mutex_get(&overlay_lock, TX_WAIT_FOREVER);
-		overlay_wanted = 0;
-		overlay_feed_abort_locked();
-		tx_mutex_put(&overlay_lock);
-		LOG_WRN("repeated overruns; face overlay auto-disabled (preview kept)");
-	}
-	if (recover_rapid >= OVERLAY_RECOVER_GIVEUP) {
-		LOG_WRN("preview overruns persist; auto-recovery stopped -- use 'gui start'");
-		return;
-	}
-	if (preview_start_core(cur_res_idx, !settings_active) != 0) {
-		LOG_WRN("camera preview auto-recovery failed -- use 'gui start'");
-		return;
-	}
-	LOG_INF("camera preview auto-recovered after overrun");
-}
-
-/* settings: cycle to the next preview resolution (stop -> set_format -> restart;
-   a live re-format is CAM_ERR_BUSY).  Runs on the GUIX thread.  camera_preview_stop
-   only REQUESTS the producer's async teardown, so wait until the stream is fully
-   idle (camera_streaming() == 0) before restarting -- otherwise the restart's
-   set_format returns CAM_ERR_BUSY (#69).  On a wait timeout, abort WITHOUT
-   touching cur_res_idx / the widgets so label, icon and stream stay consistent
-   (the user can recover with `gui stop`/`gui start`). */
+/* settings: cycle to the next preview resolution.  The base owns the resolution
+   now (#100), so change it by stopping the base (cascade -- other subscribers pause
+   and re-attach), setting the new res while off, then restarting.  Runs on the GUIX
+   thread.  camera_stream_stop() is async, so wait until the producer is idle before
+   set_format (else CAM_ERR_BUSY, #69). */
 static void cycle_resolution(void)
 {
 	int next = (cur_res_idx + 1) % N_RES;
+	bool was_streaming = camera_streaming() != 0;
 	int i;
 
-	/* Preserve the overlay feed across the stop -> reformat -> restart: the DCMI is
-	   torn down and re-armed, but the feed session (a fixed 128x128 model input,
-	   resolution-independent) is unchanged and just pauses while no frames flow.
-	   preview_reformatting stops cam_sink_close from aborting the feed on the
-	   deliberate detach below (it is only an async-overrun signal otherwise).  Every
-	   failure exit restores the flag and tears the overlay down (a dead preview must
-	   not leave the feed armed). */
-	preview_reformatting = 1;
-	preview_teardown();
-	for (i = 0; i < 100 && camera_streaming(); i++)
-		tx_thread_sleep(1);
-	if (camera_streaming()) {
-		preview_reformatting = 0;
-		(void)camera_ui_overlay_set(false);
-		LOG_WRN("resolution change aborted: stream did not stop");
+	if (was_streaming) {
+		camera_stream_stop();                 /* cascade */
+		for (i = 0; i < 100 && camera_streaming(); i++)
+			tx_thread_sleep(1);
+		if (camera_streaming()) {
+			LOG_WRN("resolution change aborted: base did not stop");
+			return;
+		}
+	}
+	if (camera_set_format(res_tbl[next].res, CAM_FMT_RGB565) != 0) {
+		LOG_WRN("resolution change: set_format failed");
+		if (was_streaming)
+			(void)camera_stream_start(0, 0, 0);
 		return;
 	}
 	cur_res_idx = next;
 	apply_view_geometry(next);
 	gx_text_button_text_set(&btn_res, res_tbl[next].name);
-	if (preview_start_core(next, false) != 0) {
-		preview_reformatting = 0;
-		(void)camera_ui_overlay_set(false);
-		LOG_WRN("resolution change: preview restart failed");
-		return;
-	}
-	preview_reformatting = 0;
+	if (was_streaming && camera_stream_start(0, 0, 0) != 0)
+		LOG_WRN("resolution change: base restart failed");
 }
 
 /* ---- widget-tree builder (registered with guix_glue) ---------------------- */
@@ -894,47 +818,7 @@ static int camera_ui_build(void *display_v, void *root_v)
 
 void camera_ui_init(void)
 {
-	/* Create the overlay lifecycle mutex once, before the scheduler (like the rest of
-	   the boot-time object setup).  Safe in tx_application_define().  On the (never
-	   observed) failure, the overlay is simply disabled -- camera_ui_overlay_set()
-	   refuses -- rather than taking an uncreated mutex. */
-	overlay_lock_ready =
-		(tx_mutex_create(&overlay_lock, "ovl", TX_INHERIT) == TX_SUCCESS);
-	if (!overlay_lock_ready)
-		LOG_ERR("overlay mutex create failed; face-detect overlay disabled");
 	guix_register_app_builder(camera_ui_build);
-}
-
-/* Enable/disable the face-detect overlay (#83).  Serialized on overlay_lock with the
-   async camera teardown (cam_sink_close) so overlay_on and the feed lifecycle never
-   diverge.  Enabling needs a live preview to feed; it opens the model + claims the NN
-   session (mutually exclusive with `ai bench`/`ai stream`).  Returns 0, -1 (no live
-   preview), or the nn_camera_feed_start() error (<0).  Idempotent. */
-int camera_ui_overlay_set(bool on)
-{
-	int rc = 0;
-
-	if (!overlay_lock_ready)
-		return -1;                          /* overlay unavailable (mutex create failed) */
-	tx_mutex_get(&overlay_lock, TX_WAIT_FOREVER);
-	if (on) {
-		/* Record the intent only once the feed actually starts: a failed `gui overlay
-		   on` must not leave overlay_wanted set (the CAMERA_FRAME retry would then
-		   start it later, contradicting the shell's "start failed"). */
-		rc = overlay_feed_start_locked();
-		if (rc == 0)
-			overlay_wanted = 1;
-	} else {
-		overlay_wanted = 0;
-		overlay_feed_abort_locked();
-	}
-	tx_mutex_put(&overlay_lock);
-	return rc;
-}
-
-bool camera_ui_overlay_get(void)
-{
-	return overlay_wanted != 0;
 }
 
 int camera_ui_start(void)
@@ -951,10 +835,11 @@ int camera_ui_start(void)
 
 int camera_ui_stop(void)
 {
+	/* Unsubscribe the preview from the base (the base keeps running -- `gui stop` is
+	   a subscription toggle, not a base stop, #100) and blank the screen.  The AI
+	   subscriber is independent: it keeps running (bbox just stops being drawn). */
 	stop_requested = 1;
-	(void)camera_ui_overlay_set(false);     /* tear the overlay feed down first (#83) */
 	preview_teardown();
-	preview_running = 0;
 	(void)guix_stop();
 	return 0;
 }
